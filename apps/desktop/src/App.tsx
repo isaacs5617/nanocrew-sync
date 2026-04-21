@@ -19,6 +19,7 @@ import { AddDriveS3Screen } from './screens/AddDriveS3Screen.js';
 import { LockScreen } from './screens/LockScreen.js';
 import { AuthContext } from './context/auth.js';
 import { TransfersProvider } from './context/transfers.js';
+import { useDriveNotifications } from './hooks/useDriveNotifications.js';
 import type { NavKey } from '@nanocrew/ui';
 
 type AppState = 'loading' | 'setup' | 'signin' | 'authed' | 'locked';
@@ -54,6 +55,11 @@ function ShellLayout({ theme, setTheme, token, onSignOut, version }: {
   const [route, setRoute] = React.useState<string>('/drives');
   const [drives, setDrives] = React.useState<{ status: string }[]>([]);
   const t = getTokens(theme);
+
+  // Windows action-centre toasts for mount/unmount/error + optional upload
+  // complete. Runs once at the shell level so notifications fire regardless
+  // of which screen the user is currently on.
+  useDriveNotifications(token);
 
   // Load drive list and keep it in sync for sidebar counts
   React.useEffect(() => {

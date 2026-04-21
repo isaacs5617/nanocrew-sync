@@ -414,11 +414,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
         return <>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>System notifications</NCEyebrow>
-            <ToggleRow theme={theme} label="Drive mounted / unmounted" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="notify_mount_events" defaultOn
+              label="Drive mounted / unmounted"
+              sub="Native Windows toast when a drive becomes available or is unmounted."
+            />
             <Spacer />
-            <ToggleRow theme={theme} label="Mount errors" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="notify_errors" defaultOn
+              label="Errors (mount + upload)"
+              sub="Surface WinFsp mount failures and upload errors as toasts."
+            />
             <Spacer />
-            <ToggleRow theme={theme} label="Upload completed" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="notify_uploads"
+              label="Upload completed"
+              sub="Off by default — large file transfers can get noisy."
+            />
             <Spacer />
             <ToggleRow theme={theme} label="Low disk space warning" comingSoon />
           </NCCard>

@@ -1,6 +1,7 @@
 import React from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
+import { appDataDir, join } from '@tauri-apps/api/path';
 import {
   getTokens, NC_FONT_MONO,
   NCCard, NCEyebrow, NCLabel, NCToggle, NCBtn,
@@ -161,7 +162,28 @@ const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, tok
   return <>
     <NCCard theme={theme} pad={20}>
       <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Logging</NCEyebrow>
-      <ToggleRow theme={theme} label="Enable verbose logging" sub="Writes detailed logs to %APPDATA%\NanoCrew\Sync\logs. May affect performance." comingSoon />
+      <PrefToggle
+        theme={theme} token={token}
+        prefKey="verbose_logging"
+        label="Enable verbose logging"
+        sub="Writes detailed (debug-level) logs to %APPDATA%\NanoCrew\Sync\logs. Takes effect on next launch."
+      />
+      <div style={{ marginTop: 14, display: 'flex', gap: 10 }}>
+        <NCBtn
+          theme={theme} small ghost
+          onClick={async () => {
+            try {
+              const base = await appDataDir();
+              const logs = await join(base, 'logs');
+              await invoke('open_path', { token, path: logs });
+            } catch (e) {
+              console.error('open logs failed', e);
+            }
+          }}
+        >
+          Open log folder
+        </NCBtn>
+      </div>
     </NCCard>
     <NCCard theme={theme} pad={20}>
       <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>WinFsp</NCEyebrow>

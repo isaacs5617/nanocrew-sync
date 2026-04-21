@@ -70,7 +70,10 @@ jobs:
           $msi = (Resolve-Path 'apps/desktop/src-tauri/bundled/winfsp.msi').Path
           Write-Host "Installing $msi..."
           $log = "$env:RUNNER_TEMP\winfsp-install.log"
-          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+          # ADDLOCAL=ALL forces install of every feature, including the
+          # Developer headers (winfsp/winfsp.h) that bindgen needs. Without
+          # this, msiexec installs only the runtime by default.
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", 'ADDLOCAL=ALL', '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
           if ($p.ExitCode -ne 0) {
             Write-Host "--- msiexec log (last 100 lines) ---"
             Get-Content $log -Tail 100 -ErrorAction SilentlyContinue
@@ -78,6 +81,16 @@ jobs:
           }
           Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -ErrorAction SilentlyContinue |
             Select-Object InstallDir, VersionMajor, VersionMinor
+          # Verify headers are actually installed (root cause of the previous
+          # bindgen failure — default silent install skipped Developer feature)
+          $hdr = 'C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h'
+          if (-not (Test-Path $hdr)) {
+            Write-Host "--- WinFsp install tree ---"
+            Get-ChildItem 'C:\Program Files (x86)\WinFsp' -Recurse -ErrorAction SilentlyContinue |
+              Select-Object FullName | Format-Table -AutoSize
+            throw "WinFsp headers missing at $hdr — ADDLOCAL=ALL did not install Developer feature"
+          }
+          Write-Host "OK: found $hdr"
 
       - name: Build Tauri installers
         env:

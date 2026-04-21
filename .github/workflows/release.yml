@@ -117,13 +117,22 @@ jobs:
           $bundleDir = "apps/desktop/src-tauri/target/release/bundle"
           New-Item -Force -ItemType Directory -Path artifacts | Out-Null
 
-          # NSIS EXE + its signature
+          # NSIS EXE + its signature. Rename spaces→dots so the local
+          # filename matches what GitHub stores as the release asset name
+          # (GitHub auto-replaces spaces with dots on upload, which would
+          # otherwise break the URL in latest.json).
           Get-ChildItem "$bundleDir/nsis" -Include *.exe,*.exe.sig -Recurse -ErrorAction SilentlyContinue |
-            Copy-Item -Destination artifacts/
+            ForEach-Object {
+              $new = $_.Name -replace ' ', '.'
+              Copy-Item $_.FullName -Destination "artifacts/$new"
+            }
 
           # MSI + signature (Tauri generates signatures for both)
           Get-ChildItem "$bundleDir/msi" -Include *.msi,*.msi.sig -Recurse -ErrorAction SilentlyContinue |
-            Copy-Item -Destination artifacts/
+            ForEach-Object {
+              $new = $_.Name -replace ' ', '.'
+              Copy-Item $_.FullName -Destination "artifacts/$new"
+            }
 
           # Build the latest.json updater manifest the app fetches from GitHub Releases
           $tag     = "${{ github.ref_name }}"

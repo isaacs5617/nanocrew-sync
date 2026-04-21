@@ -37,6 +37,9 @@ pub enum AppError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<AppError> for String {

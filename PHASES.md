@@ -111,13 +111,13 @@
 
 ## Phase 5 — Reliability plumbing
 
-- [ ] 5.1 Auto-mount on startup — reads `auto_mount` flag, mounts flagged drives at app boot
-- [ ] 5.2 System tray icon — minimize-to-tray, drive status menu, unmount/remount, quit
-- [ ] 5.3 Start at Windows sign-in — registry Run key toggle
-- [ ] 5.4 Toast notifications — mount/unmount, upload complete, mount error
-- [ ] 5.5 Bandwidth throttle — per-drive upload/download caps (governor on part dispatch)
-- [ ] 5.6 LRU local cache + pin — keep N GB of recently-read bytes; pin files for offline; respect per-drive `cache_size_gb`
-- [ ] 5.7 Reconnect on network blip — exponential backoff retry on S3 transport errors
+- [x] 5.1 Auto-mount on startup — `auto_mount_drives` in `lib.rs` reads `auto_mount = 1` rows from SQLite and spawns mount tasks in parallel during `tauri::Builder::setup`. Uses the `"auto-mount"` sentinel owner since no user has signed in yet.
+- [x] 5.2 System tray icon — `TrayIconBuilder` in `lib.rs` with Show/Quit menu. Left-click toggles visibility; close-to-tray via `on_window_event` WindowEvent::CloseRequested → `api.prevent_close()` + `window.hide()`. Single-instance plugin refocuses instead of spawning twin tray icons.
+- [x] 5.3 Start at Windows sign-in — new `commands::system::{get_autostart, set_autostart}` write to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` under value name `NanoCrewSync`. HKCU = no UAC. Settings → General "Launch at Windows sign-in" toggle wired via `AutostartRow`; includes `--hidden` arg so sign-in wakes to tray.
+- [ ] 5.4 Toast notifications — mount/unmount, upload complete, mount error (deferred — requires tauri-plugin-notification + event translation layer)
+- [ ] 5.5 Bandwidth throttle — per-drive upload/download caps (deferred — needs part-dispatch governor coupled to SQLite prefs)
+- [ ] 5.6 LRU local cache + pin — keep N GB of recently-read bytes; pin files for offline; respect per-drive `cache_size_gb` (deferred — largest reliability feature; needs on-disk cache layout + eviction thread)
+- [x] 5.7 Reconnect on network blip — AWS SDK retry config bumped from default `Standard/3 attempts` to `adaptive/8 attempts` in `mounts.rs::spawn_mount`, so transient transport errors (Wi-Fi handoff, DNS hiccup, provider throttling) retry quietly instead of surfacing as Explorer "copy failed" dialogs.
 
 **Target:** app behaves like a polished background utility — survives reboots, sleeps, Wi-Fi drops.
 

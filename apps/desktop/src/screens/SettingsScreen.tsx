@@ -55,6 +55,45 @@ const ToggleRow: React.FC<{
 
 const Spacer = () => <div style={{ height: 12 }} />;
 
+/// "Launch at Windows sign-in" toggle backed by the HKCU\...\Run registry
+/// key. Reads the current state on mount; writes through set_autostart.
+const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
+  const [on, setOn] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    invoke<boolean>('get_autostart', { token })
+      .then(setOn)
+      .catch(() => setOn(false));
+  }, [token]);
+
+  // Hide until the registry read completes so the toggle doesn't flicker.
+  if (on === null) {
+    return (
+      <ToggleRow
+        theme={theme}
+        label="Launch NanoCrew Sync at Windows sign-in"
+        sub="Reconnect mounted drives automatically."
+      />
+    );
+  }
+  return (
+    <ToggleRow
+      theme={theme}
+      label="Launch NanoCrew Sync at Windows sign-in"
+      sub="Reconnect mounted drives automatically. Current-user only — no admin rights needed."
+      on={on}
+      onChange={async (next) => {
+        setOn(next);
+        try {
+          await invoke('set_autostart', { token, enabled: next });
+        } catch {
+          // Roll back the UI state if the registry write failed.
+          setOn(!next);
+        }
+      }}
+    />
+  );
+};
+
 const PlaceholderSection: React.FC<{ title: string; body: string; theme: Theme }> = ({ title, body, theme }) => {
   const t = getTokens(theme);
   return (
@@ -148,7 +187,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
         return <>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Startup</NCEyebrow>
-            <ToggleRow theme={theme} label="Launch NanoCrew Sync at Windows sign-in" sub="Reconnect mounted drives automatically." comingSoon />
+            <AutostartRow theme={theme} token={token} />
             <Spacer />
             <ToggleRow theme={theme} label="Start minimized to system tray" comingSoon />
             <Spacer />

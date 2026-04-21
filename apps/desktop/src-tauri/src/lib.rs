@@ -125,6 +125,8 @@ pub fn run() {
             commands::drives::list_buckets,
             commands::drives::open_path,
             commands::drives::check_winfsp,
+            commands::system::get_autostart,
+            commands::system::set_autostart,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")

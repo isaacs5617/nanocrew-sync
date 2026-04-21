@@ -128,11 +128,19 @@ pub fn spawn_mount(
                 None,
                 "nanocrew-sync",
             );
+            // Retry plumbing (Phase 5.7): the AWS SDK's default retry mode is
+            // "Standard" with 3 attempts. We bump to 8 attempts with adaptive
+            // backoff so a transient network blip (Wi-Fi handoff, DNS hiccup,
+            // brief provider throttling) retries quietly rather than bubbling
+            // up as an Explorer "copy failed" dialog mid-upload.
+            let retry_config = aws_config::retry::RetryConfig::adaptive()
+                .with_max_attempts(8);
             let aws_cfg = rt.block_on(async {
                 aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(aws_config::Region::new(config.region.clone()))
                     .endpoint_url(format!("https://{}", config.endpoint))
                     .credentials_provider(creds)
+                    .retry_config(retry_config)
                     .load()
                     .await
             });

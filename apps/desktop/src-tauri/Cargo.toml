@@ -1,0 +1,66 @@
+[package]
+name = "nanocrew-sync"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "nanocrew_sync_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build  = { version = "2", features = [] }
+winfsp_build = "0.1.1"
+
+[dependencies]
+tauri       = { version = "2", features = ["tray-icon"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tokio       = { version = "1", features = ["full"] }
+
+# Database — bundled compiles SQLite in, no system dep
+rusqlite    = { version = "0.31", features = ["bundled"] }
+
+# Password hashing
+argon2      = "0.5"
+
+# Session tokens and drive IDs
+uuid        = { version = "1", features = ["v4"] }
+
+# Error handling
+thiserror   = "1"
+
+# Random for Argon2 salt generation
+rand_core   = { version = "0.6", features = ["getrandom"] }
+
+# S3 client (test_connection + VFS backend)
+aws-config          = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3          = { version = "1" }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+
+# WinFsp — user-mode Windows filesystem driver. Replaces cloud-filter
+# (see src-tauri.cloudfilter-backup-* for the previous implementation).
+# Version pinned to match WinFsp 2.1.x installed alongside the app.
+# `system` feature makes winfsp_init read HKLM\SOFTWARE\WOW6432Node\WinFsp
+# InstallDir to locate winfsp-x64.dll, so users don't need the WinFsp bin
+# directory on PATH.
+winfsp       = { version = "0.12.4", features = ["system"] }
+winfsp-sys   = { version = "0.12", features = ["system"] }
+
+# Pipelined S3 range GETs during hydration
+futures-util = "0.3"
+bytes        = "1"
+reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+# Wide-string types
+widestring = "1"
+
+# Windows API shims (security IDs, file handles, etc.)
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

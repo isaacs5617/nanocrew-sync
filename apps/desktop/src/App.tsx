@@ -1,0 +1,166 @@
+import React from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getVersion } from '@tauri-apps/api/app';
+import { getTokens, type Theme } from '@nanocrew/ui';
+import { AppShell } from '@nanocrew/ui';
+import { TitleBar } from './TitleBar.js';
+import { DashboardScreen } from './screens/DashboardScreen.js';
+import { FileBrowserScreen } from './screens/FileBrowserScreen.js';
+import { TransfersScreen } from './screens/TransfersScreen.js';
+import { ActivityScreen } from './screens/ActivityScreen.js';
+import { SettingsScreen } from './screens/SettingsScreen.js';
+import { AccountScreen } from './screens/AccountScreen.js';
+import { ErrorScreen } from './screens/ErrorScreen.js';
+import { OnboardingScreen } from './screens/OnboardingScreen.js';
+import { SetupScreen } from './screens/SetupScreen.js';
+import { AddDrivePickerScreen } from './screens/AddDrivePickerScreen.js';
+import { AddDriveWasabiScreen } from './screens/AddDriveWasabiScreen.js';
+import { AuthContext } from './context/auth.js';
+import { TransfersProvider } from './context/transfers.js';
+import type { NavKey } from '@nanocrew/ui';
+
+type AppState = 'loading' | 'setup' | 'signin' | 'authed';
+
+const NAV_TO_PATH: Record<NavKey, string> = {
+  home:      '/drives',
+  drives:    '/drives',
+  files:     '/files',
+  transfers: '/transfers',
+  activity:  '/activity',
+  account:   '/account',
+  settings:  '/settings',
+};
+
+function ShellLayout({ theme, setTheme, token, onSignOut, version }: {
+  theme: Theme;
+  setTheme: (t: Theme) => void;
+  token: string;
+  onSignOut: () => void;
+  version: string;
+}) {
+  const [activeNav, setActiveNav] = React.useState<NavKey>('drives');
+  const [route, setRoute] = React.useState<string>('/drives');
+  const [drives, setDrives] = React.useState<{ status: string }[]>([]);
+  const t = getTokens(theme);
+
+  // Load drive list and keep it in sync for sidebar counts
+  React.useEffect(() => {
+    invoke<{ status: string }[]>('list_drives', { token }).then(setDrives).catch(() => {});
+  }, [token]);
+
+  React.useEffect(() => {
+    const unlisten = listen<{ drive_id: number; status: string }>('drive_status_changed', e => {
+      setDrives(prev => prev.map((d, i) =>
+        (d as any).id === e.payload.drive_id ? { ...d, status: e.payload.status } : d
+      ));
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
+  const navigate = (key: NavKey) => {
+    setActiveNav(key);
+    setRoute(NAV_TO_PATH[key]);
+  };
+
+  const renderScreen = () => {
+    switch (route) {
+      case '/drives':     return <DashboardScreen theme={theme} onAddDrive={() => setRoute('/add-drive')} />;
+      case '/files':      return <FileBrowserScreen theme={theme} />;
+      case '/transfers':  return <TransfersScreen theme={theme} />;
+      case '/activity':   return <ActivityScreen theme={theme} />;
+      case '/settings':   return <SettingsScreen theme={theme} setTheme={setTheme} />;
+      case '/account':    return <AccountScreen theme={theme} onSignOut={onSignOut} />;
+      case '/error':      return <ErrorScreen theme={theme} />;
+      case '/add-drive':  return <AddDrivePickerScreen theme={theme} onNext={() => setRoute('/add-drive/wasabi')} onCancel={() => setRoute('/drives')} />;
+      case '/add-drive/wasabi': return (
+        <AddDriveWasabiScreen
+          theme={theme}
+          onBack={() => setRoute('/add-drive')}
+          onCancel={() => setRoute('/drives')}
+          onDone={() => setRoute('/drives')}
+        />
+      );
+      default: return <DashboardScreen theme={theme} onAddDrive={() => setRoute('/add-drive')} />;
+    }
+  };
+
+  return (
+    <div style={{ display: 'flex', flex: 1, minHeight: 0, background: t.bg, overflow: 'hidden' }}>
+      <AppShell
+        theme={theme} activeNav={activeNav} onNav={navigate}
+        driveCount={drives.length}
+        errCount={drives.filter(d => d.status === 'error').length}
+        version={version}
+      >
+        {renderScreen()}
+      </AppShell>
+    </div>
+  );
+}
+
+export function App() {
+  const [theme, setTheme] = React.useState<Theme>('dark');
+  const [appState, setAppState] = React.useState<AppState>('loading');
+  const [token, setToken] = React.useState<string>('');
+  const [version, setVersion] = React.useState<string>('');
+  const t = getTokens(theme);
+
+  React.useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
+
+  // On mount: check whether an admin account exists yet.
+  React.useEffect(() => {
+    invoke<boolean>('has_account')
+      .then(exists => setAppState(exists ? 'signin' : 'setup'))
+      .catch(() => setAppState('signin'));
+  }, []);
+
+  const handleSetupDone = () => setAppState('signin');
+
+  const handleSignIn = (tok: string) => {
+    setToken(tok);
+    setAppState('authed');
+  };
+
+  const handleSignOut = async () => {
+    if (token) await invoke('sign_out', { token }).catch(() => {});
+    setToken('');
+    setAppState('signin');
+  };
+
+  const renderContent = () => {
+    switch (appState) {
+      case 'loading':
+        return (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: t.bg }}>
+            <div style={{ fontFamily: 'monospace', fontSize: 12, color: t.textLo, letterSpacing: 2 }}>LOADING…</div>
+          </div>
+        );
+      case 'setup':
+        return <SetupScreen theme={theme} onDone={handleSetupDone} />;
+      case 'signin':
+        return <OnboardingScreen theme={theme} onSignIn={handleSignIn} />;
+      case 'authed':
+        return (
+          <AuthContext.Provider value={{ token, signOut: handleSignOut }}>
+            <TransfersProvider>
+              <ShellLayout theme={theme} setTheme={setTheme} token={token} onSignOut={handleSignOut} version={version} />
+            </TransfersProvider>
+          </AuthContext.Provider>
+        );
+    }
+  };
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      height: '100vh', overflow: 'hidden',
+      background: t.bg,
+    }}>
+      <TitleBar theme={theme} />
+      <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
+        {renderContent()}
+      </div>
+    </div>
+  );
+}

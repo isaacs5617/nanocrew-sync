@@ -1,0 +1,94 @@
+# ── Node / pnpm ──────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Build output ─────────────────────────────────────────────
+dist/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+*.tsbuildinfo
+
+# ── Rust / Cargo / Tauri ─────────────────────────────────────
+target/
+**/target/
+Cargo.lock.bak
+*.pdb
+*.rlib
+*.rmeta
+
+# Tauri bundler artifacts
+src-tauri/gen/
+src-tauri/WixTools/
+src-tauri/WixTools*/
+# Legacy CloudFilter backup dir (kept locally, not in repo)
+**/src-tauri.cloudfilter-backup-*/
+
+# ── Editor / IDE ─────────────────────────────────────────────
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── OS ───────────────────────────────────────────────────────
+$RECYCLE.BIN/
+ehthumbs.db
+System Volume Information/
+
+# ── Secrets / local config ───────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.json
+credentials.json
+
+# ── Local databases / caches ─────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── Logs ─────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Test / coverage ──────────────────────────────────────────
+coverage/
+.nyc_output/
+*.lcov
+
+# ── Tauri release artifacts (built locally) ──────────────────
+*.msi
+*.exe
+*.dmg
+*.deb
+*.AppImage
+*.app
+bundle/
+
+# ── Misc ─────────────────────────────────────────────────────
+.turbo/
+.cache/
+tmp/
+temp/

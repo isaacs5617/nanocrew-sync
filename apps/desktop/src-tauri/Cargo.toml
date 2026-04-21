@@ -59,7 +59,10 @@ reqwest      = { version = "0.12", default-features = false, features = ["rustls
 widestring = "1"
 
 # Windows API shims (security IDs, file handles, etc.)
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+
+# Base64 for encoding DPAPI blobs in the SQLite credentials column.
+base64 = "0.22"
 
 [profile.release]
 panic = "abort"

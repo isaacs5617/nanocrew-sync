@@ -88,8 +88,8 @@
 
 ## Phase 3 — Security features
 
-- [ ] 3.1 Cache encryption — AES-256-GCM on temp spool files, per-session key derived from machine ID + user password
-- [ ] 3.2 Credential-at-rest re-encryption — DPAPI-wrap S3 secrets in SQLite (currently plain under FS-perms protection)
+- [ ] 3.1 Cache encryption — AES-256-GCM on temp spool files, per-session key derived from machine ID + user password (deferred: needs part-aligned chunk encryption so MPU reads stay cheap; crates wired, module design TBD)
+- [x] 3.2 Credential-at-rest re-encryption — DPAPI-wrap S3 secrets in SQLite (`credentials.rs` + new `dpapi.rs`; `v1:<base64>` envelope with legacy-plaintext migration on first read; `add_drive` routes through `credentials::store` and never persists the raw secret)
 - [ ] 3.3 Session lock — "lock app on minimize" and "require password after screen lock" wired; PIN fallback
 - [ ] 3.4 Audit log of security-sensitive actions (mount, unmount, credential add, lock)
 

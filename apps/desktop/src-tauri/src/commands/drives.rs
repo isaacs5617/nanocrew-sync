@@ -75,18 +75,20 @@ pub async fn add_drive(
     validate_letter(&input.letter)?;
 
     let letter = input.letter.to_uppercase();
-    let secret = input.secret_access_key.clone();
 
+    // Insert the row with an empty secret placeholder, then let credentials::store
+    // write the DPAPI-wrapped blob. Two-step so the secret is never plaintext
+    // in SQLite even briefly.
     let (id, created_at) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.execute(
             "INSERT INTO drives
              (name, provider, endpoint, bucket, region, letter,
               access_key_id, secret_key, cache_size_gb, auto_mount, readonly)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,?9,?10)",
             rusqlite::params![
                 input.name, input.provider, input.endpoint, input.bucket,
-                input.region, letter, input.access_key_id, secret,
+                input.region, letter, input.access_key_id,
                 input.cache_size_gb, input.auto_mount, input.readonly,
             ],
         )
@@ -98,6 +100,14 @@ pub async fn add_drive(
             .map_err(|e| AppError::Db(e).to_string())?;
         (id, created_at)
     };
+
+    // Write the wrapped secret. If this fails we back the row out so the
+    // user doesn't end up with an un-mountable drive in the UI.
+    if let Err(e) = credentials::store(&state.db, id, &input.secret_access_key) {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = db.execute("DELETE FROM drives WHERE id = ?1", rusqlite::params![id]);
+        return Err(e.to_string());
+    }
 
     Ok(DriveInfo {
         id,

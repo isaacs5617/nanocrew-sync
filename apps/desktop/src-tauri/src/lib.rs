@@ -8,6 +8,7 @@ mod auth;
 mod commands;
 mod credentials;
 mod db;
+mod dpapi;
 mod error;
 mod mounts;
 mod state;

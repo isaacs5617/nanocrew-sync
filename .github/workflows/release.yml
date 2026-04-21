@@ -60,6 +60,11 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Rust's built-in MSVC detection hardcodes an absolute path to a
+          # specific toolset version that isn't always present on the runner
+          # image. ilammy/msvc-dev-cmd has already put link.exe on PATH, so
+          # point Cargo at the on-PATH linker and skip the brittle auto-lookup.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
         run: pnpm tauri build
 
       - name: Collect artifacts

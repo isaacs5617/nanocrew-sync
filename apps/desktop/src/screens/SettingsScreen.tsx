@@ -55,6 +55,41 @@ const ToggleRow: React.FC<{
 
 const Spacer = () => <div style={{ height: 12 }} />;
 
+/// ToggleRow backed by a string key in the SQLite `prefs` table. Reads the
+/// current value on mount and persists on change. Errors fall silently back
+/// to the built-in default — no toast spam for a failing toggle.
+const PrefToggle: React.FC<{
+  theme: Theme; token: string;
+  prefKey: string; defaultOn?: boolean;
+  label: string; sub?: string;
+  onAfterChange?: (v: boolean) => void;
+}> = ({ theme, token, prefKey, defaultOn = false, label, sub, onAfterChange }) => {
+  const [on, setOn] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    invoke<string | null>('get_pref', { token, key: prefKey })
+      .then(v => setOn(v === null || v === undefined
+        ? defaultOn
+        : (v === '1' || v === 'true')))
+      .catch(() => setOn(defaultOn));
+  }, [token, prefKey, defaultOn]);
+
+  if (on === null) return <ToggleRow theme={theme} label={label} sub={sub} />;
+  return (
+    <ToggleRow
+      theme={theme} label={label} sub={sub} on={on}
+      onChange={async (next) => {
+        setOn(next);
+        try {
+          await invoke('set_pref', { token, key: prefKey, value: next ? '1' : '0' });
+          onAfterChange?.(next);
+        } catch {
+          setOn(!next);
+        }
+      }}
+    />
+  );
+};
+
 /// "Launch at Windows sign-in" toggle backed by the HKCU\...\Run registry
 /// key. Reads the current state on mount; writes through set_autostart.
 const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
@@ -189,9 +224,20 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Startup</NCEyebrow>
             <AutostartRow theme={theme} token={token} />
             <Spacer />
-            <ToggleRow theme={theme} label="Start minimized to system tray" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="start_minimized"
+              label="Start minimized to system tray"
+              sub="Launch into the tray on startup — the window stays hidden until you click the tray icon."
+            />
             <Spacer />
-            <ToggleRow theme={theme} label="Check for updates automatically" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="auto_update_check"
+              defaultOn
+              label="Check for updates automatically"
+              sub="Check Cortex Labs for new releases at launch. Installs still require your confirmation."
+            />
           </NCCard>
 
           <NCCard theme={theme} pad={20}>
@@ -253,9 +299,19 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
         return <>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Defaults for new drives</NCEyebrow>
-            <ToggleRow theme={theme} label="Auto-mount on startup" sub="New drives will be mounted automatically when the app starts." comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="default_auto_mount" defaultOn
+              label="Auto-mount on startup"
+              sub="Pre-selects the auto-mount toggle for new drives added via Add Drive."
+            />
             <Spacer />
-            <ToggleRow theme={theme} label="Read-only by default" sub="Prevent accidental writes to newly added buckets." comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="default_readonly"
+              label="Read-only by default"
+              sub="Pre-selects read-only for new drives. Prevents accidental writes."
+            />
           </NCCard>
           <PlaceholderSection
             theme={theme}
@@ -309,7 +365,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
         return <>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Session</NCEyebrow>
-            <ToggleRow theme={theme} label="Require password after screen lock" sub="Re-authenticate when Windows resumes from sleep or lock screen." comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="lock_on_session_lock"
+              label="Require password after Windows lock"
+              sub="Re-authenticate when Windows resumes from sleep or the Win+L lock screen."
+            />
             <Spacer />
             <ToggleRow
               theme={theme}

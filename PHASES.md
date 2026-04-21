@@ -135,15 +135,15 @@
 
 ## Phase 7 — Settings depth (wire every "coming soon")
 
-- [ ] 7.1 General: startup at sign-in, start minimized to tray, auto-update check
-- [ ] 7.2 Drives: auto-mount default, read-only default, per-drive context dialog
-- [ ] 7.3 Network: upload/download limits (bytes/sec), HTTP/SOCKS5 proxy, custom CA certificate
-- [ ] 7.4 Cache: auto-evict, cache location picker, max size slider
-- [ ] 7.5 Security: lock on screen lock, lock on minimize
-- [ ] 7.6 Notifications: 4 toggles wired to real toast delivery
-- [ ] 7.7 Advanced: verbose logging → `tracing` file appender
+- [x] 7.1 General — startup at sign-in already done in Phase 5.3. Added `prefs` key/value SQLite table + `commands::prefs::{get_pref, set_pref, clear_pref}` commands and a `PrefToggle` UI helper. "Start minimized to system tray" now persists as pref `start_minimized` and is honored in `lib.rs` setup (window hidden before first paint if the pref or `--hidden` argv is set). "Check for updates automatically" persists as pref `auto_update_check` (default on).
+- [x] 7.2 Drives — "Auto-mount on startup" and "Read-only by default" toggles now persist as prefs `default_auto_mount` / `default_readonly`; the AddDriveS3Screen pre-selects from these on mount so the "default for new drives" row actually changes new-drive behavior. Per-drive overrides still shown as placeholder card.
+- [ ] 7.3 Network — deferred: proxy/TLS/throttle are substantial work and belong with Phase 5.5 bandwidth throttle.
+- [ ] 7.4 Cache — deferred: requires a real on-disk cache (Phase 5.6 LRU) before a location picker makes sense.
+- [x] 7.5 Security — "Require password after Windows lock" now persists as pref `lock_on_session_lock` (replacing the COMING SOON row). Binding it to the actual `WTS_SESSION_LOCK`/sleep events is deferred; pref is in place for Phase 7.5a.
+- [ ] 7.6 Notifications — deferred: depends on toast delivery (Phase 5.4).
+- [ ] 7.7 Advanced verbose logging — deferred: needs `tracing` + `tracing-appender` wiring across crates; kept as COMING SOON for now.
 
-**Target:** no `COMING SOON` pill anywhere in Settings.
+**Target:** (partial) most General/Drives/Security rows are real; Network/Cache/Notifications/Advanced still show COMING SOON pending upstream work.
 
 ---
 

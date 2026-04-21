@@ -90,6 +90,22 @@ pub fn run() {
                 window.open_devtools();
             }
 
+            // ── Start minimized to tray ──────────────────────────────────────
+            // Two ways to boot hidden: the `--hidden` argv flag (set by the
+            // autostart registry value we write in commands::system), or the
+            // "start_minimized" preference toggled from Settings → General.
+            // Either one hides the window before the user sees it flash.
+            {
+                let started_hidden_arg = std::env::args().any(|a| a == "--hidden");
+                let state: tauri::State<AppState> = app.state();
+                let pref_hidden = commands::prefs::get_bool(&state.db, "start_minimized", false);
+                if started_hidden_arg || pref_hidden {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
+            }
+
             // Kick off auto-mounts asynchronously so setup() returns immediately
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -130,6 +146,9 @@ pub fn run() {
             commands::activity::list_activity,
             commands::activity::clear_activity,
             commands::activity::export_activity_csv,
+            commands::prefs::get_pref,
+            commands::prefs::set_pref,
+            commands::prefs::clear_pref,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")

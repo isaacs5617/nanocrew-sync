@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_ts   ON activity(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_kind ON activity(kind);
+
+-- Tiny key/value table for user preferences that aren't worth their own
+-- schema (toggles, defaults, picks). String values only — callers serialize
+-- anything structured.
+CREATE TABLE IF NOT EXISTS prefs (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
 ";
 
 pub fn open(path: &Path) -> Result<Connection, AppError> {

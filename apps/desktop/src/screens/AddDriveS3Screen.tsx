@@ -63,6 +63,21 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
   const [autoMount, setAutoMount] = React.useState(true);
   const [readonly, setReadonly] = React.useState(false);
 
+  // Override the hard-coded defaults with the user's preferred defaults
+  // (Settings → Drives). Runs once on mount.
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const am = await invoke<string | null>('get_pref', { token, key: 'default_auto_mount' });
+        if (am === '0' || am === 'false') setAutoMount(false);
+        else if (am === '1' || am === 'true') setAutoMount(true);
+        const ro = await invoke<string | null>('get_pref', { token, key: 'default_readonly' });
+        if (ro === '1' || ro === 'true') setReadonly(true);
+        else if (ro === '0' || ro === 'false') setReadonly(false);
+      } catch {/* pref failures just leave the built-in defaults in place */}
+    })();
+  }, [token]);
+
   const [testing, setTesting] = React.useState(false);
   const [testOk, setTestOk] = React.useState<boolean | null>(null);
   const [saving, setSaving] = React.useState(false);

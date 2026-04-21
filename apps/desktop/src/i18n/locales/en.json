@@ -1,0 +1,32 @@
+{
+  "tray.show": "Show NanoCrew Sync",
+  "tray.quit": "Quit",
+  "tray.tooltip": "NanoCrew Sync",
+
+  "common.signOut": "Sign out",
+  "common.lock": "Lock",
+  "common.cancel": "Cancel",
+  "common.save": "Save",
+  "common.close": "Close",
+  "common.loading": "Loading…",
+  "common.retry": "Retry",
+
+  "activity.title": "Activity",
+  "activity.subtitle": "Audit log of mount, auth, and drive events",
+  "activity.clearLog": "Clear log",
+  "activity.exportCsv": "Export CSV",
+  "activity.errorsOnly": "ERRORS ONLY",
+  "activity.filterPlaceholder": "Filter…",
+  "activity.noEvents": "No events match the current filter.",
+
+  "settings.title": "Preferences",
+  "settings.subtitle": "Local settings · stored in Windows Credential Manager and app data directory",
+  "settings.section.general": "General",
+  "settings.section.drives": "Drives",
+  "settings.section.network": "Network",
+  "settings.section.cacheStorage": "Cache & storage",
+  "settings.section.security": "Security",
+  "settings.section.notifications": "Notifications",
+  "settings.section.advanced": "Advanced",
+  "settings.section.about": "About"
+}

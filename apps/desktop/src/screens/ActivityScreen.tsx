@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -94,6 +95,7 @@ interface ActivityScreenProps { theme: Theme }
 
 export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const { token } = useAuth();
 
   const [entries, setEntries] = React.useState<ActivityEntry[]>([]);
@@ -165,17 +167,17 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
     <>
       <TopBar
         theme={theme}
-        crumbs={['Activity']}
-        title={<>Drive <span style={{ color: t.lime }}>Activity</span></>}
-        subtitle="Audit log of mount, auth, and drive events"
+        crumbs={[tr('activity.title')]}
+        title={<>Drive <span style={{ color: t.lime }}>{tr('activity.title')}</span></>}
+        subtitle={tr('activity.subtitle')}
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
             <NCBtn theme={theme} small ghost iconLeft={<I.download size={13} />}
                    onClick={onExport} disabled={visible.length === 0}>
-              Export CSV
+              {tr('activity.exportCsv')}
             </NCBtn>
             <NCBtn theme={theme} small ghost iconLeft={<I.x size={13} />} onClick={onClear}>
-              Clear log
+              {tr('activity.clearLog')}
             </NCBtn>
           </div>
         }

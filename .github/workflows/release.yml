@@ -57,15 +57,25 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # winfsp-sys's build.rs reads HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir
-      # to find the WinFsp headers/libs. Install the bundled MSI silently so
-      # the registry key exists before cargo builds winfsp-sys.
-      - name: Install WinFsp
+      # to find the WinFsp headers/libs, AND the Tauri resources bundler needs
+      # apps/desktop/src-tauri/bundled/winfsp.msi present. The MSI is gitignored
+      # (*.msi rule), so fetch it from the official release and place it at the
+      # bundled/ path. Then install it silently so winfsp-sys can find it.
+      - name: Download + install WinFsp
         shell: pwsh
         run: |
-          $msi = "apps/desktop/src-tauri/bundled/winfsp.msi"
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $PWD 'apps/desktop/src-tauri/bundled/download-winfsp.ps1'
+          & pwsh -File $script
+          $msi = (Resolve-Path 'apps/desktop/src-tauri/bundled/winfsp.msi').Path
           Write-Host "Installing $msi..."
-          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "WinFsp install failed with exit code $($p.ExitCode)" }
+          $log = "$env:RUNNER_TEMP\winfsp-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Write-Host "--- msiexec log (last 100 lines) ---"
+            Get-Content $log -Tail 100 -ErrorAction SilentlyContinue
+            throw "WinFsp install failed with exit code $($p.ExitCode)"
+          }
           Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -ErrorAction SilentlyContinue |
             Select-Object InstallDir, VersionMajor, VersionMinor
 

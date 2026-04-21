@@ -54,8 +54,8 @@
   - [x] Per-handle `DownloadState` byte counter, throttled to 250 ms progress events
   - [x] `close()` emits terminal `state: "done"` — partial reads treated as done (not error) to avoid flooding UI with phantom failures from Windows thumbnailers / AV / editor probes
   - [~] Idle sweeper deferred — not needed unless we see stuck rows in practice
-- [ ] 1.2 LIST cache TTL (5 s directory cache) so remote changes become visible without remount
-- [ ] 1.3 Verify small-file single-PUT path (< 16 MiB skips MPU)
+- [x] 1.2 LIST cache TTL (5 s directory cache + 5 s meta cache) — already live; invalidated on every create/delete/rename/mkdir
+- [x] 1.3 Verify small-file single-PUT path (≤ 16 MiB skips MPU) — gated on `upload_id.is_none()` at finalize; MPU only starts when contiguous writes cross `PART_TARGET`
 - [ ] 1.4 Strip verbose `[winfsp]` logging — keep errors, drop routine traces
 - [ ] 1.5 Replace `tokio::runtime::Builder::new_current_thread` drop-on-block pattern with a single long-lived runtime on the filesystem context
 

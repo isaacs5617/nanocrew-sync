@@ -65,6 +65,14 @@ jobs:
           # image. ilammy/msvc-dev-cmd has already put link.exe on PATH, so
           # point Cargo at the on-PATH linker and skip the brittle auto-lookup.
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
+          # The runner image pre-sets CC_x86_64_pc_windows_msvc to an absolute
+          # path inside "C:\Program Files (x86)\...\BuildTools\..." that (a)
+          # doesn't exist on this image (it ships VS Enterprise) and (b) breaks
+          # cc-rs's tokenizer on the unquoted space in "Program Files". Force
+          # cc-rs to use cl.exe from PATH — msvc-dev-cmd has already put the
+          # correct Enterprise toolchain there.
+          CC_x86_64_pc_windows_msvc: cl.exe
+          CXX_x86_64_pc_windows_msvc: cl.exe
         run: pnpm tauri build
 
       - name: Collect artifacts

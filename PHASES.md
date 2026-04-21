@@ -56,7 +56,7 @@
   - [~] Idle sweeper deferred — not needed unless we see stuck rows in practice
 - [x] 1.2 LIST cache TTL (5 s directory cache + 5 s meta cache) — already live; invalidated on every create/delete/rename/mkdir
 - [x] 1.3 Verify small-file single-PUT path (≤ 16 MiB skips MPU) — gated on `upload_id.is_none()` at finalize; MPU only starts when contiguous writes cross `PART_TARGET`
-- [ ] 1.4 Strip verbose `[winfsp]` logging — keep errors, drop routine traces
+- [x] 1.4 Strip verbose `[winfsp]` logging — keep errors, drop routine traces (stripped `finalize_write begin`, `cleanup flags=`, `upload complete`; all remaining eprintln! calls are error paths)
 - [ ] 1.5 Replace `tokio::runtime::Builder::new_current_thread` drop-on-block pattern with a single long-lived runtime on the filesystem context
 
 **Target:** every mount-to-Explorer action reports progress and stays responsive.

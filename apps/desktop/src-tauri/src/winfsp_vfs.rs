@@ -735,11 +735,6 @@ impl S3Fs {
     /// do a single PUT.
     fn finalize_write(&self, key: &str, mut state: WriteState) -> Result<u64, String> {
         let size = state.bytes_written;
-        eprintln!(
-            "[winfsp] finalize_write begin key={key} size={size} upload_id={} dispatched={}",
-            state.upload_id.as_deref().unwrap_or("none"),
-            state.dispatched_bytes
-        );
         state.temp_file.sync_all().ok();
         state.temp_file.set_len(size).ok();
 
@@ -1294,7 +1289,6 @@ impl FileSystemContext for S3Fs {
     }
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
-        eprintln!("[winfsp] cleanup flags={flags:#x}");
         // FspCleanupDelete = 0x01
         const CLEANUP_DELETE: u32 = 0x01;
         match context.as_ref() {
@@ -1339,10 +1333,7 @@ impl FileSystemContext for S3Fs {
                         // (start/progress/done/error) so the UI shows a single
                         // continuous upload.
                         match self.finalize_write(key, state) {
-                            Ok(final_size) => {
-                                eprintln!(
-                                    "[winfsp] upload complete key={key} bytes={final_size}"
-                                );
+                            Ok(_final_size) => {
                                 self.invalidate_meta(key);
                                 self.invalidate_parent(key);
                             }

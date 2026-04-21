@@ -44,7 +44,7 @@ pub fn record(
         ) {
             Ok(_) => conn.last_insert_rowid(),
             Err(e) => {
-                eprintln!("activity: insert failed: {e}");
+                tracing::warn!(target: "nanocrew::activity", "insert failed: {e}");
                 return;
             }
         }

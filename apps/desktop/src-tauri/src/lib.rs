@@ -11,6 +11,7 @@ mod db;
 mod dpapi;
 mod error;
 mod file_lock;
+mod logging;
 mod mounts;
 mod state;
 mod types;
@@ -42,7 +43,33 @@ pub fn run() {
                 .join("nanocrew.db");
 
             let conn = db::open(&db_path).expect("failed to open database");
-            app.manage(AppState::new(conn));
+            let state = AppState::new(conn);
+
+            // ── Logging ───────────────────────────────────────────────────────
+            // Initialize tracing BEFORE we manage state so the subscriber is
+            // active for auto_mount_drives and any subsequent events. Read
+            // `verbose_logging` directly from the fresh connection — prefs
+            // module not yet reachable via State<AppState> because we haven't
+            // called app.manage() yet.
+            let verbose = {
+                let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                db.query_row(
+                    "SELECT value FROM prefs WHERE key = 'verbose_logging'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+            };
+            let log_dir = db_path.parent().map(|p| p.join("logs"))
+                .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+            if let Some(guard) = logging::init(&log_dir, verbose) {
+                state.attach_log_guard(guard);
+            }
+            tracing::info!(target: "nanocrew", "startup: log dir = {}", log_dir.display());
+
+            app.manage(state);
 
             // ── System tray ───────────────────────────────────────────────────
             let show = MenuItem::with_id(app, "show", "Show NanoCrew Sync", true, None::<&str>)?;
@@ -185,7 +212,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("auto_mount: prepare failed: {e}");
+                tracing::error!(target: "nanocrew::auto_mount", "prepare failed: {e}");
                 return;
             }
         };
@@ -207,7 +234,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("auto_mount: query failed: {e}");
+                tracing::error!(target: "nanocrew::auto_mount", "query failed: {e}");
                 return;
             }
         }
@@ -224,7 +251,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         let secret = match credentials::retrieve(&state.db, id) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("auto_mount drive {id}: credential error: {e}");
+                tracing::error!(target: "nanocrew::auto_mount", drive_id = id, "credential error: {e}");
                 let msg = e.to_string();
                 let _ = app.emit(
                     "drive_status_changed",

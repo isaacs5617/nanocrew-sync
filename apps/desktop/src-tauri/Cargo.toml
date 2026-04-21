@@ -67,6 +67,12 @@ sha2 = "0.10"
 # Base64 for encoding DPAPI blobs in the SQLite credentials column.
 base64 = "0.22"
 
+# Structured logging. Everything under the `nanocrew=` target flows through
+# `tracing`; `tracing-appender` writes rolling daily files to %APPDATA%.
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+tracing-appender    = "0.2"
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

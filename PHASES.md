@@ -141,7 +141,7 @@
 - [ ] 7.4 Cache — deferred: requires a real on-disk cache (Phase 5.6 LRU) before a location picker makes sense.
 - [x] 7.5 Security — "Require password after Windows lock" now persists as pref `lock_on_session_lock` (replacing the COMING SOON row). Binding it to the actual `WTS_SESSION_LOCK`/sleep events is deferred; pref is in place for Phase 7.5a.
 - [ ] 7.6 Notifications — deferred: depends on toast delivery (Phase 5.4).
-- [ ] 7.7 Advanced verbose logging — deferred: needs `tracing` + `tracing-appender` wiring across crates; kept as COMING SOON for now.
+- [x] 7.7 Advanced verbose logging — `tracing` + `tracing-subscriber` + `tracing-appender` wired in `logging.rs`; rolling daily file at `%APPDATA%\NanoCrew\Sync\logs\nanocrew-sync.log.YYYY-MM-DD`. Level gated by `verbose_logging` pref (info → debug). `WorkerGuard` lives in `AppState` so buffered writes flush on exit. Settings → Advanced exposes the toggle + "Open log folder" button. `eprintln!` calls in `auto_mount_drives` and `activity::record` migrated to structured `tracing::error!/warn!`.
 
 **Target:** (partial) most General/Drives/Security rows are real; Network/Cache/Notifications/Advanced still show COMING SOON pending upstream work.
 

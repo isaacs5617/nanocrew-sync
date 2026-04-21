@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import {
   getTokens, NC_FONT_DISPLAY, NC_FONT_MONO, NC_FONT_UI,
@@ -14,6 +15,7 @@ interface SetupScreenProps {
 
 export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const [username, setUsername] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [confirm, setConfirm] = React.useState('');
@@ -23,9 +25,9 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
 
   const handleCreate = async () => {
     setError(null);
-    if (!username.trim()) { setError('Username is required.'); return; }
-    if (password.length < 8) { setError('Password must be at least 8 characters.'); return; }
-    if (password !== confirm) { setError('Passwords do not match.'); return; }
+    if (!username.trim()) { setError(tr('setup.errorUsername')); return; }
+    if (password.length < 8) { setError(tr('setup.errorShort')); return; }
+    if (password !== confirm) { setError(tr('setup.errorMismatch')); return; }
 
     setBusy(true);
     try {
@@ -53,22 +55,22 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
           <NCWordmark dark={theme === 'dark'} size={22} />
         </div>
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', maxWidth: 420 }}>
-          <NCEyebrow theme={theme} accent style={{ marginBottom: 20 }}>FIRST RUN · SETUP</NCEyebrow>
+          <NCEyebrow theme={theme} accent style={{ marginBottom: 20 }}>{tr('setup.eyebrow')}</NCEyebrow>
           <div style={{
             fontFamily: NC_FONT_DISPLAY, fontWeight: 800,
             fontSize: 44, lineHeight: 0.95, letterSpacing: -2,
             color: t.textHi, marginBottom: 24,
           }}>
-            Create your <span style={{ color: t.lime }}>admin</span> account.
+            {tr('setup.headlinePrefix')} <span style={{ color: t.lime }}>{tr('setup.headlineAccent')}</span> {tr('setup.headlineSuffix')}
           </div>
           <div style={{ fontSize: 15, lineHeight: 1.6, color: t.textMd, marginBottom: 32 }}>
-            This account is stored locally on this machine. It controls access to NanoCrew Sync and all mounted drives.
+            {tr('setup.tagline')}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {[
-              { n: '01', text: 'Credentials never leave this device' },
-              { n: '02', text: 'Password hashed with Argon2id' },
-              { n: '03', text: 'S3 keys stored in Windows Credential Manager' },
+              { n: '01', text: tr('setup.bullet1') },
+              { n: '02', text: tr('setup.bullet2') },
+              { n: '03', text: tr('setup.bullet3') },
             ].map((l, i) => (
               <div key={i} style={{ display: 'flex', gap: 14, alignItems: 'baseline' }}>
                 <span style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.lime, letterSpacing: 1.5 }}>{l.n}</span>
@@ -78,7 +80,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
           </div>
         </div>
         <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: t.textLo, letterSpacing: 1.5 }}>
-          NANOCREW · CAPE TOWN · CORTEX · SYNC
+          {tr('common.footer.nanocrew')}
         </div>
       </div>
 
@@ -88,18 +90,18 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
           <div style={{
             fontFamily: NC_FONT_DISPLAY, fontWeight: 800,
             fontSize: 26, letterSpacing: -0.8, color: t.textHi, marginBottom: 8,
-          }}>Set up your account</div>
+          }}>{tr('setup.heading')}</div>
           <div style={{ fontSize: 13, color: t.textMd, marginBottom: 28 }}>
-            You only need to do this once. Additional users can be added later.
+            {tr('setup.instructions')}
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 20 }}>
             <div>
-              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>Username</div>
+              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>{tr('common.username')}</div>
               <NCInput theme={theme} value={username} onChange={setUsername} prefix={<I.user size={13} />} />
             </div>
             <div>
-              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>Password</div>
+              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>{tr('common.password')}</div>
               <NCInput
                 theme={theme}
                 type={showPw ? 'text' : 'password'}
@@ -110,7 +112,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
               />
             </div>
             <div>
-              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>Confirm password</div>
+              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>{tr('setup.confirmPassword')}</div>
               <NCInput theme={theme} type="password" value={confirm} onChange={setConfirm} prefix={<I.lock size={13} />} />
             </div>
           </div>
@@ -134,7 +136,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ theme, onDone }) => {
             onClick={handleCreate}
             disabled={busy}
           >
-            {busy ? 'Creating account…' : 'Create account'}
+            {busy ? tr('setup.submitting') : tr('setup.submit')}
           </NCBtn>
         </div>
       </div>

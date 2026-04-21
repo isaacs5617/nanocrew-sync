@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -37,6 +38,7 @@ const DriveMenu: React.FC<{
   onClose: () => void;
 }> = ({ drive, theme, anchorRect, onRemove, onOpen, onClose }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const ref = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
@@ -73,10 +75,10 @@ const DriveMenu: React.FC<{
       borderRadius: 4, boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
       minWidth: 180, overflow: 'hidden',
     }}>
-      {drive.status === 'mounted' && item('Open in Explorer', <I.folder size={13} />, () => onOpen(drive.letter))}
+      {drive.status === 'mounted' && item(tr('dashboard.menu.openExplorer'), <I.folder size={13} />, () => onOpen(drive.letter))}
       {drive.status === 'mounted' && <div style={{ height: 1, background: t.border }} />}
       {drive.status !== 'mounted'
-        ? item('Remove drive', <I.trash size={13} />, () => onRemove(drive.id), true)
+        ? item(tr('dashboard.menu.remove'), <I.trash size={13} />, () => onRemove(drive.id), true)
         : (
           <div style={{
             display: 'flex', alignItems: 'center', gap: 10,
@@ -84,7 +86,7 @@ const DriveMenu: React.FC<{
             color: t.textLo, cursor: 'not-allowed',
           }}>
             <I.trash size={13} />
-            Remove drive
+            {tr('dashboard.menu.remove')}
           </div>
         )}
     </div>
@@ -107,12 +109,13 @@ const DriveRow: React.FC<{
   onOpen: (letter: string) => void;
 }> = ({ d, theme, last, menuOpen, menuAnchor, onMount, onUnmount, onMenuOpen, onMenuClose, onRemove, onOpen }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const statusMap: Record<string, { label: string; color: string; dot: DriveStatus }> = {
-    mounted:   { label: 'Mounted',   color: t.lime,    dot: 'mounted' },
-    mounting:  { label: 'Mounting…', color: t.lime,    dot: 'syncing' },
-    syncing:   { label: 'Syncing',   color: t.lime,    dot: 'syncing' },
-    error:     { label: 'Error',     color: t.danger,  dot: 'error' },
-    offline:   { label: 'Offline',   color: t.textLo,  dot: 'offline' },
+    mounted:   { label: tr('dashboard.status.mounted'),  color: t.lime,    dot: 'mounted' },
+    mounting:  { label: tr('dashboard.status.mounting'), color: t.lime,    dot: 'syncing' },
+    syncing:   { label: tr('dashboard.status.syncing'),  color: t.lime,    dot: 'syncing' },
+    error:     { label: tr('dashboard.status.error'),    color: t.danger,  dot: 'error' },
+    offline:   { label: tr('dashboard.status.offline'),  color: t.textLo,  dot: 'offline' },
   };
   const s = statusMap[d.status] ?? statusMap['offline']!;
   const isMounted = d.status === 'mounted' || d.status === 'mounting' || d.status === 'syncing';
@@ -181,6 +184,7 @@ interface DashboardScreenProps {
 
 export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDrive }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const { token } = useAuth();
   const [drives, setDrives] = React.useState<Drive[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -243,12 +247,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
     <>
       <TopBar
         theme={theme}
-        crumbs={['Drives']}
-        title={<>Mounted <span style={{ color: t.lime }}>drives</span></>}
-        subtitle={`${drives.length} connection${drives.length !== 1 ? 's' : ''}`}
+        crumbs={[tr('dashboard.crumb')]}
+        title={<>{tr('dashboard.titlePrefix')} <span style={{ color: t.lime }}>{tr('dashboard.titleAccent')}</span></>}
+        subtitle={tr(drives.length === 1 ? 'dashboard.subtitleOne' : 'dashboard.subtitleOther', { count: drives.length })}
         actions={<>
-          <NCBtn theme={theme} small iconLeft={<I.refresh size={13} />} onClick={loadDrives}>Refresh</NCBtn>
-          <NCBtn theme={theme} small primary iconLeft={<I.plus size={13} />} onClick={onAddDrive}>Add drive</NCBtn>
+          <NCBtn theme={theme} small iconLeft={<I.refresh size={13} />} onClick={loadDrives}>{tr('dashboard.refresh')}</NCBtn>
+          <NCBtn theme={theme} small primary iconLeft={<I.plus size={13} />} onClick={onAddDrive}>{tr('dashboard.addDrive')}</NCBtn>
         </>}
       />
 
@@ -256,9 +260,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
         {/* Stats strip */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 24 }}>
           {[
-            { label: 'MOUNTED',  value: String(mounted),         foot: `of ${drives.length} configured` },
-            { label: 'DRIVES',   value: String(drives.length),   foot: drives.length === 0 ? 'none yet — add one below' : `${readonly} read-only` },
-            { label: 'PROVIDER', value: drives.length > 0 ? drives[0].provider.toUpperCase() : '—', foot: drives.length > 1 ? `+${drives.length - 1} more` : 'your storage, your keys' },
+            { label: tr('dashboard.stats.mounted'),  value: String(mounted),         foot: tr('dashboard.stats.ofConfigured', { total: drives.length }) },
+            { label: tr('dashboard.stats.drives'),   value: String(drives.length),   foot: drives.length === 0 ? tr('dashboard.stats.noneYet') : tr('dashboard.stats.readonlyCount', { count: readonly }) },
+            { label: tr('dashboard.stats.provider'), value: drives.length > 0 ? drives[0].provider.toUpperCase() : '—', foot: drives.length > 1 ? tr('dashboard.stats.moreCount', { count: drives.length - 1 }) : tr('dashboard.stats.tagline') },
           ].map((s, i) => (
             <NCCard key={i} theme={theme} pad={16}>
               <NCEyebrow theme={theme} style={{ marginBottom: 10 }}>{s.label}</NCEyebrow>
@@ -284,28 +288,28 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
             </div>
             {actionError.toLowerCase().includes('winfsp') && (
               <div style={{ marginTop: 8, paddingLeft: 21, color: t.textMd }}>
-                WinFsp is required to mount drives. Download it from{' '}
+                {tr('dashboard.winfspHint')}{' '}
                 <span
                   onClick={() => invoke('open_path', { token, path: 'https://winfsp.net' })}
                   style={{ color: t.lime, fontFamily: NC_FONT_MONO, fontSize: 11, cursor: 'pointer' }}
                 >winfsp.net</span>{' '}
-                and install, then restart NanoCrew Sync.
+                {tr('dashboard.winfspHintCont')}
               </div>
             )}
             {actionError.toLowerCase().includes('credential') && (
               <div style={{ marginTop: 8, paddingLeft: 21, color: t.textMd }}>
-                Use the ⋯ menu on the drive row to remove it, then add it again.
+                {tr('dashboard.credentialHint')}
               </div>
             )}
           </div>
         )}
 
         {/* Drive list */}
-        <NCEyebrow theme={theme} style={{ marginBottom: 12 }}>Drives</NCEyebrow>
+        <NCEyebrow theme={theme} style={{ marginBottom: 12 }}>{tr('dashboard.drivesHeader')}</NCEyebrow>
 
         {loading ? (
           <div style={{ padding: 40, textAlign: 'center', color: t.textLo, fontFamily: NC_FONT_MONO, fontSize: 11, letterSpacing: 1.5 }}>
-            LOADING…
+            {tr('dashboard.loadingUpper')}
           </div>
         ) : drives.length === 0 ? (
           <div style={{
@@ -313,8 +317,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
           }}>
             <I.cloud size={32} color={t.textLo} />
-            <div style={{ fontSize: 13, color: t.textMd }}>No drives configured yet.</div>
-            <NCBtn theme={theme} small primary iconLeft={<I.plus size={13} />} onClick={onAddDrive}>Add your first drive</NCBtn>
+            <div style={{ fontSize: 13, color: t.textMd }}>{tr('dashboard.noDrives')}</div>
+            <NCBtn theme={theme} small primary iconLeft={<I.plus size={13} />} onClick={onAddDrive}>{tr('dashboard.addFirst')}</NCBtn>
           </div>
         ) : (
           <div style={{ border: `1px solid ${t.border}`, borderRadius: 4, background: t.surface1, overflow: 'hidden' }}>
@@ -327,10 +331,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
               color: t.textMd, textTransform: 'uppercase',
             }}>
               <span /><span />
-              <span>Drive name</span>
-              <span>Letter</span>
-              <span>Region</span>
-              <span>Status</span>
+              <span>{tr('dashboard.col.name')}</span>
+              <span>{tr('dashboard.col.letter')}</span>
+              <span>{tr('dashboard.col.region')}</span>
+              <span>{tr('dashboard.col.status')}</span>
               <span />
             </div>
             {drives.map((d, i) => (
@@ -364,10 +368,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
               <I.plus size={16} color={t.textMd} />
             </div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Connect another bucket</div>
-              <div style={{ fontSize: 12, color: t.textMd }}>Mount Wasabi, S3, or B2 as a local drive letter.</div>
+              <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>{tr('dashboard.connectTitle')}</div>
+              <div style={{ fontSize: 12, color: t.textMd }}>{tr('dashboard.connectSub')}</div>
             </div>
-            <NCBtn theme={theme} small onClick={onAddDrive}>Add drive</NCBtn>
+            <NCBtn theme={theme} small onClick={onAddDrive}>{tr('dashboard.addDrive')}</NCBtn>
           </div>
         )}
       </div>

@@ -149,7 +149,7 @@
 
 ## Phase 8 — Internationalization
 
-- [~] 8.1 `react-i18next` + `en.json` baseline — **scaffold done**: `i18next`, `react-i18next`, and `i18next-browser-languagedetector` added to `apps/desktop`; `src/i18n/index.ts` bootstraps i18n with a localStorage cache (`nanocrew_locale`) and a single `en.json` file containing ~25 baseline keys (tray, common buttons, activity, settings sections). ActivityScreen migrated as the proof-of-life consumer. Remaining strings across the app still live as English literals — extraction is the bulk of the work and is deferred.
+- [~] 8.1 `react-i18next` + `en.json` baseline — scaffold + four of the highest-traffic screens migrated: ActivityScreen, OnboardingScreen, SetupScreen, DashboardScreen. `en.json` now has ~90 keys covering tray, common buttons, activity, settings section headings, onboarding, setup, and the dashboard (incl. pluralised `subtitleOne/Other`, status labels, and error-hint fragments). `AddDriveS3Screen`, `AddDrivePickerScreen`, `SettingsScreen`, `AccountScreen`, `FileBrowserScreen`, `TransfersScreen`, `ErrorScreen`, and `LockScreen` still contain English literals — next wave.
 - [ ] 8.2 Ship 6 languages (DE, FR, ES, PT-BR, JA) — deferred until 8.1 extraction is complete; adding locales before the en.json source is finalised just means churn.
 - [ ] 8.3 Language picker in Settings → General — deferred (scaffold exposes `SUPPORTED_LOCALES` for the picker to consume once non-EN locales land).
 - [ ] 8.4 GitHub-based contribution flow for community-translated locales — requires the locales/ directory structure to be stable first.

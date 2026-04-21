@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import {
   getTokens, NC_FONT_DISPLAY, NC_FONT_MONO, NC_FONT_UI,
@@ -14,6 +15,7 @@ interface OnboardingScreenProps {
 
 export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSignIn }) => {
   const t = getTokens(theme);
+  const { t: tr } = useTranslation();
   const [username, setUsername] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [showPw, setShowPw] = React.useState(false);
@@ -22,14 +24,14 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
 
   const handleSignIn = async () => {
     setError(null);
-    if (!username.trim() || !password) { setError('Username and password are required.'); return; }
+    if (!username.trim() || !password) { setError(tr('onboarding.errorRequired')); return; }
 
     setBusy(true);
     try {
       const token = await invoke<string>('sign_in', { username: username.trim(), password });
       onSignIn(token);
     } catch (e) {
-      setError('Invalid username or password.');
+      setError(tr('onboarding.errorInvalid'));
     } finally {
       setBusy(false);
     }
@@ -51,23 +53,22 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
           <NCWordmark dark={theme === 'dark'} size={22} />
         </div>
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', maxWidth: 420 }}>
-          <NCEyebrow theme={theme} accent style={{ marginBottom: 20 }}>WELCOME · EARLY ACCESS</NCEyebrow>
+          <NCEyebrow theme={theme} accent style={{ marginBottom: 20 }}>{tr('onboarding.eyebrow')}</NCEyebrow>
           <div style={{
             fontFamily: NC_FONT_DISPLAY, fontWeight: 800,
             fontSize: 52, lineHeight: 0.95, letterSpacing: -2,
             color: t.textHi, marginBottom: 24,
           }}>
-            Mount any <span style={{ color: t.lime }}>bucket</span> as a Windows drive.
+            {tr('onboarding.headlinePrefix')} <span style={{ color: t.lime }}>{tr('onboarding.headlineAccent')}</span> {tr('onboarding.headlineSuffix')}
           </div>
           <div style={{ fontSize: 15, lineHeight: 1.6, color: t.textMd, marginBottom: 32 }}>
-            NanoCrew Sync turns Wasabi, S3 and other S3-compatible stores into native drive letters.
-            Open files in any app, stream large media, and keep your credentials in the OS keychain.
+            {tr('onboarding.tagline')}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {[
-              { n: '01', text: 'Mounts like Z:\\ — every Windows app sees it as local' },
-              { n: '02', text: 'Bring-your-own storage — we never touch your data' },
-              { n: '03', text: 'Free for everyone, forever during beta' },
+              { n: '01', text: tr('onboarding.bullet1') },
+              { n: '02', text: tr('onboarding.bullet2') },
+              { n: '03', text: tr('onboarding.bullet3') },
             ].map((l, i) => (
               <div key={i} style={{ display: 'flex', gap: 14, alignItems: 'baseline' }}>
                 <span style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.lime, letterSpacing: 1.5 }}>{l.n}</span>
@@ -77,7 +78,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
           </div>
         </div>
         <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: t.textLo, letterSpacing: 1.5 }}>
-          NANOCREW · CAPE TOWN · CORTEX · SYNC
+          {tr('common.footer.nanocrew')}
         </div>
       </div>
 
@@ -87,18 +88,18 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
           <div style={{
             fontFamily: NC_FONT_DISPLAY, fontWeight: 800,
             fontSize: 26, letterSpacing: -0.8, color: t.textHi, marginBottom: 8,
-          }}>Sign in to continue</div>
+          }}>{tr('onboarding.heading')}</div>
           <div style={{ fontSize: 13, color: t.textMd, marginBottom: 28 }}>
-            Enter your local NanoCrew Sync credentials.
+            {tr('onboarding.instructions')}
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 20 }}>
             <div>
-              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>Username</div>
+              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>{tr('common.username')}</div>
               <NCInput theme={theme} value={username} onChange={setUsername} prefix={<I.user size={13} />} />
             </div>
             <div>
-              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>Password</div>
+              <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, fontWeight: 500, letterSpacing: 2, textTransform: 'uppercase', color: t.textMd, marginBottom: 8 }}>{tr('common.password')}</div>
               <NCInput
                 theme={theme}
                 type={showPw ? 'text' : 'password'}
@@ -129,7 +130,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
             onClick={handleSignIn}
             disabled={busy}
           >
-            {busy ? 'Signing in…' : 'Sign in'}
+            {busy ? tr('onboarding.submitting') : tr('onboarding.submit')}
           </NCBtn>
         </div>
       </div>

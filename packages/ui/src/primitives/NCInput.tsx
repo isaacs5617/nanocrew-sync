@@ -12,11 +12,14 @@ interface NCInputProps {
   prefix?: React.ReactNode;
   suffix?: React.ReactNode;
   small?: boolean;
+  inputRef?: React.Ref<HTMLInputElement>;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+  autoFocus?: boolean;
 }
 
 export const NCInput: React.FC<NCInputProps> = ({
   value, placeholder, mono, theme = 'dark', type = 'text',
-  style, onChange, prefix, suffix, small,
+  style, onChange, prefix, suffix, small, inputRef, onKeyDown, autoFocus,
 }) => {
   const t = getTokens(theme);
   return (
@@ -30,10 +33,13 @@ export const NCInput: React.FC<NCInputProps> = ({
         <div style={{ color: t.textMd, marginRight: 8, display: 'flex' }}>{prefix}</div>
       )}
       <input
+        ref={inputRef}
         type={type}
         value={value ?? ''}
         placeholder={placeholder}
+        autoFocus={autoFocus}
         onChange={(e) => onChange?.(e.target.value)}
+        onKeyDown={onKeyDown}
         style={{
           flex: 1, minWidth: 0,
           background: 'transparent', border: 'none', outline: 'none',

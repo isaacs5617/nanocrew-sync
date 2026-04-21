@@ -22,7 +22,7 @@ interface AccountInfo {
 
 export const AccountScreen: React.FC<AccountScreenProps> = ({ theme, onSignOut }) => {
   const t = getTokens(theme);
-  const { token } = useAuth();
+  const { token, lock } = useAuth();
   const [account, setAccount] = React.useState<AccountInfo | null>(null);
   const [changingPw, setChangingPw] = React.useState(false);
   const [currentPw, setCurrentPw] = React.useState('');
@@ -70,9 +70,14 @@ export const AccountScreen: React.FC<AccountScreenProps> = ({ theme, onSignOut }
         title={<>Your <span style={{ color: t.lime }}>account</span></>}
         subtitle="NanoCrew Sync is currently free for everyone. Bring your own storage — we never touch your data."
         actions={
-          <NCBtn theme={theme} small ghost iconLeft={<I.x size={13} />} onClick={onSignOut}>
-            Sign out
-          </NCBtn>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <NCBtn theme={theme} small ghost iconLeft={<I.lock size={13} />} onClick={lock}>
+              Lock
+            </NCBtn>
+            <NCBtn theme={theme} small ghost iconLeft={<I.x size={13} />} onClick={onSignOut}>
+              Sign out
+            </NCBtn>
+          </div>
         }
       />
       <div style={{ flex: 1, overflow: 'auto', padding: 28 }}>

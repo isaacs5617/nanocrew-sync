@@ -16,11 +16,22 @@ import { OnboardingScreen } from './screens/OnboardingScreen.js';
 import { SetupScreen } from './screens/SetupScreen.js';
 import { AddDrivePickerScreen } from './screens/AddDrivePickerScreen.js';
 import { AddDriveS3Screen } from './screens/AddDriveS3Screen.js';
+import { LockScreen } from './screens/LockScreen.js';
 import { AuthContext } from './context/auth.js';
 import { TransfersProvider } from './context/transfers.js';
 import type { NavKey } from '@nanocrew/ui';
 
-type AppState = 'loading' | 'setup' | 'signin' | 'authed';
+type AppState = 'loading' | 'setup' | 'signin' | 'authed' | 'locked';
+
+// localStorage key for the "lock on minimize" preference. Lives on the
+// browser side because it's a UI-only setting and needs to be read before
+// any backend call can happen.
+const LOCK_ON_MINIMIZE_KEY = 'nanocrew.lockOnMinimize';
+export const readLockOnMinimize = (): boolean =>
+  window.localStorage.getItem(LOCK_ON_MINIMIZE_KEY) === '1';
+export const writeLockOnMinimize = (on: boolean): void => {
+  window.localStorage.setItem(LOCK_ON_MINIMIZE_KEY, on ? '1' : '0');
+};
 
 const NAV_TO_PATH: Record<NavKey, string> = {
   home:      '/drives',
@@ -116,6 +127,7 @@ export function App() {
   const [theme, setTheme] = React.useState<Theme>('dark');
   const [appState, setAppState] = React.useState<AppState>('loading');
   const [token, setToken] = React.useState<string>('');
+  const [username, setUsername] = React.useState<string>('');
   const [version, setVersion] = React.useState<string>('');
   const t = getTokens(theme);
 
@@ -128,18 +140,49 @@ export function App() {
       .catch(() => setAppState('signin'));
   }, []);
 
+  // Session lock — listen for the Tauri window's "resize" (minimize fires
+  // this with a zeroed inner size on Windows). We only lock when signed in
+  // and when the user opted in via Settings. Drives stay mounted throughout;
+  // the lock is purely UI-level.
+  React.useEffect(() => {
+    if (appState !== 'authed') return;
+    if (!readLockOnMinimize()) return;
+
+    let cancelled = false;
+    (async () => {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const win = getCurrentWindow();
+      const unlisten = await win.onResized(async () => {
+        if (cancelled) return;
+        try {
+          if (await win.isMinimized()) setAppState('locked');
+        } catch { /* ignore */ }
+      });
+      return unlisten;
+    })().catch(() => {});
+
+    return () => { cancelled = true; };
+  }, [appState]);
+
   const handleSetupDone = () => setAppState('signin');
 
   const handleSignIn = (tok: string) => {
     setToken(tok);
     setAppState('authed');
+    invoke<{ username: string }>('get_account', { token: tok })
+      .then(a => setUsername(a.username))
+      .catch(() => {});
   };
 
   const handleSignOut = async () => {
     if (token) await invoke('sign_out', { token }).catch(() => {});
     setToken('');
+    setUsername('');
     setAppState('signin');
   };
+
+  const handleLock = () => { if (appState === 'authed') setAppState('locked'); };
+  const handleUnlock = () => { if (appState === 'locked') setAppState('authed'); };
 
   const renderContent = () => {
     switch (appState) {
@@ -155,11 +198,21 @@ export function App() {
         return <OnboardingScreen theme={theme} onSignIn={handleSignIn} />;
       case 'authed':
         return (
-          <AuthContext.Provider value={{ token, signOut: handleSignOut }}>
+          <AuthContext.Provider value={{ token, signOut: handleSignOut, lock: handleLock }}>
             <TransfersProvider>
               <ShellLayout theme={theme} setTheme={setTheme} token={token} onSignOut={handleSignOut} version={version} />
             </TransfersProvider>
           </AuthContext.Provider>
+        );
+      case 'locked':
+        return (
+          <LockScreen
+            theme={theme}
+            token={token}
+            username={username}
+            onUnlock={handleUnlock}
+            onSignOut={handleSignOut}
+          />
         );
     }
   };

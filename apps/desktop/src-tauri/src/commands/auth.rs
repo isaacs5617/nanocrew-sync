@@ -168,6 +168,37 @@ pub async fn change_password(
     Ok(())
 }
 
+/// Re-verify the authenticated user's password without issuing a new token.
+/// Used by the session-lock flow: drives stay mounted, the session token
+/// stays valid, we just re-prove the user is at the keyboard.
+#[tauri::command]
+pub async fn verify_password(
+    state: State<'_, AppState>,
+    token: String,
+    password: String,
+) -> Result<(), String> {
+    let account_id = require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let stored_hash: String = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT password_hash FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| AppError::InvalidCredentials.to_string())?
+    };
+
+    let parsed = PasswordHash::new(&stored_hash)
+        .map_err(|e| AppError::PasswordHash(e.to_string()).to_string())?;
+
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .map_err(|_| AppError::InvalidCredentials.to_string())?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_cache(
     state: State<'_, AppState>,

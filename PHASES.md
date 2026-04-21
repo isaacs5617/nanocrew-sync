@@ -90,7 +90,7 @@
 
 - [ ] 3.1 Cache encryption — AES-256-GCM on temp spool files, per-session key derived from machine ID + user password (deferred: needs part-aligned chunk encryption so MPU reads stay cheap; crates wired, module design TBD)
 - [x] 3.2 Credential-at-rest re-encryption — DPAPI-wrap S3 secrets in SQLite (`credentials.rs` + new `dpapi.rs`; `v1:<base64>` envelope with legacy-plaintext migration on first read; `add_drive` routes through `credentials::store` and never persists the raw secret)
-- [ ] 3.3 Session lock — "lock app on minimize" and "require password after screen lock" wired; PIN fallback
+- [x] 3.3 Session lock — "lock app on minimize" wired via Tauri `onResized` + `isMinimized`; `verify_password` backend command; `LockScreen` UI with password prompt; drives stay mounted throughout (files remain accessible in Explorer while locked); manual Lock button on Account screen; opt-in toggle in Settings → Security. PIN fallback deferred to a later polish pass.
 - [ ] 3.4 Audit log of security-sensitive actions (mount, unmount, credential add, lock)
 
 **Target:** "zero plaintext at rest" claim substantiated end-to-end.

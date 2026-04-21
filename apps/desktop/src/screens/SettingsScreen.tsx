@@ -10,6 +10,7 @@ import {
 import { I } from '@nanocrew/ui';
 import { useAuth } from '../context/auth.js';
 import { UpdateButton } from './UpdateButton.js';
+import { readLockOnMinimize, writeLockOnMinimize } from '../App.js';
 
 interface SettingsScreenProps {
   theme: Theme;
@@ -19,11 +20,19 @@ interface SettingsScreenProps {
 const ToggleRow: React.FC<{
   label: string; sub?: string; on?: boolean; theme: Theme;
   comingSoon?: boolean;
+  onChange?: (v: boolean) => void;
 }> = ({
-  label, sub, on, theme, comingSoon,
+  label, sub, on, theme, comingSoon, onChange,
 }) => {
   const t = getTokens(theme);
   const [v, setV] = React.useState(comingSoon ? false : (on ?? false));
+  // Keep internal state in sync when `on` prop changes (controlled-ish).
+  React.useEffect(() => { if (!comingSoon && on !== undefined) setV(on); }, [on, comingSoon]);
+  const handle = (next: boolean) => {
+    if (comingSoon) return;
+    setV(next);
+    onChange?.(next);
+  };
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, opacity: comingSoon ? 0.55 : 1 }}>
       <div style={{ flex: 1 }}>
@@ -39,7 +48,7 @@ const ToggleRow: React.FC<{
         </div>
         {sub && <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>{sub}</div>}
       </div>
-      <NCToggle on={v} onChange={comingSoon ? () => {} : setV} theme={theme} />
+      <NCToggle on={v} onChange={handle} theme={theme} />
     </div>
   );
 };
@@ -263,7 +272,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Session</NCEyebrow>
             <ToggleRow theme={theme} label="Require password after screen lock" sub="Re-authenticate when Windows resumes from sleep or lock screen." comingSoon />
             <Spacer />
-            <ToggleRow theme={theme} label="Lock app when minimized to tray" comingSoon />
+            <ToggleRow
+              theme={theme}
+              label="Lock app when minimized"
+              sub="Require your password to unlock. Drives stay mounted — files stay accessible in Explorer."
+              on={readLockOnMinimize()}
+              onChange={writeLockOnMinimize}
+            />
           </NCCard>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Credential storage</NCEyebrow>

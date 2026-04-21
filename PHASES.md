@@ -125,11 +125,11 @@
 
 ## Phase 6 — Activity & audit
 
-- [ ] 6.1 Persist activity log to SQLite `activity` table — mount, unmount, upload, download, rename, delete, error
-- [ ] 6.2 Activity screen rewrite — filter by drive / event type / date; export CSV
-- [ ] 6.3 Error aggregation — group repeated errors, show recovery actions
+- [x] 6.1 Persist activity log to SQLite `activity` table — new table with `id, ts, kind, action, severity, drive_id, actor, target, message` + ts DESC / kind indexes. Central `commands::activity::record(...)` helper wired into `auth::{create_admin, sign_in, sign_out, change_password}` and `drives::{add_drive, remove_drive, mount_drive, unmount_drive}` plus the `lib.rs::auto_mount_drives` success/error paths, so every user-visible domain event lands in the log. Inserts also fan out a live `activity_appended` Tauri event.
+- [x] 6.2 Activity screen rewrite — `ActivityScreen` now loads from `list_activity` (kinds, severity, since, limit) and live-appends via `activity_appended`. UI adds KIND chips (ALL/MOUNT/DRIVE/AUTH/FILE/SYSTEM), an ERRORS-ONLY toggle with live count, free-text filter across action/actor/target/message, Clear log (`clear_activity`) and Export CSV (client-side Blob download, RFC-4180-safe). A matching Rust `export_activity_csv(path)` command is also registered for programmatic dumps.
+- [ ] 6.3 Error aggregation — deferred: grouping repeated errors and surfacing inline recovery actions belongs with the toast/notification work in Phase 5.4 and Phase 7.6.
 
-**Target:** an admin can reconstruct exactly what happened on a drive in the last 30 days.
+**Target:** an admin can reconstruct exactly what happened on a drive in the last 30 days. (Achieved for 6.1/6.2; 6.3 deferred.)
 
 ---
 

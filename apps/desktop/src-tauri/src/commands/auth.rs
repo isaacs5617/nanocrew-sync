@@ -3,11 +3,12 @@ use argon2::{
     Argon2,
 };
 use rand_core::OsRng;
-use tauri::State;
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
 use crate::{
     auth::require_auth,
+    commands::activity,
     error::AppError,
     state::{ActiveSession, AppState},
     types::AccountInfo,
@@ -16,6 +17,7 @@ use crate::{
 #[tauri::command]
 pub async fn create_admin(
     state: State<'_, AppState>,
+    app: AppHandle,
     username: String,
     password: String,
 ) -> Result<(), String> {
@@ -45,6 +47,12 @@ pub async fn create_admin(
         rusqlite::params![username, hash],
     )
     .map_err(|e| AppError::Db(e).to_string())?;
+    drop(db);
+
+    activity::record(
+        &state.db, &app, "auth", "account_created", activity::SEV_INFO,
+        None, Some(&username), None, None,
+    );
 
     Ok(())
 }
@@ -52,6 +60,7 @@ pub async fn create_admin(
 #[tauri::command]
 pub async fn sign_in(
     state: State<'_, AppState>,
+    app: AppHandle,
     username: String,
     password: String,
 ) -> Result<String, String> {
@@ -75,7 +84,12 @@ pub async fn sign_in(
     let token = Uuid::new_v4().to_string();
     state.sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
         token.clone(),
-        ActiveSession { account_id, username },
+        ActiveSession { account_id, username: username.clone() },
+    );
+
+    activity::record(
+        &state.db, &app, "auth", "sign_in", activity::SEV_INFO,
+        None, Some(&username), None, None,
     );
 
     Ok(token)
@@ -84,9 +98,22 @@ pub async fn sign_in(
 #[tauri::command]
 pub async fn sign_out(
     state: State<'_, AppState>,
+    app: AppHandle,
     token: String,
 ) -> Result<(), String> {
-    state.sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
+    let user = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&token)
+        .map(|s| s.username);
+
+    if let Some(u) = user.as_deref() {
+        activity::record(
+            &state.db, &app, "auth", "sign_out", activity::SEV_INFO,
+            None, Some(u), None, None,
+        );
+    }
     Ok(())
 }
 
@@ -125,6 +152,7 @@ pub async fn get_account(
 #[tauri::command]
 pub async fn change_password(
     state: State<'_, AppState>,
+    app: AppHandle,
     token: String,
     current_password: String,
     new_password: String,
@@ -164,6 +192,17 @@ pub async fn change_password(
         )
         .map_err(|e| AppError::Db(e).to_string())?;
     }
+
+    let actor = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&token)
+        .map(|s| s.username.clone());
+    activity::record(
+        &state.db, &app, "auth", "password_changed", activity::SEV_INFO,
+        None, actor.as_deref(), None, None,
+    );
 
     Ok(())
 }

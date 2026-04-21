@@ -94,6 +94,24 @@ pub struct FileLockEvent {
     pub machine: Option<String>,
 }
 
+/// One row of the append-only activity log, as returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityEntry {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub action: String,
+    pub severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Emitted as `transfer_progress` whenever a file transfer starts, makes
 /// progress, completes, or errors.  `state` is one of "start" | "progress" |
 /// "done" | "error".

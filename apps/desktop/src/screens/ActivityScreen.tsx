@@ -9,44 +9,85 @@ import {
 import { I } from '@nanocrew/ui';
 import { useAuth } from '../context/auth.js';
 
+/** One row as returned by the `list_activity` Tauri command. */
 interface ActivityEntry {
   id: number;
-  time: Date;
-  driveId: number;
-  driveName: string;
-  status: string;
-  message?: string;
+  ts: number;         // unix seconds
+  kind: string;       // auth | drive | mount | file | system | error
+  action: string;     // sign_in, mount, unmount, ...
+  severity: string;   // info | warn | error
+  drive_id?: number | null;
+  actor?: string | null;
+  target?: string | null;
+  message?: string | null;
 }
 
-interface Drive {
-  id: number;
-  name: string;
-  letter: string;
-  status: string;
-}
+/** Kinds shown in the filter row, in display order. `null` = "all". */
+const KINDS: { key: string | null; label: string }[] = [
+  { key: null,     label: 'ALL' },
+  { key: 'mount',  label: 'MOUNT' },
+  { key: 'drive',  label: 'DRIVE' },
+  { key: 'auth',   label: 'AUTH' },
+  { key: 'file',   label: 'FILE' },
+  { key: 'system', label: 'SYSTEM' },
+];
 
-function statusColor(status: string, t: ReturnType<typeof getTokens>) {
-  switch (status) {
-    case 'mounted':  return t.lime;
-    case 'mounting': return t.textMd;
-    case 'offline':  return t.textLo;
-    case 'error':    return t.danger;
-    default:         return t.textMd;
+function severityColor(sev: string, t: ReturnType<typeof getTokens>) {
+  switch (sev) {
+    case 'error': return t.danger;
+    case 'warn':  return t.textHi;
+    default:      return t.lime;
   }
 }
 
-function statusLabel(status: string) {
-  switch (status) {
-    case 'mounted':  return 'MOUNTED';
-    case 'mounting': return 'MOUNTING';
-    case 'offline':  return 'OFFLINE';
-    case 'error':    return 'ERROR';
-    default:         return status.toUpperCase();
-  }
+function actionLabel(action: string) {
+  return action.replace(/_/g, ' ').toUpperCase();
 }
 
-function formatTime(d: Date) {
+function formatTime(ts: number) {
+  const d = new Date(ts * 1000);
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function formatDate(ts: number) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { month: 'short', day: '2-digit' });
+}
+
+/** RFC 4180 field escape — wraps fields that contain ,"\r\n in quotes. */
+function csvField(s: string): string {
+  if (/[,"\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+/** Build a CSV dump from the rows currently visible in the UI. */
+function buildCsv(rows: ActivityEntry[]): string {
+  const header = 'id,ts,iso_time,kind,action,severity,drive_id,actor,target,message\n';
+  const body = rows.map(r => [
+    r.id,
+    r.ts,
+    csvField(new Date(r.ts * 1000).toISOString()),
+    csvField(r.kind),
+    csvField(r.action),
+    csvField(r.severity),
+    r.drive_id ?? '',
+    csvField(r.actor ?? ''),
+    csvField(r.target ?? ''),
+    csvField(r.message ?? ''),
+  ].join(',')).join('\n');
+  return header + body + '\n';
+}
+
+/** Trigger a browser download of `text` as `filename` via a transient <a>. */
+function downloadCsv(filename: string, text: string) {
+  const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 interface ActivityScreenProps { theme: Theme }
@@ -55,60 +96,70 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
   const t = getTokens(theme);
   const { token } = useAuth();
 
-  const [drives, setDrives] = React.useState<Drive[]>([]);
-  const [log, setLog] = React.useState<ActivityEntry[]>([]);
-  const entryId = React.useRef(0);
-  const driveMapRef = React.useRef<Map<number, string>>(new Map());
+  const [entries, setEntries] = React.useState<ActivityEntry[]>([]);
+  const [kind, setKind] = React.useState<string | null>(null);
+  const [errorsOnly, setErrorsOnly] = React.useState(false);
+  const [search, setSearch] = React.useState('');
+  const [loading, setLoading] = React.useState(true);
 
-  // Load drives on mount for name lookup
+  // Load from backend whenever filters change. Kind/severity filtering could
+  // happen client-side too, but pushing it to SQL keeps the fetch cheap even
+  // when the log gets large.
+  const reload = React.useCallback(() => {
+    setLoading(true);
+    invoke<ActivityEntry[]>('list_activity', {
+      token,
+      kinds: kind ? [kind] : null,
+      severity: errorsOnly ? 'error' : null,
+      since: null,
+      limit: 1000,
+    })
+      .then(rows => setEntries(rows))
+      .catch(() => setEntries([]))
+      .finally(() => setLoading(false));
+  }, [token, kind, errorsOnly]);
+
+  React.useEffect(() => { reload(); }, [reload]);
+
+  // Live updates via Tauri event. We ignore entries that don't match the
+  // current filter so the UI doesn't flicker with unrelated rows.
   React.useEffect(() => {
-    invoke<Drive[]>('list_drives', { token })
-      .then(all => {
-        setDrives(all);
-        driveMapRef.current = new Map(all.map(d => [d.id, `${d.letter} ${d.name}`]));
-        // Seed log with current mount states
-        const now = new Date();
-        const initial: ActivityEntry[] = all.map(d => ({
-          id: entryId.current++,
-          time: now,
-          driveId: d.id,
-          driveName: `${d.letter} ${d.name}`,
-          status: d.status,
-        }));
-        setLog(initial.reverse());
-      })
-      .catch(() => {});
-  }, [token]);
-
-  // Listen for live drive status events
-  React.useEffect(() => {
-    const unlisten = listen<{ drive_id: number; status: string; message?: string }>(
-      'drive_status_changed',
-      e => {
-        const { drive_id, status, message } = e.payload;
-        const driveName = driveMapRef.current.get(drive_id) ?? `Drive #${drive_id}`;
-
-        // Update drives list
-        setDrives(prev => prev.map(d =>
-          d.id === drive_id ? { ...d, status } : d
-        ));
-
-        // Append log entry
-        setLog(prev => [{
-          id: entryId.current++,
-          time: new Date(),
-          driveId: drive_id,
-          driveName,
-          status,
-          message,
-        }, ...prev].slice(0, 200));
-      }
-    );
+    const unlisten = listen<ActivityEntry>('activity_appended', e => {
+      const row = e.payload;
+      if (kind && row.kind !== kind) return;
+      if (errorsOnly && row.severity !== 'error') return;
+      setEntries(prev => [row, ...prev].slice(0, 1000));
+    });
     return () => { unlisten.then(fn => fn()); };
-  }, []);
+  }, [kind, errorsOnly]);
 
-  const mounted = drives.filter(d => d.status === 'mounted');
-  const errors  = drives.filter(d => d.status === 'error');
+  // Free-text filter runs client-side across action/actor/target/message.
+  const visible = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return entries;
+    return entries.filter(e =>
+      e.action.toLowerCase().includes(q) ||
+      (e.actor ?? '').toLowerCase().includes(q) ||
+      (e.target ?? '').toLowerCase().includes(q) ||
+      (e.message ?? '').toLowerCase().includes(q),
+    );
+  }, [entries, search]);
+
+  const onClear = async () => {
+    if (!confirm('Clear the entire activity log? This cannot be undone.')) return;
+    try {
+      await invoke('clear_activity', { token });
+      setEntries([]);
+    } catch {/* ignore */}
+  };
+
+  const onExport = () => {
+    const csv = buildCsv(visible);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    downloadCsv(`nanocrew-activity-${stamp}.csv`, csv);
+  };
+
+  const errorCount = entries.filter(e => e.severity === 'error').length;
 
   return (
     <>
@@ -116,64 +167,102 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
         theme={theme}
         crumbs={['Activity']}
         title={<>Drive <span style={{ color: t.lime }}>Activity</span></>}
-        subtitle="Live mount events and drive status"
+        subtitle="Audit log of mount, auth, and drive events"
         actions={
-          <NCBtn theme={theme} small ghost onClick={() => setLog([])}>
-            Clear log
-          </NCBtn>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <NCBtn theme={theme} small ghost iconLeft={<I.download size={13} />}
+                   onClick={onExport} disabled={visible.length === 0}>
+              Export CSV
+            </NCBtn>
+            <NCBtn theme={theme} small ghost iconLeft={<I.x size={13} />} onClick={onClear}>
+              Clear log
+            </NCBtn>
+          </div>
         }
       />
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {/* Status summary bar */}
+        {/* Filter bar */}
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 20,
+          display: 'flex', alignItems: 'center', gap: 14,
           padding: '10px 20px', borderBottom: `1px solid ${t.border}`,
           background: t.surface1, flexShrink: 0,
           fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1,
+          flexWrap: 'wrap',
         }}>
-          <span>
-            <span style={{ color: t.lime }}>{mounted.length}</span>
-            <span style={{ color: t.textLo }}> MOUNTED</span>
-          </span>
-          {errors.length > 0 && (
-            <span>
-              <span style={{ color: t.danger }}>{errors.length}</span>
-              <span style={{ color: t.textLo }}> ERROR{errors.length !== 1 ? 'S' : ''}</span>
-            </span>
-          )}
+          {KINDS.map(k => {
+            const active = kind === k.key;
+            return (
+              <button
+                key={k.label}
+                onClick={() => setKind(k.key)}
+                style={{
+                  background: active ? t.lime : 'transparent',
+                  color: active ? t.bg : t.textMd,
+                  border: `1px solid ${active ? t.lime : t.border}`,
+                  padding: '4px 10px', borderRadius: 3, cursor: 'pointer',
+                  fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.2,
+                }}
+              >{k.label}</button>
+            );
+          })}
+
           <span style={{ color: t.textFaint }}>|</span>
-          {drives.map(d => (
-            <span key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{
-                display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
-                background: statusColor(d.status, t),
-              }} />
-              <span style={{ color: t.textMd }}>{d.letter}</span>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={errorsOnly}
+              onChange={e => setErrorsOnly(e.target.checked)}
+            />
+            <span style={{ color: errorsOnly ? t.danger : t.textMd }}>
+              ERRORS ONLY {errorCount > 0 && <span style={{ color: t.danger }}>({errorCount})</span>}
             </span>
-          ))}
-          {drives.length === 0 && (
-            <span style={{ color: t.textFaint }}>No drives configured</span>
-          )}
+          </label>
+
+          <span style={{ color: t.textFaint }}>|</span>
+
+          <input
+            type="search"
+            placeholder="Filter…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            style={{
+              flex: 1, minWidth: 140, maxWidth: 320,
+              padding: '4px 8px', borderRadius: 3,
+              background: t.bg, color: t.textHi,
+              border: `1px solid ${t.border}`,
+              fontFamily: NC_FONT_MONO, fontSize: 11,
+            }}
+          />
+
+          <span style={{ color: t.textFaint, marginLeft: 'auto' }}>
+            {visible.length}/{entries.length}
+          </span>
         </div>
 
-        {/* Event log */}
+        {/* Table */}
         <div style={{ flex: 1, overflow: 'auto' }}>
-          {log.length === 0 ? (
+          {loading ? (
+            <div style={{
+              padding: 60, textAlign: 'center',
+              color: t.textMd, fontSize: 13, fontFamily: NC_FONT_UI,
+            }}>Loading…</div>
+          ) : visible.length === 0 ? (
             <div style={{
               flex: 1, display: 'flex', flexDirection: 'column',
               alignItems: 'center', justifyContent: 'center', gap: 12,
               color: t.textMd, fontSize: 13, padding: 60,
             }}>
               <I.cloud size={36} color={t.textLo} />
-              <div>No events yet. Mount or unmount a drive to see activity.</div>
+              <div>No events match the current filter.</div>
             </div>
           ) : (
             <>
               {/* Header */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: '90px 180px 90px 1fr',
+                gridTemplateColumns: '110px 70px 140px 120px 1fr',
                 gap: 14, padding: '9px 20px',
                 borderBottom: `1px solid ${t.border}`,
                 fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.5,
@@ -181,37 +270,46 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
                 position: 'sticky', top: 0, background: t.bg, zIndex: 1,
               }}>
                 <span>Time</span>
-                <span>Drive</span>
-                <span>Status</span>
+                <span>Kind</span>
+                <span>Action</span>
+                <span>Target</span>
                 <span>Detail</span>
               </div>
 
-              {log.map(entry => (
+              {visible.map(e => (
                 <div
-                  key={entry.id}
+                  key={e.id}
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: '90px 180px 90px 1fr',
+                    gridTemplateColumns: '110px 70px 140px 120px 1fr',
                     gap: 14, padding: '9px 20px', alignItems: 'center',
                     borderBottom: `1px solid ${t.border}`,
                   }}
+                  title={e.message ?? ''}
                 >
                   <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: t.textFaint }}>
-                    {formatTime(entry.time)}
-                  </div>
-                  <div style={{ fontFamily: NC_FONT_UI, fontSize: 13, color: t.textHi,
-                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {entry.driveName}
+                    <span style={{ color: t.textMd }}>{formatDate(e.ts)}</span>{' '}
+                    {formatTime(e.ts)}
                   </div>
                   <div style={{
                     fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.5,
-                    color: statusColor(entry.status, t),
+                    color: t.textMd, textTransform: 'uppercase',
                   }}>
-                    {statusLabel(entry.status)}
+                    {e.kind}
+                  </div>
+                  <div style={{
+                    fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.5,
+                    color: severityColor(e.severity, t),
+                  }}>
+                    {actionLabel(e.action)}
+                  </div>
+                  <div style={{ fontFamily: NC_FONT_UI, fontSize: 12, color: t.textHi,
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {e.target ?? '—'}
                   </div>
                   <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd,
                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {entry.message ?? '—'}
+                    {e.message ?? (e.actor ? `by ${e.actor}` : '—')}
                   </div>
                 </div>
               ))}

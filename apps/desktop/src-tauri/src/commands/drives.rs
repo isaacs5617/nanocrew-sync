@@ -2,12 +2,24 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     auth::require_auth,
+    commands::activity,
     credentials,
     error::AppError,
     mounts::{self, MountConfig},
     state::AppState,
     types::{AddDriveInput, DriveInfo, DriveStatusPayload, S3Entry, TestConnectionInput},
 };
+
+/// Look up the username tied to `token`, if any — used purely for activity-log
+/// attribution.
+fn actor_for(state: &State<'_, AppState>, token: &str) -> Option<String> {
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(token)
+        .map(|s| s.username.clone())
+}
 
 // ── Drive CRUD ───────────────────────────────────────────────────────────────
 
@@ -68,11 +80,13 @@ pub async fn list_drives(
 #[tauri::command]
 pub async fn add_drive(
     state: State<'_, AppState>,
+    app: AppHandle,
     token: String,
     input: AddDriveInput,
 ) -> Result<DriveInfo, String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
     validate_letter(&input.letter)?;
+    let actor = actor_for(&state, &token);
 
     let letter = input.letter.to_uppercase();
 
@@ -109,6 +123,13 @@ pub async fn add_drive(
         return Err(e.to_string());
     }
 
+    activity::record(
+        &state.db, &app, "drive", "add_drive", activity::SEV_INFO,
+        Some(id), actor.as_deref(),
+        Some(&format!("{letter} {}", input.name)),
+        Some(&format!("{} — {}", input.provider, input.bucket)),
+    );
+
     Ok(DriveInfo {
         id,
         name: input.name,
@@ -129,14 +150,28 @@ pub async fn add_drive(
 #[tauri::command]
 pub async fn remove_drive(
     state: State<'_, AppState>,
+    app: AppHandle,
     token: String,
     drive_id: i64,
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
+    let actor = actor_for(&state, &token);
 
     if state.mounts.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&drive_id) {
         return Err(AppError::DriveStillMounted.to_string());
     }
+
+    // Pull the display name before we delete, so the activity entry has a
+    // human-friendly target rather than a bare row id.
+    let label: Option<String> = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT letter || ' ' || name FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
 
     // Delete from DB first; a stale orphan credential in keyring is harmless,
     // but a DB row pointing at a missing credential causes permanent mount failure.
@@ -147,6 +182,11 @@ pub async fn remove_drive(
     }
 
     credentials::delete(&state.db, drive_id).map_err(|e| e.to_string())?;
+
+    activity::record(
+        &state.db, &app, "drive", "remove_drive", activity::SEV_INFO,
+        Some(drive_id), actor.as_deref(), label.as_deref(), None,
+    );
 
     Ok(())
 }
@@ -204,6 +244,11 @@ pub async fn mount_drive(
         DriveStatusPayload { drive_id, status: "mounting".into(), message: None },
     );
 
+    // Clone before moving into MountConfig so the activity entry after the
+    // await still has the fields it needs.
+    let letter_for_log = letter.clone();
+    let owner_for_log = owner.clone();
+
     // spawn_mount blocks until WinFsp is up; run it off the async runtime.
     let mount_config = MountConfig {
         drive_id, letter, provider, endpoint, bucket, region,
@@ -219,6 +264,12 @@ pub async fn mount_drive(
     // "mounted" event is emitted by the WinFsp thread on success
     state.mounts.lock().unwrap_or_else(|p| p.into_inner()).insert(drive_id, handle);
 
+    activity::record(
+        &state.db, &app, "mount", "mount", activity::SEV_INFO,
+        Some(drive_id), Some(&owner_for_log),
+        Some(&letter_for_log), None,
+    );
+
     Ok(())
 }
 
@@ -231,6 +282,8 @@ pub async fn unmount_drive(
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
 
+    let actor = actor_for(&state, &token);
+
     let handle = state
         .mounts
         .lock()
@@ -238,11 +291,27 @@ pub async fn unmount_drive(
         .remove(&drive_id)
         .ok_or_else(|| "Drive is not mounted".to_string())?;
 
+    // Best-effort letter lookup for the log entry.
+    let letter: Option<String> = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT letter FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+
     handle.stop();
 
     let _ = app.emit(
         "drive_status_changed",
         DriveStatusPayload { drive_id, status: "offline".into(), message: None },
+    );
+
+    activity::record(
+        &state.db, &app, "mount", "unmount", activity::SEV_INFO,
+        Some(drive_id), actor.as_deref(), letter.as_deref(), None,
     );
 
     Ok(())

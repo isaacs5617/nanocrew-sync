@@ -127,6 +127,9 @@ pub fn run() {
             commands::drives::check_winfsp,
             commands::system::get_autostart,
             commands::system::set_autostart,
+            commands::activity::list_activity,
+            commands::activity::clear_activity,
+            commands::activity::export_activity_csv,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")
@@ -203,9 +206,15 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("auto_mount drive {id}: credential error: {e}");
+                let msg = e.to_string();
                 let _ = app.emit(
                     "drive_status_changed",
-                    DriveStatusPayload { drive_id: id, status: "error".into(), message: Some(e.to_string()) },
+                    DriveStatusPayload { drive_id: id, status: "error".into(), message: Some(msg.clone()) },
+                );
+                commands::activity::record(
+                    &state.db, &app, "mount", "mount_failed",
+                    commands::activity::SEV_ERROR,
+                    Some(id), Some("auto-mount"), Some(&letter), Some(&msg),
                 );
                 continue;
             }
@@ -234,18 +243,33 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
 
         let app2 = app.clone();
         let app3 = app.clone();
+        let letter_for_log = letter.clone();
         tokio::task::spawn_blocking(move || mounts::spawn_mount(config, app2))
             .await
             .map(|result| match result {
                 Ok(handle) => {
                     let state: tauri::State<AppState> = app3.state();
                     state.mounts.lock().unwrap_or_else(|p| p.into_inner()).insert(id, handle);
+                    commands::activity::record(
+                        &state.db, &app3, "mount", "mount",
+                        commands::activity::SEV_INFO,
+                        Some(id), Some("auto-mount"),
+                        Some(&letter_for_log), None,
+                    );
                     // "mounted" event already emitted by the WinFsp thread
                 }
                 Err(e) => {
+                    let state: tauri::State<AppState> = app3.state();
+                    let msg = e.to_string();
                     let _ = app3.emit(
                         "drive_status_changed",
-                        DriveStatusPayload { drive_id: id, status: "error".into(), message: Some(e.to_string()) },
+                        DriveStatusPayload { drive_id: id, status: "error".into(), message: Some(msg.clone()) },
+                    );
+                    commands::activity::record(
+                        &state.db, &app3, "mount", "mount_failed",
+                        commands::activity::SEV_ERROR,
+                        Some(id), Some("auto-mount"),
+                        Some(&letter_for_log), Some(&msg),
                     );
                 }
             })

@@ -28,6 +28,23 @@ CREATE TABLE IF NOT EXISTS drives (
     readonly      INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL DEFAULT (unixepoch())
 );
+
+-- Append-only audit log. Every meaningful event gets a row here so the
+-- Activity screen can show history across sessions, not just what happened
+-- since the last launch.
+CREATE TABLE IF NOT EXISTS activity (
+    id        INTEGER PRIMARY KEY NOT NULL,
+    ts        INTEGER NOT NULL DEFAULT (unixepoch()),
+    kind      TEXT    NOT NULL,  -- auth | drive | mount | file | system | error
+    action    TEXT    NOT NULL,  -- sign_in, mount, unmount, add_drive, error, ...
+    severity  TEXT    NOT NULL DEFAULT 'info',  -- info | warn | error
+    drive_id  INTEGER,
+    actor     TEXT,
+    target    TEXT,
+    message   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_activity_ts   ON activity(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_kind ON activity(kind);
 ";
 
 pub fn open(path: &Path) -> Result<Connection, AppError> {

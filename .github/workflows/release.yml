@@ -28,6 +28,20 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Activate MSVC developer environment so cargo can find link.exe,
+      # INCLUDE, LIB, etc. Without this, cargo's hardcoded link.exe path
+      # guess is frequently off by a version and the build fails at link.
+      - name: Setup MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # NASM is required by aws-lc-sys (pulled in transitively by aws-sdk-s3).
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

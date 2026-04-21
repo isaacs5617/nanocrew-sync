@@ -97,9 +97,16 @@ pub fn spawn_mount(
     let thread = std::thread::Builder::new()
         .name(format!("winfsp-{}", config.letter))
         .spawn(move || {
-            // 1. Build the AWS S3 client on a short-lived runtime. The one
-            //    owned by S3Fs handles all subsequent IO.
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            // 1. Build the long-lived multi-thread tokio runtime that S3Fs will
+            //    own for the lifetime of the mount. Use it once here to load
+            //    the AWS config, then hand it to S3Fs — no short-lived
+            //    bootstrap runtime, no drop-on-block.
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(
+                    std::thread::available_parallelism()
+                        .map(|n| n.get().max(4))
+                        .unwrap_or(4),
+                )
                 .enable_all()
                 .build()
             {
@@ -129,12 +136,13 @@ pub fn spawn_mount(
                 .force_path_style(true)
                 .build();
             let client = aws_sdk_s3::Client::from_conf(s3_conf);
-            drop(rt);
 
-            // 2. Build the filesystem context.
+            // 2. Build the filesystem context. The runtime we just used moves
+            //    into S3Fs and stays alive for every subsequent IO call.
             let emit_app = app_handle.clone();
             let label = format!("NanoCrew-{}", config.bucket);
             let ctx = match S3Fs::new(
+                rt,
                 client,
                 config.bucket.clone(),
                 config.drive_id,

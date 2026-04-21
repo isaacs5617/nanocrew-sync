@@ -174,6 +174,25 @@
 
 **Target:** a Free user can upgrade to Pro and see the gated features unlock in < 60 s.
 
+### Design notes for the next session
+
+Phase 9 is deliberately **not** scaffolded tonight — each sub-item depends on product decisions that need your input before I lock them in with code:
+
+1. **JWT key-signing infrastructure.** We need an `ed25519` (or RS256) keypair. The public key ships embedded in the Rust binary; the private key signs licenses on a server (or a local dev tool for now). Decision needed: is the signing service a simple Node/Rust CLI you run manually, or does it live in a Cloudflare Worker / Lambda behind an admin dashboard?
+2. **Machine fingerprint source.** `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` is already read by `file_lock::machine_id()` and is the obvious candidate. Hardware UUID (`wmic csproduct get uuid`) is more stable across reinstalls but needs elevation on some SKUs. Pick one.
+3. **Trial start timestamp.** Will live in the `prefs` table (key: `trial_started_at`). Written on first successful sign-in after install. Straightforward — but we need the trial length locked (14 days vs 30).
+4. **Enforcement gates.** The schema lists Free/Personal/Pro/Team tiers with specific feature gates (drive count, File Lock, cache encryption). Every gate is a `fn ensure_tier(state, feature) -> Result<()>` call at the command entry point. Easy to add — but the *list* of gates needs to match what's actually behind the paywall, which is a pricing decision.
+5. **Payment provider.** Stripe vs Lemon Squeezy vs Paddle changes the checkout-return URL and webhook format. The licensing server design depends on this. This is fundamentally a business decision.
+6. **Offline grace period.** If the machine can't reach the license server for N days, what happens? Silent downgrade to Free? Lockout? Warning banner only?
+
+When you're ready, the landing points in code are:
+- `commands::prefs` (already exists) — stash trial start / cached license JWT
+- New `commands::licensing` module with `get_status`, `activate`, `deactivate`, `machine_fingerprint`
+- New `licensing::verify` Rust module that parses the JWT and checks signature + expiry + machine
+- UI: new "License" section in `SettingsScreen`, plus a tier badge on `AccountScreen`
+
+I'd rather leave these hooks empty and well-documented than ship a stub that pretends to enforce anything.
+
 ---
 
 ## Phase 10 — Website + marketing

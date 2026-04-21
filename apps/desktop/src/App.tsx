@@ -15,7 +15,7 @@ import { ErrorScreen } from './screens/ErrorScreen.js';
 import { OnboardingScreen } from './screens/OnboardingScreen.js';
 import { SetupScreen } from './screens/SetupScreen.js';
 import { AddDrivePickerScreen } from './screens/AddDrivePickerScreen.js';
-import { AddDriveWasabiScreen } from './screens/AddDriveWasabiScreen.js';
+import { AddDriveS3Screen } from './screens/AddDriveS3Screen.js';
 import { AuthContext } from './context/auth.js';
 import { TransfersProvider } from './context/transfers.js';
 import type { NavKey } from '@nanocrew/ui';
@@ -72,16 +72,29 @@ function ShellLayout({ theme, setTheme, token, onSignOut, version }: {
       case '/settings':   return <SettingsScreen theme={theme} setTheme={setTheme} />;
       case '/account':    return <AccountScreen theme={theme} onSignOut={onSignOut} />;
       case '/error':      return <ErrorScreen theme={theme} />;
-      case '/add-drive':  return <AddDrivePickerScreen theme={theme} onNext={() => setRoute('/add-drive/wasabi')} onCancel={() => setRoute('/drives')} />;
-      case '/add-drive/wasabi': return (
-        <AddDriveWasabiScreen
+      case '/add-drive':  return (
+        <AddDrivePickerScreen
           theme={theme}
-          onBack={() => setRoute('/add-drive')}
+          onNext={(providerId) => setRoute(`/add-drive/${providerId}`)}
           onCancel={() => setRoute('/drives')}
-          onDone={() => setRoute('/drives')}
         />
       );
-      default: return <DashboardScreen theme={theme} onAddDrive={() => setRoute('/add-drive')} />;
+      default:
+        // Any `/add-drive/<providerId>` route renders the generic S3 screen.
+        // The screen handles "unknown provider" itself, so we just pass the id.
+        if (route.startsWith('/add-drive/')) {
+          const providerId = route.slice('/add-drive/'.length);
+          return (
+            <AddDriveS3Screen
+              theme={theme}
+              providerId={providerId}
+              onBack={() => setRoute('/add-drive')}
+              onCancel={() => setRoute('/drives')}
+              onDone={() => setRoute('/drives')}
+            />
+          );
+        }
+        return <DashboardScreen theme={theme} onAddDrive={() => setRoute('/add-drive')} />;
     }
   };
 

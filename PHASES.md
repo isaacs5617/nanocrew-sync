@@ -65,22 +65,22 @@
 
 ## Phase 2 — Provider breadth
 
-- [ ] 2.1 Generic `AddDriveS3Screen` — one form, presets for:
-  - [ ] AWS S3
-  - [ ] Backblaze B2
-  - [ ] Cloudflare R2
-  - [ ] MinIO (self-hosted)
-  - [ ] IDrive e2
-  - [ ] DigitalOcean Spaces
-  - [ ] Storj
-  - [ ] Scaleway Object Storage
-  - [ ] Contabo Object Storage
-  - [ ] Oracle Cloud Object Storage
-  - [ ] Linode Object Storage
-  - [ ] Vultr Object Storage
-- [ ] 2.2 Provider picker rewrite — route all S3-compatible to the generic form; Wasabi kept as a convenience preset
-- [ ] 2.3 Region/endpoint presets per provider (avoid hand-typing hosts)
-- [ ] 2.4 "Test connection" button — `HeadBucket` before save, surface permission / endpoint errors inline
+- [x] 2.1 Generic `AddDriveS3Screen` — one form, presets for:
+  - [x] AWS S3 (22 regions)
+  - [x] Backblaze B2 (6 regions)
+  - [x] Cloudflare R2 (custom endpoint flow for `<account-id>.r2.cloudflarestorage.com`)
+  - [x] MinIO (self-hosted, custom endpoint)
+  - [x] IDrive e2 (8 regions)
+  - [x] DigitalOcean Spaces (8 regions)
+  - [x] Storj (global gateway)
+  - [x] Scaleway Object Storage (3 regions)
+  - [x] Contabo Object Storage (3 regions)
+  - [x] Oracle Cloud Object Storage (custom endpoint flow)
+  - [x] Linode Object Storage (9 regions)
+  - [x] Vultr Object Storage (7 regions)
+- [x] 2.2 Provider picker rewrite — single form at `/add-drive/<providerId>`; Wasabi kept as the recommended preset at the top
+- [x] 2.3 Region/endpoint presets per provider — `S3_PROVIDER_PRESETS` in `packages/ui/src/s3-providers.ts` is the single source of truth
+- [x] 2.4 "Test connection" button — already calls `list_objects_v2 max_keys=1` on the backend (HeadBucket-equivalent but also validates list permission); errors now prettified (AccessDenied/SignatureDoesNotMatch/NoSuchBucket/DNS/timeout → human-readable)
 
 **Target:** any S3-compatible bucket mountable in ≤ 60 seconds from "Add drive" click.
 

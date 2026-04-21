@@ -9,6 +9,7 @@ import {
 } from '@nanocrew/ui';
 import { I } from '@nanocrew/ui';
 import { useAuth } from '../context/auth.js';
+import { UpdateButton } from './UpdateButton.js';
 
 interface SettingsScreenProps {
   theme: Theme;
@@ -309,6 +310,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.6 }}>
               Mount S3-compatible cloud storage (Wasabi, Amazon S3, Backblaze B2) as local Windows drive letters. No subscriptions. No data routing. Your credentials stay on your machine.
             </div>
+            <UpdateButton theme={theme} />
           </NCCard>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Built with</NCEyebrow>

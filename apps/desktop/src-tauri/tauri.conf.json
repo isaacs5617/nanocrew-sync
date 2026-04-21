@@ -28,8 +28,21 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZERDc3MUZEODI2Q0E2RDYKUldUV3BteUMvWEhYL2FVT0lxZTNxMGFYZEhPc3VnN0Q0OVdQTXlaS1l2TGtOeVgrRmt6UXlKbVEK",
+      "endpoints": [
+        "https://github.com/isaacs5617/nanocrew-sync/releases/latest/download/latest.json",
+        "https://releases.nanocrew.dev/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
       "icons/32x32.png",

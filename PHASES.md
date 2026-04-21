@@ -28,6 +28,24 @@
 
 ---
 
+## Phase 0.5 — Auto-update infrastructure
+
+- [x] Ed25519 updater keypair generated (`~/.nanocrew-sync-updater.key`)
+- [x] `tauri-plugin-updater` + `tauri-plugin-process` added to Cargo + package.json
+- [x] Public key embedded in `tauri.conf.json`; updater endpoints set (GitHub Releases primary, `releases.nanocrew.dev` placeholder)
+- [x] Updater + process permissions added to `capabilities/default.json`
+- [x] Plugin wired in `lib.rs`
+- [x] "Check for updates" button added to Settings → About with download progress + auto-relaunch
+- [x] GitHub Actions release workflow (`.github/workflows/release.yml`) — builds signed MSI + NSIS EXE on tag push, generates `latest.json`, publishes to GitHub Release
+- [x] `RELEASING.md` documents the release flow and key management
+- [ ] Upload `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to GitHub secrets
+- [ ] First real end-to-end update test: tag v0.1.1, watch Actions publish, click "Check for updates" from v0.1.0, verify install + relaunch
+- [ ] Decide on public asset hosting (GitHub public mirror vs R2 vs GitHub Pages) before public beta
+
+**Target:** every future change reaches our own machines via "Check for updates" — no manual MSI wrangling.
+
+---
+
 ## Phase 1 — Correctness & UX polish
 
 - [ ] 1.1 Download progress on Transfers page

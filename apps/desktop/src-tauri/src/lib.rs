@@ -23,6 +23,8 @@ pub fn run() {
         // Enforce single-instance: a second launch refocuses the existing
         // window (and un-hides it from tray) instead of spawning a twin
         // taskbar icon / duplicate WinFsp mount attempt.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();

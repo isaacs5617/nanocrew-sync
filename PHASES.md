@@ -21,8 +21,8 @@
 - [x] WinFsp detection + prompt-to-install
 - [x] `.gitignore`, `LICENSE` (proprietary), `README.md`, `PHASES.md`
 - [x] Private GitHub repo + initial push
-- [ ] Tag `v0.1.0-alpha`
-- [ ] Verify signed-MSI + NSIS-EXE build targets produce installers
+- [x] Tag `v0.1.0-alpha` (superseded by v0.1.1 as first CI-built release)
+- [x] Verify signed-MSI + NSIS-EXE build targets produce installers (v0.1.1 shipped both)
 
 **Target:** tagged release with a working MSI and EXE installer.
 
@@ -38,9 +38,10 @@
 - [x] "Check for updates" button added to Settings → About with download progress + auto-relaunch
 - [x] GitHub Actions release workflow (`.github/workflows/release.yml`) — builds signed MSI + NSIS EXE on tag push, generates `latest.json`, publishes to GitHub Release
 - [x] `RELEASING.md` documents the release flow and key management
-- [ ] Upload `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to GitHub secrets
-- [ ] First real end-to-end update test: tag v0.1.1, watch Actions publish, click "Check for updates" from v0.1.0, verify install + relaunch
-- [ ] Decide on public asset hosting (GitHub public mirror vs R2 vs GitHub Pages) before public beta
+- [x] Upload `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to GitHub secrets
+- [x] First real end-to-end update test: tag v0.1.1, Actions published, "Check for updates" from v0.1.0 → v0.1.1 install + relaunch verified
+- [x] Public asset hosting decided: GitHub Releases on a public repo (repo flipped public 2026-04-21)
+- [x] CI hardening: MSVC dev env + NASM + forced `link.exe`/`cl.exe` on PATH + override of broken `CC_*` env var + WinFsp SDK install with `ADDLOCAL=ALL` + space→dot rename on artifacts so `latest.json` URL matches stored asset name
 
 **Target:** every future change reaches our own machines via "Check for updates" — no manual MSI wrangling.
 
@@ -48,10 +49,11 @@
 
 ## Phase 1 — Correctness & UX polish
 
-- [ ] 1.1 Download progress on Transfers page
-  - [ ] Emit `transfer_progress` from `read()` on first byte of a fresh open
-  - [ ] Per-handle byte counter, 30s idle-done sweeper
-  - [ ] Auto-expire incomplete downloads after N seconds idle
+- [x] 1.1 Download progress on Transfers page
+  - [x] Emit `transfer_progress` from `read()` on first qualifying read (file ≥ 256 KiB)
+  - [x] Per-handle `DownloadState` byte counter, throttled to 250 ms progress events
+  - [x] `close()` emits terminal `state: "done"` — partial reads treated as done (not error) to avoid flooding UI with phantom failures from Windows thumbnailers / AV / editor probes
+  - [~] Idle sweeper deferred — not needed unless we see stuck rows in practice
 - [ ] 1.2 LIST cache TTL (5 s directory cache) so remote changes become visible without remount
 - [ ] 1.3 Verify small-file single-PUT path (< 16 MiB skips MPU)
 - [ ] 1.4 Strip verbose `[winfsp]` logging — keep errors, drop routine traces

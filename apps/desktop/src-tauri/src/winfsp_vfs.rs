@@ -116,9 +116,30 @@ pub enum OpenFile {
         meta: Mutex<Meta>,
         /// `Some` once a write has begun on this handle. Dropped on `close`.
         write: Mutex<Option<WriteState>>,
+        /// `Some` once a qualifying read has begun on this handle. Dropped on
+        /// `close` (after the final "done"/"error" event is emitted).
+        download: Mutex<Option<DownloadState>>,
         /// Set by `set_delete(true)`, acted on during `cleanup`.
         pending_delete: AtomicBool,
     },
+}
+
+/// Progress state for a download (read) on a single handle.
+///
+/// Unlike `WriteState`, downloads have no temp file, no multipart machinery,
+/// and no backpressure loop — they are a one-way byte counter. We lazily
+/// allocate this on the first `read()` for files at or above
+/// `MIN_TRANSFER_BYTES`, emit a `start` event immediately, throttle subsequent
+/// `progress` events on `PROGRESS_INTERVAL`, and emit `done`/`error` on
+/// `close()` (based on whether `bytes_done` reached `size`).
+pub struct DownloadState {
+    xfer_id: u64,
+    bytes_done: AtomicU64,
+    /// Plain `Instant` — the outer `download: Mutex<Option<DownloadState>>`
+    /// already serializes all access, so no independent lock is needed.
+    last_emit: Instant,
+    size: u64,
+    filename: String,
 }
 
 /// Accumulating state for an in-progress write on a single handle.
@@ -885,6 +906,66 @@ impl S3Fs {
         });
     }
 
+    /// Emit `transfer_progress` for a read. Lazily allocates `DownloadState`
+    /// on the first qualifying byte (file size ≥ `MIN_TRANSFER_BYTES`),
+    /// emitting `start` immediately with `done_bytes = n`, then throttles
+    /// `progress` events on `PROGRESS_INTERVAL`. The terminal `done`/`error`
+    /// event is emitted from `close()` — not from here — because reads are
+    /// stateless and we only know completion at handle close.
+    fn emit_download_progress(
+        &self,
+        download: &Mutex<Option<DownloadState>>,
+        key: &str,
+        size: u64,
+        n: u64,
+    ) {
+        if size < MIN_TRANSFER_BYTES {
+            return;
+        }
+        let mut guard = download.lock().unwrap_or_else(|p| p.into_inner());
+        let (xfer_id, done, should_emit, is_start) = match guard.as_mut() {
+            Some(d) => {
+                let done = d.bytes_done.fetch_add(n, Ordering::Relaxed) + n;
+                let should = d.last_emit.elapsed() >= PROGRESS_INTERVAL;
+                if should {
+                    d.last_emit = Instant::now();
+                }
+                (d.xfer_id, done, should, false)
+            }
+            None => {
+                let id = self.next_xfer.fetch_add(1, Ordering::Relaxed);
+                let filename = key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(key)
+                    .to_string();
+                *guard = Some(DownloadState {
+                    xfer_id: id,
+                    bytes_done: AtomicU64::new(n),
+                    last_emit: Instant::now(),
+                    size,
+                    filename,
+                });
+                (id, n, true, true)
+            }
+        };
+        if !should_emit && !is_start {
+            return;
+        }
+        let filename = guard.as_ref().map(|d| d.filename.clone()).unwrap_or_default();
+        drop(guard);
+        (self.emit)(TransferPayload {
+            id: xfer_id,
+            drive_id: self.drive_id,
+            filename,
+            direction: "download".into(),
+            total_bytes: size,
+            done_bytes: done,
+            state: if is_start { "start" } else { "progress" }.into(),
+            error: None,
+        });
+    }
+
     fn emit_progress(&self, state: &mut WriteState, done_bytes: u64, total: u64, finished: bool) {
         if total < MIN_TRANSFER_BYTES && !finished {
             return;
@@ -1070,14 +1151,41 @@ impl FileSystemContext for S3Fs {
                 key: real_key,
                 meta: Mutex::new(meta),
                 write: Mutex::new(None),
+                download: Mutex::new(None),
                 pending_delete: AtomicBool::new(false),
             }
         };
         Ok(Box::new(handle))
     }
 
-    fn close(&self, _context: Self::FileContext) {
-        // Box drops, freeing DirBuffer etc.
+    fn close(&self, context: Self::FileContext) {
+        // Finalize any in-progress download. We treat every clean handle
+        // close as "done" regardless of whether bytes_done reached size —
+        // Windows apps (thumbnailers, AV, editors, property-sheet probes)
+        // routinely open a file, read a partial byte range, and close, and
+        // flagging those as errors would flood the Transfers screen with
+        // false-positive failures. The cost is that a genuinely cancelled
+        // download shows as "done" with a partial byte count; we think that
+        // trade is correct for now.
+        if let OpenFile::File { ref download, .. } = *context {
+            let slot = std::mem::take(
+                &mut *download.lock().unwrap_or_else(|p| p.into_inner()),
+            );
+            if let Some(d) = slot {
+                let done = d.bytes_done.load(Ordering::Relaxed);
+                (self.emit)(TransferPayload {
+                    id: d.xfer_id,
+                    drive_id: self.drive_id,
+                    filename: d.filename,
+                    direction: "download".into(),
+                    total_bytes: d.size,
+                    done_bytes: done,
+                    state: "done".into(),
+                    error: None,
+                });
+            }
+        }
+        // Box drops after this.
     }
 
     fn create(
@@ -1180,6 +1288,7 @@ impl FileSystemContext for S3Fs {
             key,
             meta: Mutex::new(meta),
             write: Mutex::new(Some(write)),
+            download: Mutex::new(None),
             pending_delete: AtomicBool::new(false),
         }))
     }
@@ -1355,10 +1464,10 @@ impl FileSystemContext for S3Fs {
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
-        let (key, size) = match context.as_ref() {
-            OpenFile::File { key, meta, .. } => {
+        let (key, size, download) = match context.as_ref() {
+            OpenFile::File { key, meta, download, .. } => {
                 let m = meta.lock().unwrap_or_else(|p| p.into_inner());
-                (key.clone(), m.size)
+                (key.clone(), m.size, download)
             }
             _ => return Err(nt(STATUS_INVALID_PARAMETER)),
         };
@@ -1374,6 +1483,7 @@ impl FileSystemContext for S3Fs {
             })?;
         let n = bytes.len().min(buffer.len());
         buffer[..n].copy_from_slice(&bytes[..n]);
+        self.emit_download_progress(download, &key, size, n as u64);
         Ok(n as u32)
     }
 

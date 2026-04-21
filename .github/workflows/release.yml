@@ -56,6 +56,19 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      # winfsp-sys's build.rs reads HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir
+      # to find the WinFsp headers/libs. Install the bundled MSI silently so
+      # the registry key exists before cargo builds winfsp-sys.
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = "apps/desktop/src-tauri/bundled/winfsp.msi"
+          Write-Host "Installing $msi..."
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "WinFsp install failed with exit code $($p.ExitCode)" }
+          Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -ErrorAction SilentlyContinue |
+            Select-Object InstallDir, VersionMajor, VersionMinor
+
       - name: Build Tauri installers
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

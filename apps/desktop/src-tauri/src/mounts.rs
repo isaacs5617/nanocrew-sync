@@ -22,7 +22,7 @@ use winfsp::{
 
 use crate::{
     error::AppError,
-    types::{DriveStatusPayload, TransferPayload},
+    types::{DriveStatusPayload, FileLockEvent, TransferPayload},
     winfsp_vfs::S3Fs,
 };
 
@@ -57,6 +57,10 @@ pub struct MountConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub readonly: bool,
+    /// Human-readable owner recorded in cross-device sentinel locks
+    /// (`.nanocrew/locks/…`). Typically the signed-in username; falls back to
+    /// a generic tag for auto-mount-at-startup when no user is signed in yet.
+    pub owner: String,
 }
 
 /// A live mounted drive. Dropping `stop_tx` unblocks the host thread.
@@ -140,6 +144,7 @@ pub fn spawn_mount(
             // 2. Build the filesystem context. The runtime we just used moves
             //    into S3Fs and stays alive for every subsequent IO call.
             let emit_app = app_handle.clone();
+            let emit_app_lock = app_handle.clone();
             let label = format!("NanoCrew-{}", config.bucket);
             let ctx = match S3Fs::new(
                 rt,
@@ -150,6 +155,10 @@ pub fn spawn_mount(
                 Box::new(move |p: TransferPayload| {
                     let _ = emit_app.emit("transfer_progress", p);
                 }),
+                Box::new(move |p: FileLockEvent| {
+                    let _ = emit_app_lock.emit("file_lock_event", p);
+                }),
+                config.owner.clone(),
             ) {
                 Ok(c) => c,
                 Err(e) => {

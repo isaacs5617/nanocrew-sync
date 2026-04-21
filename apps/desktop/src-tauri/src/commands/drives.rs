@@ -162,6 +162,16 @@ pub async fn mount_drive(
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
 
+    // Grab the signed-in username so cross-device sentinel locks are tagged
+    // with "owner = <that user>" rather than an opaque GUID.
+    let owner = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&token)
+        .map(|s| s.username.clone())
+        .unwrap_or_else(|| "user".to_string());
+
     if state.mounts.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&drive_id) {
         return Err(AppError::AlreadyMounted.to_string());
     }
@@ -198,6 +208,7 @@ pub async fn mount_drive(
     let mount_config = MountConfig {
         drive_id, letter, provider, endpoint, bucket, region,
         access_key_id: aki, secret_access_key: secret, readonly,
+        owner,
     };
     let app2 = app.clone();
     let handle = tokio::task::spawn_blocking(move || mounts::spawn_mount(mount_config, app2))

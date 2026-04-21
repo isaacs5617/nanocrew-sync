@@ -99,9 +99,9 @@
 
 ## Phase 4 — File Lock (parity blocker vs RaiDrive)
 
-- [ ] 4.1 Honor Windows share modes in `open()` — reject conflicting opens with `STATUS_SHARING_VIOLATION`
-- [ ] 4.2 Lockfile detection — recognize Office `~$*.docx`, LibreOffice `.~lock.*#`, `.lock` patterns
-- [ ] 4.3 Cross-device lock coordination — sentinel objects in bucket `.nanocrew/locks/`, TTL heartbeat, conflict UI
+- [x] 4.1 Honor Windows share modes in `open()` — WinFsp's kernel driver enforces share-modes natively within a single host; we layer a per-mount `local_writers` HashSet on top so a second writer-open on this machine fast-fails with `STATUS_SHARING_VIOLATION` regardless of how it arrived. Writer access detected from `FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | GENERIC_WRITE | GENERIC_ALL`.
+- [x] 4.2 Lockfile detection — `file_lock::classify_lockfile` recognises Office `~$*.{docx,xlsx,pptx,doc,xls,ppt}`, LibreOffice `.~lock.*#`, vim `.*.swp`, and generic `*.lock`. VFS emits `file_lock_event` Tauri events on open/create/close with `state: "lockfile_created" | "lockfile_released"` so future UI can show "being edited" banners.
+- [x] 4.3 Cross-device lock coordination — sentinel objects at `.nanocrew/locks/<sha256>.json` with schema-versioned JSON payload (`v`, `key`, `machine`, `owner`, `acquired_at`, `expires_at`). Writer-open checks sentinel, rejects foreign-machine holders with `STATUS_SHARING_VIOLATION`, emits `sentinel_conflict` event. `machine_id` sourced from `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (falls back to hostname). 15-minute TTL; heartbeat function present but unused pending a per-mount refresh task. Owner tagged from signed-in username (or `auto-mount` for startup mounts). Internal `.nanocrew/` keys bypass all lock checks to prevent self-deadlock.
 - [ ] 4.4 File Browser lock indicator — red padlock icon on locked files, shows locker's device name
 - [ ] 4.5 "Break lock" admin action for orphaned locks
 

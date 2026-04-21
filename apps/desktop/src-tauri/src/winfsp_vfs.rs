@@ -20,7 +20,7 @@
 //! us `\foo\bar.txt`; we translate to `foo/bar.txt`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::c_void,
     fs::{File, OpenOptions},
     os::windows::fs::FileExt,
@@ -40,6 +40,7 @@ use windows::{
         Foundation::{
             STATUS_ACCESS_DENIED, STATUS_END_OF_FILE, STATUS_INVALID_PARAMETER,
             STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+            STATUS_SHARING_VIOLATION,
         },
         Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
     },
@@ -65,7 +66,8 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
-use crate::types::TransferPayload;
+use crate::file_lock;
+use crate::types::{FileLockEvent, TransferPayload};
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,10 @@ pub enum OpenFile {
         download: Mutex<Option<DownloadState>>,
         /// Set by `set_delete(true)`, acted on during `cleanup`.
         pending_delete: AtomicBool,
+        /// True if this handle took the local writer slot + cross-device
+        /// sentinel during `open`/`create`. Consulted on `close` so we only
+        /// release what we acquired.
+        holds_writer_lock: AtomicBool,
     },
 }
 
@@ -240,6 +246,10 @@ pub struct S3Fs {
 
     next_xfer: AtomicU64,
     emit: Box<dyn Fn(TransferPayload) + Send + Sync>,
+    /// File-lock events — distinct channel from transfers so the UI can show
+    /// "Document.docx is being edited" banners without cluttering the
+    /// transfers panel.
+    emit_lock: Box<dyn Fn(FileLockEvent) + Send + Sync>,
 
     list_cache: Mutex<HashMap<String, (Instant, CachedList)>>,
     meta_cache: Mutex<HashMap<String, (Instant, Option<Meta>)>>,
@@ -247,6 +257,20 @@ pub struct S3Fs {
     /// Single DACL blob returned for every file/directory. Everyone gets full
     /// access — we don't enforce ACLs on S3.
     security: Vec<u8>,
+
+    /// Lowercased keys of files currently opened for write on THIS machine.
+    /// A second writer-open for the same file fails with
+    /// `STATUS_SHARING_VIOLATION`. WinFsp's kernel driver already enforces
+    /// Windows share-modes inside a single kernel, but we track it ourselves
+    /// too so the in-process path is obviously correct.
+    local_writers: Mutex<HashSet<String>>,
+
+    /// Stable per-machine identifier, used as the `machine` field of
+    /// cross-device sentinel locks in `.nanocrew/locks/`.
+    machine_id: String,
+    /// Human-readable owner name (username) written into sentinels so a
+    /// conflict dialog can say "locked by <user>" rather than a GUID.
+    owner: String,
 }
 
 impl S3Fs {
@@ -257,8 +281,11 @@ impl S3Fs {
         drive_id: i64,
         volume_label: String,
         emit: Box<dyn Fn(TransferPayload) + Send + Sync>,
+        emit_lock: Box<dyn Fn(FileLockEvent) + Send + Sync>,
+        owner: String,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
+        let machine_id = file_lock::machine_id();
 
         Ok(Self {
             rt,
@@ -268,9 +295,13 @@ impl S3Fs {
             volume_label,
             next_xfer: AtomicU64::new(2_000_000),
             emit,
+            emit_lock,
             list_cache: Mutex::new(HashMap::new()),
             meta_cache: Mutex::new(HashMap::new()),
             security,
+            local_writers: Mutex::new(HashSet::new()),
+            machine_id,
+            owner,
         })
     }
 
@@ -1081,6 +1112,48 @@ fn fill_file_info(info: &mut FileInfo, meta: &Meta) {
     info.ea_size = 0;
 }
 
+// ── Share / file-lock helpers ────────────────────────────────────────────────
+
+/// Access-rights bits that imply the caller intends to modify the file. Taken
+/// from wdm.h — we can't pull Windows constants through winfsp-sys cleanly, so
+/// they're inlined with reference to the source.
+const FILE_WRITE_DATA: u32 = 0x0002;
+const FILE_APPEND_DATA: u32 = 0x0004;
+const FILE_WRITE_EA: u32 = 0x0010;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+const DELETE_ACCESS: u32 = 0x0001_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_ALL: u32 = 0x1000_0000;
+const WRITE_MASK: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | DELETE_ACCESS
+    | GENERIC_WRITE
+    | GENERIC_ALL;
+
+#[inline]
+fn is_write_access(granted: FILE_ACCESS_RIGHTS) -> bool {
+    (granted as u32) & WRITE_MASK != 0
+}
+
+/// Keys under `.nanocrew/` are our own bookkeeping — sentinels must not
+/// recurse through `is_write_access`, lockfile detection, or cross-device
+/// sentinel checks, or the VFS deadlocks on itself the first time a user
+/// opens a file for write.
+#[inline]
+fn is_internal_key(key: &str) -> bool {
+    key == ".nanocrew"
+        || key.starts_with(".nanocrew/")
+}
+
+impl S3Fs {
+    /// Emit a file-lock event. Non-fatal if the frontend isn't listening.
+    fn emit_lock(&self, ev: FileLockEvent) {
+        (self.emit_lock)(ev);
+    }
+}
+
 // ── FileSystemContext impl ───────────────────────────────────────────────────
 
 impl FileSystemContext for S3Fs {
@@ -1114,7 +1187,7 @@ impl FileSystemContext for S3Fs {
         &self,
         file_name: &U16CStr,
         _create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let input_key = Self::to_key(file_name);
@@ -1126,6 +1199,88 @@ impl FileSystemContext for S3Fs {
             .ok_or_else(|| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
         fill_file_info(file_info.as_mut(), &meta);
+
+        // Phase 4.1 + 4.3: acquire writer locks BEFORE handing back a handle.
+        // We only do the check for files the caller intends to write to, and
+        // skip it entirely for our internal `.nanocrew/` bookkeeping keys.
+        let took_local = if !meta.is_dir
+            && is_write_access(granted_access)
+            && !is_internal_key(&real_key)
+        {
+            let lk = real_key.to_ascii_lowercase();
+            {
+                let mut locks = self.local_writers.lock().unwrap_or_else(|p| p.into_inner());
+                if locks.contains(&lk) {
+                    return Err(nt(STATUS_SHARING_VIOLATION));
+                }
+                locks.insert(lk.clone());
+            }
+            // Cross-device advisory check. Failures to read the sentinel (S3
+            // hiccups, network blips) are logged but don't block the open —
+            // the local-writer set already guarantees single-writer per file
+            // on this machine, and we don't want to lock users out because
+            // their connection stuttered.
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let mid = self.machine_id.clone();
+            let key = real_key.clone();
+            let state = self.rt.block_on(async move {
+                match file_lock::check(&client, &bucket, &key, &mid).await {
+                    Ok(st) => Ok(st),
+                    Err(e) => Err(e),
+                }
+            });
+            match state {
+                Ok(file_lock::LockState::Foreign(s)) => {
+                    // Release our local claim before bailing.
+                    self.local_writers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&lk);
+                    self.emit_lock(FileLockEvent {
+                        drive_id: self.drive_id,
+                        target: real_key.clone(),
+                        trigger: real_key.clone(),
+                        state: "sentinel_conflict".into(),
+                        owner: Some(s.owner),
+                        machine: Some(s.machine),
+                    });
+                    return Err(nt(STATUS_SHARING_VIOLATION));
+                }
+                Ok(file_lock::LockState::Free) | Err(_) => {}
+            }
+
+            // Acquire our own sentinel. Best-effort — if the PUT fails, log
+            // and fall through; the local-writer set still protects against
+            // same-machine conflicts.
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let mid = self.machine_id.clone();
+            let owner = self.owner.clone();
+            let key = real_key.clone();
+            let _ = self.rt.block_on(async move {
+                file_lock::acquire(&client, &bucket, &key, &mid, &owner).await
+            });
+            true
+        } else {
+            false
+        };
+
+        // Phase 4.2: emit lockfile-detection events for Office/LibreOffice/vim
+        // sidecar files so the UI can light up "being edited" badges.
+        if !meta.is_dir {
+            let (_, base) = Self::split_key(&real_key);
+            if let Some(target) = file_lock::classify_lockfile(base) {
+                self.emit_lock(FileLockEvent {
+                    drive_id: self.drive_id,
+                    target,
+                    trigger: real_key.clone(),
+                    state: "lockfile_created".into(),
+                    owner: None,
+                    machine: None,
+                });
+            }
+        }
 
         let handle = if meta.is_dir {
             OpenFile::Dir {
@@ -1139,6 +1294,7 @@ impl FileSystemContext for S3Fs {
                 write: Mutex::new(None),
                 download: Mutex::new(None),
                 pending_delete: AtomicBool::new(false),
+                holds_writer_lock: AtomicBool::new(took_local),
             }
         };
         Ok(Box::new(handle))
@@ -1153,7 +1309,13 @@ impl FileSystemContext for S3Fs {
         // false-positive failures. The cost is that a genuinely cancelled
         // download shows as "done" with a partial byte count; we think that
         // trade is correct for now.
-        if let OpenFile::File { ref download, .. } = *context {
+        if let OpenFile::File {
+            ref download,
+            ref key,
+            ref holds_writer_lock,
+            ..
+        } = *context
+        {
             let slot = std::mem::take(
                 &mut *download.lock().unwrap_or_else(|p| p.into_inner()),
             );
@@ -1168,6 +1330,33 @@ impl FileSystemContext for S3Fs {
                     done_bytes: done,
                     state: "done".into(),
                     error: None,
+                });
+            }
+
+            // Phase 4.1/4.3: release writer lock + sentinel if we took one.
+            if holds_writer_lock.swap(false, Ordering::Relaxed) {
+                self.local_writers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key.to_ascii_lowercase());
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                let k = key.clone();
+                let _ = self
+                    .rt
+                    .block_on(async move { file_lock::release(&client, &bucket, &k).await });
+            }
+
+            // Phase 4.2: emit lockfile-released for editor sidecars.
+            let (_, base) = Self::split_key(key);
+            if let Some(target) = file_lock::classify_lockfile(base) {
+                self.emit_lock(FileLockEvent {
+                    drive_id: self.drive_id,
+                    target,
+                    trigger: key.clone(),
+                    state: "lockfile_released".into(),
+                    owner: None,
+                    machine: None,
                 });
             }
         }
@@ -1263,6 +1452,67 @@ impl FileSystemContext for S3Fs {
                 nt(STATUS_ACCESS_DENIED)
             })?;
 
+        // Phase 4.1 + 4.3: a `create` is always a writer, so stake the
+        // local-writer claim and drop a sentinel. Internal bookkeeping keys
+        // bypass — we must be able to write sentinels themselves.
+        let took_local = if !is_internal_key(&key) {
+            let lk = key.to_ascii_lowercase();
+            let mut locks = self.local_writers.lock().unwrap_or_else(|p| p.into_inner());
+            if locks.contains(&lk) {
+                return Err(nt(STATUS_SHARING_VIOLATION));
+            }
+            locks.insert(lk);
+            drop(locks);
+
+            // Foreign sentinel? Reject before we commit to the upload path.
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let mid = self.machine_id.clone();
+            let k = key.clone();
+            if let Ok(file_lock::LockState::Foreign(s)) =
+                self.rt.block_on(async move { file_lock::check(&client, &bucket, &k, &mid).await })
+            {
+                self.local_writers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key.to_ascii_lowercase());
+                self.emit_lock(FileLockEvent {
+                    drive_id: self.drive_id,
+                    target: key.clone(),
+                    trigger: key.clone(),
+                    state: "sentinel_conflict".into(),
+                    owner: Some(s.owner),
+                    machine: Some(s.machine),
+                });
+                return Err(nt(STATUS_SHARING_VIOLATION));
+            }
+
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let mid = self.machine_id.clone();
+            let owner = self.owner.clone();
+            let k = key.clone();
+            let _ = self.rt.block_on(async move {
+                file_lock::acquire(&client, &bucket, &k, &mid, &owner).await
+            });
+            true
+        } else {
+            false
+        };
+
+        // Phase 4.2: emit lockfile-created for editor sidecars.
+        let (_, base) = Self::split_key(&key);
+        if let Some(target) = file_lock::classify_lockfile(base) {
+            self.emit_lock(FileLockEvent {
+                drive_id: self.drive_id,
+                target,
+                trigger: key.clone(),
+                state: "lockfile_created".into(),
+                owner: None,
+                machine: None,
+            });
+        }
+
         let meta = Meta {
             is_dir: false,
             size: 0,
@@ -1276,6 +1526,7 @@ impl FileSystemContext for S3Fs {
             write: Mutex::new(Some(write)),
             download: Mutex::new(None),
             pending_delete: AtomicBool::new(false),
+            holds_writer_lock: AtomicBool::new(took_local),
         }))
     }
 

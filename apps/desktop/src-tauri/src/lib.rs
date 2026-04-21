@@ -10,6 +10,7 @@ mod credentials;
 mod db;
 mod dpapi;
 mod error;
+mod file_lock;
 mod mounts;
 mod state;
 mod types;
@@ -218,6 +219,10 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             access_key_id: aki,
             secret_access_key: secret,
             readonly,
+            // Startup auto-mount runs before any user signs in, so we tag the
+            // sentinel owner generically. Manual `mount_drive` calls from an
+            // authed session supply the real username.
+            owner: "auto-mount".to_string(),
         };
 
         let _ = app.emit(

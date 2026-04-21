@@ -76,6 +76,24 @@ pub struct DriveStatusPayload {
     pub message: Option<String>,
 }
 
+/// Emitted as `file_lock_event` when the VFS detects an editor lockfile being
+/// created/removed or a cross-device sentinel conflict. `state` is one of
+/// `"lockfile_created"` | `"lockfile_released"` | `"sentinel_conflict"`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileLockEvent {
+    pub drive_id: i64,
+    /// Filesystem key being affected (the *target* file for lockfiles).
+    pub target: String,
+    /// The path that triggered the event (the lockfile itself, or the file
+    /// whose sentinel is being challenged).
+    pub trigger: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
 /// Emitted as `transfer_progress` whenever a file transfer starts, makes
 /// progress, completes, or errors.  `state` is one of "start" | "progress" |
 /// "done" | "error".

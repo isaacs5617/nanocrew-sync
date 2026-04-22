@@ -67,6 +67,7 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
 use crate::file_lock;
+use crate::throttle::RateLimiter;
 use crate::types::{FileLockEvent, TransferPayload};
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
@@ -271,6 +272,12 @@ pub struct S3Fs {
     /// Human-readable owner name (username) written into sentinels so a
     /// conflict dialog can say "locked by <user>" rather than a GUID.
     owner: String,
+
+    /// Per-direction byte-rate caps. An unlimited limiter is a no-op on
+    /// every `acquire`, so we always call through these regardless of
+    /// whether throttling is configured.
+    upload_limiter: Arc<RateLimiter>,
+    download_limiter: Arc<RateLimiter>,
 }
 
 impl S3Fs {
@@ -283,6 +290,8 @@ impl S3Fs {
         emit: Box<dyn Fn(TransferPayload) + Send + Sync>,
         emit_lock: Box<dyn Fn(FileLockEvent) + Send + Sync>,
         owner: String,
+        upload_rate_bps: Option<u64>,
+        download_rate_bps: Option<u64>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
@@ -302,6 +311,8 @@ impl S3Fs {
             local_writers: Mutex::new(HashSet::new()),
             machine_id,
             owner,
+            upload_limiter: Arc::new(RateLimiter::new(upload_rate_bps)),
+            download_limiter: Arc::new(RateLimiter::new(download_rate_bps)),
         })
     }
 
@@ -549,7 +560,9 @@ impl S3Fs {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key_s = key.to_string();
+        let limiter = self.download_limiter.clone();
         self.rt.block_on(async move {
+            limiter.acquire(len).await;
             let end = offset + len - 1;
             let range = format!("bytes={}-{}", offset, end);
             let resp = client
@@ -690,6 +703,7 @@ impl S3Fs {
             let completed_parts = state.completed_parts.clone();
             let upload_err = state.upload_err.clone();
             let bytes_uploaded = state.bytes_uploaded.clone();
+            let limiter = self.upload_limiter.clone();
 
             self.rt.spawn(async move {
                 let result: Result<(), String> = async {
@@ -713,6 +727,9 @@ impl S3Fs {
                     .map_err(|e| format!("read temp @{off}+{sz}: {e}"))?;
 
                     let actual = buf.len();
+                    // Bandwidth throttle — pace each part's send against the
+                    // configured upload cap. No-op on an unlimited limiter.
+                    limiter.acquire(actual as u64).await;
                     let resp = client
                         .upload_part()
                         .bucket(&bucket)
@@ -891,8 +908,11 @@ impl S3Fs {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key_s = key.to_string();
+        let limiter = self.upload_limiter.clone();
+        let size = bytes.len() as u64;
         self.rt
             .block_on(async move {
+                limiter.acquire(size).await;
                 client
                     .put_object()
                     .bucket(&bucket)

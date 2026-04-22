@@ -251,10 +251,16 @@ pub async fn mount_drive(
     let owner_for_log = owner.clone();
 
     // spawn_mount blocks until WinFsp is up; run it off the async runtime.
+    // Bandwidth caps — prefs store MB/s, MountConfig carries B/s.
+    let upload_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
+    let download_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
+
     let mount_config = MountConfig {
         drive_id, letter, provider, endpoint, bucket, region,
         access_key_id: aki, secret_access_key: secret, readonly,
         owner,
+        upload_rate_bps,
+        download_rate_bps,
     };
     let app2 = app.clone();
     let handle = tokio::task::spawn_blocking(move || mounts::spawn_mount(mount_config, app2))

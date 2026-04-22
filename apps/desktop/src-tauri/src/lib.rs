@@ -15,6 +15,7 @@ mod http_client;
 mod logging;
 mod mounts;
 mod state;
+mod throttle;
 mod types;
 mod winfsp_vfs;
 
@@ -268,6 +269,11 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             }
         };
 
+        // Read global bandwidth caps from prefs so auto-mounted drives
+        // respect them too.
+        let upload_rate_bps = commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
+        let download_rate_bps = commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
+
         let config = mounts::MountConfig {
             drive_id: id,
             letter: letter.clone(),
@@ -282,6 +288,8 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             // sentinel owner generically. Manual `mount_drive` calls from an
             // authed session supply the real username.
             owner: "auto-mount".to_string(),
+            upload_rate_bps,
+            download_rate_bps,
         };
 
         let _ = app.emit(

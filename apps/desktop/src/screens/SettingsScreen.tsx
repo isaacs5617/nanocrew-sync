@@ -396,9 +396,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
         return <>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Bandwidth</NCEyebrow>
-            <ToggleRow theme={theme} label="Limit upload speed" sub="Throttle uploads so NanoCrew Sync doesn't saturate your connection." comingSoon />
+            <div style={{ fontSize: 12, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+              Global caps in megabytes per second. Applied at chunk boundaries — a blank field or <span style={{ fontFamily: NC_FONT_MONO }}>0</span> means unlimited. Remount a drive to pick up changes.
+            </div>
+            <PrefInput
+              theme={theme} token={token}
+              prefKey="upload_rate_mbps"
+              label="Upload limit (MB/s)"
+              sub="Throttle uploads so NanoCrew Sync doesn't saturate your connection. Decimals OK (e.g. 0.5)."
+              placeholder="0 (unlimited)"
+              mono
+            />
             <Spacer />
-            <ToggleRow theme={theme} label="Limit download speed" comingSoon />
+            <PrefInput
+              theme={theme} token={token}
+              prefKey="download_rate_mbps"
+              label="Download limit (MB/s)"
+              sub="Throttle range reads. Useful on metered connections."
+              placeholder="0 (unlimited)"
+              mono
+            />
           </NCCard>
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Proxy & TLS</NCEyebrow>

@@ -63,6 +63,11 @@ pub struct MountConfig {
     /// (`.nanocrew/locks/…`). Typically the signed-in username; falls back to
     /// a generic tag for auto-mount-at-startup when no user is signed in yet.
     pub owner: String,
+    /// Global upload/download caps in bytes-per-second. `None` = unlimited.
+    /// Read from the `upload_rate_bps` / `download_rate_bps` prefs keys at
+    /// the two MountConfig build sites (manual mount + auto_mount_drives).
+    pub upload_rate_bps: Option<u64>,
+    pub download_rate_bps: Option<u64>,
 }
 
 /// A live mounted drive. Dropping `stop_tx` unblocks the host thread.
@@ -184,6 +189,8 @@ pub fn spawn_mount(
                     let _ = emit_app_lock.emit("file_lock_event", p);
                 }),
                 config.owner.clone(),
+                config.upload_rate_bps,
+                config.download_rate_bps,
             ) {
                 Ok(c) => c,
                 Err(e) => {

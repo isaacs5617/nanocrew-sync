@@ -22,6 +22,18 @@ pub fn get(db: &Mutex<Connection>, key: &str) -> Option<String> {
     .ok()
 }
 
+/// Read a MB/s rate pref and return it as bytes/second. Returns `None` for
+/// an unset, empty, non-numeric, or zero / negative value — all of which
+/// mean "unlimited". Accepts decimals (e.g. "0.5" → 524288 B/s).
+pub fn get_rate_bps(db: &Mutex<Connection>, key: &str) -> Option<u64> {
+    let raw = get(db, key)?;
+    let mbps: f64 = raw.trim().parse().ok()?;
+    if !mbps.is_finite() || mbps <= 0.0 {
+        return None;
+    }
+    Some((mbps * 1_048_576.0) as u64)
+}
+
 /// `get` with a boolean interpretation: "1"/"true" → true, everything else → `default`.
 pub fn get_bool(db: &Mutex<Connection>, key: &str, default: bool) -> bool {
     match get(db, key).as_deref() {

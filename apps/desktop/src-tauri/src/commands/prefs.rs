@@ -4,10 +4,31 @@
 //! extend the Settings UI without a migration for every new toggle.
 
 use rusqlite::{params, Connection};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
 
 use crate::{auth::require_auth, error::AppError, state::AppState};
+
+/// Default cache root: `%LOCALAPPDATA%\NanoCrew\Sync\cache`. Returns `None`
+/// only when `LOCALAPPDATA` is unset (should never happen on a real Windows
+/// session).
+pub fn default_cache_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("NanoCrew").join("Sync").join("cache"))
+}
+
+/// Resolve the effective cache root — honors the `cache_root` pref if set
+/// (and non-empty), otherwise falls back to the default. Callers get a
+/// concrete path even when the pref is unset, so mount code never has to
+/// re-compute the default itself.
+pub fn get_cache_root(db: &Mutex<Connection>) -> Option<PathBuf> {
+    match get(db, "cache_root") {
+        Some(s) if !s.trim().is_empty() => Some(PathBuf::from(s.trim())),
+        _ => default_cache_root(),
+    }
+}
 
 /// Low-level read for internal callers (startup, etc.). Returns `None` if the
 /// key is absent. Errors become `None` — startup reads should never fail the
@@ -74,6 +95,29 @@ pub async fn set_pref(
     )
     .map_err(|e| AppError::Db(e).to_string())?;
     Ok(())
+}
+
+/// Return a snapshot of cache-location info for the Settings screen:
+/// `(effective, default, is_custom)`. `effective` is what a fresh mount
+/// would use right now; `default` is the LOCALAPPDATA path we'd fall back
+/// to; `is_custom` is whether the pref is currently overriding the default.
+#[tauri::command]
+pub async fn get_cache_root_info(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(String, String, bool), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    let default = default_cache_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let override_pref = get(&state.db, "cache_root")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (effective, is_custom) = match override_pref {
+        Some(p) => (p, true),
+        None => (default.clone(), false),
+    };
+    Ok((effective, default, is_custom))
 }
 
 /// Delete a preference row. No-op if the key doesn't exist.

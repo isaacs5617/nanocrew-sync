@@ -26,7 +26,7 @@ use crate::{
     http_client,
     state::AppState,
     types::{DriveStatusPayload, FileLockEvent, TransferPayload},
-    winfsp_vfs::{cache_dir_for_drive, S3Fs},
+    winfsp_vfs::S3Fs,
 };
 
 // ── Global WinFsp init ───────────────────────────────────────────────────────
@@ -78,6 +78,11 @@ pub struct MountConfig {
     /// Absolute path to the app SQLite file — the cache opens its own
     /// connection so it never fights the main app's Mutex.
     pub db_path: std::path::PathBuf,
+    /// Cache root directory (Phase 7.4). Resolved from the `cache_root` pref
+    /// (or `%LOCALAPPDATA%\NanoCrew\Sync\cache` as default) at both
+    /// MountConfig build sites. Per-drive data lands at
+    /// `<cache_root>/drive-<id>/`.
+    pub cache_root: std::path::PathBuf,
 }
 
 /// A live mounted drive. Dropping `stop_tx` unblocks the host thread.
@@ -130,27 +135,23 @@ pub fn spawn_mount(
     let cache: Option<std::sync::Arc<DiskCache>> = if config.cache_enabled
         && config.cache_max_bytes > 0
     {
-        match cache_dir_for_drive(config.drive_id) {
-            Some(root) => match DiskCache::new(
-                config.drive_id,
-                root,
-                &config.db_path,
-                config.cache_max_bytes,
-                true,
-            ) {
-                Ok(c) => {
-                    c.start_eviction();
-                    Some(c)
-                }
-                Err(e) => {
-                    tracing::warn!(target: "nanocrew::cache",
-                        drive_id = config.drive_id, "cache init failed: {e}");
-                    None
-                }
-            },
-            None => {
+        let root = config
+            .cache_root
+            .join(format!("drive-{}", config.drive_id));
+        match DiskCache::new(
+            config.drive_id,
+            root,
+            &config.db_path,
+            config.cache_max_bytes,
+            true,
+        ) {
+            Ok(c) => {
+                c.start_eviction();
+                Some(c)
+            }
+            Err(e) => {
                 tracing::warn!(target: "nanocrew::cache",
-                    drive_id = config.drive_id, "LOCALAPPDATA unavailable — cache disabled");
+                    drive_id = config.drive_id, "cache init failed: {e}");
                 None
             }
         }

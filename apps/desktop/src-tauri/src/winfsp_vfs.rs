@@ -2040,12 +2040,4 @@ impl FileSystemContext for S3Fs {
     }
 }
 
-// ── Pathbuf re-export used by mounts.rs ──────────────────────────────────────
-
-#[allow(dead_code)]
-pub fn cache_dir_for_drive(drive_id: i64) -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|p| p.join("NanoCrew").join("Sync").join("cache").join(format!("drive-{drive_id}")))
-}
 

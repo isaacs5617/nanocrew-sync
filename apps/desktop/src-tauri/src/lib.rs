@@ -180,6 +180,7 @@ pub fn run() {
             commands::prefs::get_pref,
             commands::prefs::set_pref,
             commands::prefs::clear_pref,
+            commands::prefs::get_cache_root_info,
             commands::cache::pin_file,
             commands::cache::unpin_file,
             commands::cache::is_file_pinned,
@@ -257,6 +258,18 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             return;
         }
     };
+    // Cache root — same value for every auto-mounted drive this boot.
+    let cache_root = {
+        let state: tauri::State<AppState> = app.state();
+        match commands::prefs::get_cache_root(&state.db) {
+            Some(p) => p,
+            None => {
+                tracing::error!(target: "nanocrew::auto_mount",
+                    "LOCALAPPDATA not set — cannot resolve cache root");
+                return;
+            }
+        }
+    };
 
     for (id, endpoint, bucket, region, letter, aki, provider, readonly, cache_size_gb) in rows {
         let state: tauri::State<AppState> = app.state();
@@ -310,6 +323,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             cache_enabled,
             cache_max_bytes,
             db_path: db_path.clone(),
+            cache_root: cache_root.clone(),
         };
 
         let _ = app.emit(

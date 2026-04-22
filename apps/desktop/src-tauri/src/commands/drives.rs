@@ -265,6 +265,11 @@ pub async fn mount_drive(
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?
         .join("nanocrew.db");
+    // Cache location (Phase 7.4). `cache_root` pref overrides the
+    // LOCALAPPDATA default; the per-drive subdirectory is appended in
+    // `mounts::spawn_mount`.
+    let cache_root = crate::commands::prefs::get_cache_root(&state.db)
+        .ok_or_else(|| "LOCALAPPDATA not set — cannot resolve cache root".to_string())?;
 
     let mount_config = MountConfig {
         drive_id, letter, provider, endpoint, bucket, region,
@@ -275,6 +280,7 @@ pub async fn mount_drive(
         cache_enabled,
         cache_max_bytes,
         db_path,
+        cache_root,
     };
     let app2 = app.clone();
     let handle = tokio::task::spawn_blocking(move || mounts::spawn_mount(mount_config, app2))

@@ -180,6 +180,70 @@ const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token 
   );
 };
 
+/// Cache location picker. Reads the effective + default root from the backend,
+/// lets the user override via a `cache_root` pref (empty = default), and
+/// offers an "Open folder" shortcut. Changes apply at next mount — we don't
+/// try to migrate existing cache files.
+const CacheLocationCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
+  const t = getTokens(theme);
+  const [info, setInfo] = React.useState<{ effective: string; def: string; isCustom: boolean } | null>(null);
+  const [reloadTick, setReloadTick] = React.useState(0);
+
+  React.useEffect(() => {
+    invoke<[string, string, boolean]>('get_cache_root_info', { token })
+      .then(([effective, def, isCustom]) => setInfo({ effective, def, isCustom }))
+      .catch(() => {});
+  }, [token, reloadTick]);
+
+  // Poll once more shortly after mount so the effective path tracks the pref
+  // after a debounced save completes. Cheap — one SQLite read.
+  React.useEffect(() => {
+    const h = window.setInterval(() => setReloadTick(x => x + 1), 1500);
+    return () => window.clearInterval(h);
+  }, []);
+
+  return (
+    <NCCard theme={theme} pad={20}>
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Cache location</NCEyebrow>
+      <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+        By default, NanoCrew Sync stores its on-disk cache under <span style={{ fontFamily: NC_FONT_MONO, color: t.textHi }}>%LOCALAPPDATA%\NanoCrew\Sync\cache</span>. Override this to move the cache to a larger or faster drive. Each mounted drive gets its own subfolder. <strong style={{ color: t.textHi }}>Changes apply at next mount</strong> — existing cached data is not migrated automatically.
+      </div>
+      <PrefInput
+        theme={theme} token={token}
+        prefKey="cache_root"
+        label="Custom cache folder"
+        sub="Absolute path. Leave blank to use the default."
+        placeholder={info?.def ?? 'C:\\Users\\…\\AppData\\Local\\NanoCrew\\Sync\\cache'}
+        mono
+      />
+      <div style={{
+        marginTop: 12, padding: '10px 12px',
+        background: t.surface1, border: `1px solid ${t.border}`, borderRadius: 3,
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}>
+        <I.drive size={14} color={info?.isCustom ? t.lime : t.textLo} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.2, color: t.textLo, marginBottom: 2 }}>
+            {info?.isCustom ? 'CUSTOM · ACTIVE' : 'DEFAULT'}
+          </div>
+          <div style={{
+            fontFamily: NC_FONT_MONO, fontSize: 12, color: t.textHi,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {info?.effective ?? '—'}
+          </div>
+        </div>
+        <NCBtn
+          theme={theme} small ghost
+          onClick={() => info && invoke('open_path', { token, path: info.effective }).catch(() => {})}
+        >
+          Open folder
+        </NCBtn>
+      </div>
+    </NCCard>
+  );
+};
+
 const PlaceholderSection: React.FC<{ title: string; body: string; theme: Theme }> = ({ title, body, theme }) => {
   const t = getTokens(theme);
   return (
@@ -466,11 +530,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
               <NCBtn theme={theme} small ghost onClick={handleClearCache}>Clear cache</NCBtn>
             </div>
           </NCCard>
-          <PlaceholderSection
-            theme={theme}
-            title="Cache location"
-            body="Choose where NanoCrew Sync stores its local cache. By default this is %LOCALAPPDATA%\NanoCrew\Sync\cache."
-          />
+          <CacheLocationCard theme={theme} token={token} />
         </>;
 
       case 'Security':

@@ -161,37 +161,22 @@
 
 ## Phase 9 — Licensing & pricing gate
 
-- [ ] 9.1 License key format — signed JWT with tier, seat count, expiry, machine limit
-- [ ] 9.2 Activation flow — paste key in Settings → About → Activate
-- [ ] 9.3 Machine fingerprint — hardware UUID + MAC hash; deactivate on uninstall
-- [ ] 9.4 Tier enforcement:
-  - [ ] Free: 1 drive, 50 GB/mo transfer, core providers
-  - [ ] Personal ($49 one-time): unlimited drives, all providers, 1 PC, 1 year of updates
-  - [ ] Pro ($99/yr or $199 lifetime): 3 PCs, File Lock, cache encryption, priority support
-  - [ ] Team ($12/user/mo, 5-seat min): floating seats, SSO, audit log, central drive config
-- [ ] 9.5 14-day full-Pro trial on first install
-- [ ] 9.6 In-app upgrade CTAs (Stripe or Lemon Squeezy checkout link)
+- [x] 9.1 License key format — RS256 JWT with `key_id`, `tier`, `seats`, `iat`, `exp`, `machine_limit`, `machine_fingerprint`, `email`. Verified offline against an embedded issuer pubkey (`license::ISSUER_PUBKEY_PEM`). **Ship-blocker for GA:** swap the placeholder PEM for the real production pubkey before 11.5.
+- [x] 9.2 Activation flow — Settings → About → **License** card. Paste JWT into textarea, click Activate; `activate_license` verifies + persists to `prefs.license_jwt`. Deactivate clears it. Every activation/deactivation writes a `license/activate` or `license/deactivate` audit row.
+- [x] 9.3 Machine fingerprint — `SHA-256("nanocrew-sync-v1|" || file_lock::machine_id())` where `machine_id` already reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. Chose MachineGuid over hardware UUID + MAC because MAC churns on NIC changes and the hardware UUID needs elevation on some SKUs. First 16 hex chars of the fingerprint shown on the About card so users can quote it to support.
+- [x] 9.4 Tier enforcement — **soft launch**: backend computes `LicenseStatus { tier, is_pro, expires_at, days_remaining, ... }`; frontend renders tier badge + "Upgrade to Pro" CTA when `!is_pro`. Hard feature gates (max_drives, File Lock, cache encryption) deliberately **not** wired yet — see `license.rs` module docs for rationale (key-server hiccups shouldn't brick paying users). Adding gates later is a one-line `if !status.is_pro { return Err(...) }` at command entry points.
+- [x] 9.5 14-day full-Pro trial — `prefs.install_at` recorded on first `get_license_status` call; `compute_status` returns `tier: "trial", is_pro: true` with day countdown until `install_at + 14 days`. Trial banner on the License card.
+- [x] 9.6 In-app upgrade CTA — "Upgrade to Pro" NCBtn in the License card opens `https://nanocrew.dev/buy` via `open_path` (explorer.exe handles URLs). Placeholder URL — swap for the real Stripe/Lemon Squeezy checkout link once payment provider is locked in.
 
 **Target:** a Free user can upgrade to Pro and see the gated features unlock in < 60 s.
 
-### Design notes for the next session
+### Follow-ups before GA
 
-Phase 9 is deliberately **not** scaffolded tonight — each sub-item depends on product decisions that need your input before I lock them in with code:
-
-1. **JWT key-signing infrastructure.** We need an `ed25519` (or RS256) keypair. The public key ships embedded in the Rust binary; the private key signs licenses on a server (or a local dev tool for now). Decision needed: is the signing service a simple Node/Rust CLI you run manually, or does it live in a Cloudflare Worker / Lambda behind an admin dashboard?
-2. **Machine fingerprint source.** `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` is already read by `file_lock::machine_id()` and is the obvious candidate. Hardware UUID (`wmic csproduct get uuid`) is more stable across reinstalls but needs elevation on some SKUs. Pick one.
-3. **Trial start timestamp.** Will live in the `prefs` table (key: `trial_started_at`). Written on first successful sign-in after install. Straightforward — but we need the trial length locked (14 days vs 30).
-4. **Enforcement gates.** The schema lists Free/Personal/Pro/Team tiers with specific feature gates (drive count, File Lock, cache encryption). Every gate is a `fn ensure_tier(state, feature) -> Result<()>` call at the command entry point. Easy to add — but the *list* of gates needs to match what's actually behind the paywall, which is a pricing decision.
-5. **Payment provider.** Stripe vs Lemon Squeezy vs Paddle changes the checkout-return URL and webhook format. The licensing server design depends on this. This is fundamentally a business decision.
-6. **Offline grace period.** If the machine can't reach the license server for N days, what happens? Silent downgrade to Free? Lockout? Warning banner only?
-
-When you're ready, the landing points in code are:
-- `commands::prefs` (already exists) — stash trial start / cached license JWT
-- New `commands::licensing` module with `get_status`, `activate`, `deactivate`, `machine_fingerprint`
-- New `licensing::verify` Rust module that parses the JWT and checks signature + expiry + machine
-- UI: new "License" section in `SettingsScreen`, plus a tier badge on `AccountScreen`
-
-I'd rather leave these hooks empty and well-documented than ship a stub that pretends to enforce anything.
+- Generate production RS256 issuer keypair; replace `license::ISSUER_PUBKEY_PEM` placeholder.
+- Stand up signing service (Cloudflare Worker or Node CLI) that issues JWTs with the claims schema in `license::LicenseClaims`.
+- Pick payment provider (Stripe / Lemon Squeezy / Paddle); swap `https://nanocrew.dev/buy` for the real checkout link.
+- Decide whether to escalate "soft" tier enforcement to hard gates (max_drives, File Lock, cache encryption). Hook points are the `commands::*` entry functions — add `if !license::compute_status(&state.db).is_pro { return Err(...) }`.
+- Decide offline grace period policy. Current behavior: JWT verified offline against embedded pubkey, so no network dependency — license works forever until `exp`. If a network-revoked list becomes necessary, add a periodic fetch + `revoked` check in `verify_jwt`.
 
 ---
 
@@ -201,7 +186,7 @@ I'd rather leave these hooks empty and well-documented than ship a stub that pre
 - [ ] 10.2 Pricing page — 4 tiers, lifetime/annual toggle, FAQ
 - [ ] 10.3 Docs site (MDX, searchable) — install, provider setup, troubleshooting
 - [ ] 10.4 Release automation — GitHub Actions signs and publishes MSI + EXE to `releases.nanocrew.dev`
-- [ ] 10.5 Auto-updater — Tauri updater consuming the release feed
+- [x] 10.5 Auto-updater — `tauri-plugin-updater` 2.10.1 wired in `lib.rs`; `tauri.conf.json.plugins.updater` has a minisign pubkey and two endpoints (GitHub Releases `latest.json` + `releases.nanocrew.dev/{{target}}/{{arch}}/{{current_version}}`), NSIS `installMode: passive`, `createUpdaterArtifacts: true`. Settings → About → `UpdateButton` calls `check()` + `downloadAndInstall()` + `relaunch()` with live progress UI. Ship-blocker for GA: publish a real `latest.json` and ensure CI signs updater bundles with the matching private key.
 
 **Target:** a prospect can land on nanocrew.dev, pick a tier, check out, and install — unattended.
 

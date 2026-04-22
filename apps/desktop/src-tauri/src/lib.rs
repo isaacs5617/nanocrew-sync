@@ -13,6 +13,7 @@ mod dpapi;
 mod error;
 mod file_lock;
 mod http_client;
+mod license;
 mod logging;
 mod mounts;
 mod state;
@@ -188,6 +189,9 @@ pub fn run() {
             commands::cache::list_pinned_files,
             commands::locks::list_file_locks,
             commands::locks::break_file_lock,
+            license::get_license_status,
+            license::activate_license,
+            license::deactivate_license,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")

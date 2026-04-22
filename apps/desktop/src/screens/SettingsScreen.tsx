@@ -244,6 +244,165 @@ const CacheLocationCard: React.FC<{ theme: Theme; token: string }> = ({ theme, t
   );
 };
 
+interface LicenseStatus {
+  tier: string;
+  is_pro: boolean;
+  expires_at: number;
+  days_remaining: number;
+  key_id: string | null;
+  email: string | null;
+  machine_fingerprint_short: string;
+}
+
+const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
+  const t = getTokens(theme);
+  const [status, setStatus] = React.useState<LicenseStatus | null>(null);
+  const [key, setKey] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const s = await invoke<LicenseStatus>('get_license_status', { token });
+      setStatus(s);
+    } catch (e) {
+      console.error('get_license_status failed', e);
+    }
+  }, [token]);
+
+  React.useEffect(() => { refresh(); }, [refresh]);
+
+  const activate = async () => {
+    const jwt = key.trim();
+    if (!jwt) return;
+    setBusy(true); setErr(null);
+    try {
+      const s = await invoke<LicenseStatus>('activate_license', { token, licenseJwt: jwt });
+      setStatus(s);
+      setKey('');
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deactivate = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const s = await invoke<LicenseStatus>('deactivate_license', { token });
+      setStatus(s);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!status) {
+    return (
+      <NCCard theme={theme} pad={20}>
+        <NCEyebrow theme={theme}>License</NCEyebrow>
+        <div style={{ fontSize: 12, color: t.textMd, marginTop: 10 }}>Loading…</div>
+      </NCCard>
+    );
+  }
+
+  const isActive = status.key_id !== null;
+  const tierLabel = status.tier.toUpperCase();
+  const badgeColor =
+    status.tier === 'pro' || status.tier === 'team' ? t.lime
+    : status.tier === 'trial' ? '#f6c744'
+    : t.textLo;
+
+  return (
+    <NCCard theme={theme} pad={20}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+        <NCEyebrow theme={theme}>License</NCEyebrow>
+        <span style={{
+          fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.4,
+          color: '#0A0A0A', background: badgeColor,
+          padding: '3px 8px', borderRadius: 2, fontWeight: 600,
+        }}>{tierLabel}</span>
+      </div>
+
+      {status.tier === 'trial' && (
+        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
+          Free trial — <strong>{status.days_remaining}</strong> {status.days_remaining === 1 ? 'day' : 'days'} remaining.
+        </div>
+      )}
+      {status.tier === 'free' && (
+        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
+          Trial ended. Activate a license or continue on the free tier.
+        </div>
+      )}
+      {isActive && (
+        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
+          Thanks for supporting NanoCrew. {status.days_remaining > 0 && (
+            <span style={{ color: t.textMd }}>Expires in {status.days_remaining} days.</span>
+          )}
+        </div>
+      )}
+
+      {isActive ? (
+        <div style={{ display: 'grid', gap: 6, fontSize: 12, color: t.textMd, marginBottom: 14 }}>
+          <div><span style={{ color: t.textLo }}>Key ID:</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.key_id}</span></div>
+          {status.email && <div><span style={{ color: t.textLo }}>Email:</span> {status.email}</div>}
+          <div><span style={{ color: t.textLo }}>This machine:</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span></div>
+        </div>
+      ) : (
+        <>
+          <NCLabel theme={theme}>License key</NCLabel>
+          <textarea
+            value={key}
+            onChange={e => setKey(e.target.value)}
+            placeholder="Paste your license JWT here…"
+            rows={3}
+            style={{
+              width: '100%', boxSizing: 'border-box', resize: 'vertical',
+              fontFamily: NC_FONT_MONO, fontSize: 11,
+              background: t.surface2, color: t.textHi,
+              border: `1px solid ${t.border}`, borderRadius: 3,
+              padding: '8px 10px', marginTop: 6, marginBottom: 10,
+            }}
+          />
+          <div style={{ fontSize: 11, color: t.textLo, marginBottom: 10 }}>
+            This machine: <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span>
+          </div>
+        </>
+      )}
+
+      {err && (
+        <div style={{
+          fontSize: 12, color: '#f07f7f', background: 'rgba(240, 127, 127, 0.1)',
+          border: '1px solid rgba(240, 127, 127, 0.3)', padding: '8px 10px',
+          borderRadius: 3, marginBottom: 10,
+        }}>{err}</div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {isActive ? (
+          <NCBtn theme={theme} small ghost onClick={deactivate} disabled={busy}>
+            {busy ? 'Working…' : 'Deactivate'}
+          </NCBtn>
+        ) : (
+          <NCBtn theme={theme} small onClick={activate} disabled={busy || !key.trim()}>
+            {busy ? 'Activating…' : 'Activate'}
+          </NCBtn>
+        )}
+        {!status.is_pro && (
+          <NCBtn
+            theme={theme} small ghost
+            onClick={() => invoke('open_path', { token, path: 'https://nanocrew.dev/buy' }).catch(() => {})}
+          >
+            Upgrade to Pro
+          </NCBtn>
+        )}
+      </div>
+    </NCCard>
+  );
+};
+
 const PlaceholderSection: React.FC<{ title: string; body: string; theme: Theme }> = ({ title, body, theme }) => {
   const t = getTokens(theme);
   return (
@@ -594,6 +753,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
 
       case 'About':
         return <>
+          <LicenseCard theme={theme} token={token} />
           <NCCard theme={theme} pad={24}>
             <div style={{ display: 'flex', gap: 20, alignItems: 'center', marginBottom: 20 }}>
               <div style={{

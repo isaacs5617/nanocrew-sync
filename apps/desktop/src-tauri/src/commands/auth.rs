@@ -238,6 +238,32 @@ pub async fn verify_password(
     Ok(())
 }
 
+/// Audit-log a lock/unlock transition. Locking is handled UI-side (no server
+/// state changes) but we want a trail for security review. `reason` is a free
+/// short tag — `"minimize"`, `"idle"`, `"manual"`, etc.
+#[tauri::command]
+pub async fn record_lock_event(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    token: String,
+    locked: bool,
+    reason: Option<String>,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    let actor = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&token)
+        .map(|s| s.username.clone());
+    let action = if locked { "lock" } else { "unlock" };
+    activity::record(
+        &state.db, &app, "auth", action, activity::SEV_INFO,
+        None, actor.as_deref(), None, reason.as_deref(),
+    );
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_cache(
     state: State<'_, AppState>,

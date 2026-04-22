@@ -161,7 +161,10 @@ export function App() {
       const unlisten = await win.onResized(async () => {
         if (cancelled) return;
         try {
-          if (await win.isMinimized()) setAppState('locked');
+          if (await win.isMinimized()) {
+            setAppState('locked');
+            invoke('record_lock_event', { token, locked: true, reason: 'minimize' }).catch(() => {});
+          }
         } catch { /* ignore */ }
       });
       return unlisten;
@@ -187,8 +190,16 @@ export function App() {
     setAppState('signin');
   };
 
-  const handleLock = () => { if (appState === 'authed') setAppState('locked'); };
-  const handleUnlock = () => { if (appState === 'locked') setAppState('authed'); };
+  const handleLock = () => {
+    if (appState !== 'authed') return;
+    setAppState('locked');
+    invoke('record_lock_event', { token, locked: true, reason: 'manual' }).catch(() => {});
+  };
+  const handleUnlock = () => {
+    if (appState !== 'locked') return;
+    setAppState('authed');
+    invoke('record_lock_event', { token, locked: false, reason: null }).catch(() => {});
+  };
 
   const renderContent = () => {
     switch (appState) {

@@ -160,6 +160,7 @@ pub fn run() {
             commands::auth::get_account,
             commands::auth::change_password,
             commands::auth::verify_password,
+            commands::auth::record_lock_event,
             commands::auth::clear_cache,
             commands::drives::list_drives,
             commands::drives::add_drive,

@@ -5,6 +5,7 @@ use crate::{
     commands::activity,
     credentials,
     error::AppError,
+    http_client,
     mounts::{self, MountConfig},
     state::AppState,
     types::{AddDriveInput, DriveInfo, DriveStatusPayload, S3Entry, TestConnectionInput},
@@ -335,10 +336,12 @@ pub async fn test_connection(
         "nanocrew-sync",
     );
 
+    let http = http_client::build_from_prefs(&state.db).map_err(|e| e.to_string())?;
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(input.region))
         .endpoint_url(format!("https://{}", input.endpoint))
         .credentials_provider(creds)
+        .http_client(http)
         .load()
         .await;
 
@@ -421,10 +424,12 @@ pub async fn list_drive_objects(
     let creds = aws_credential_types::Credentials::new(
         aki, secret, None, None, "nanocrew-sync",
     );
+    let http = http_client::build_from_prefs(&state.db).map_err(|e| e.to_string())?;
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region))
         .endpoint_url(format!("https://{}", endpoint))
         .credentials_provider(creds)
+        .http_client(http)
         .load()
         .await;
 
@@ -493,10 +498,12 @@ pub async fn list_buckets(
     let creds = aws_credential_types::Credentials::new(
         access_key_id, secret_access_key, None, None, "nanocrew-sync",
     );
+    let http = http_client::build_from_prefs(&state.db).map_err(|e| e.to_string())?;
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region))
         .endpoint_url(format!("https://{}", endpoint))
         .credentials_provider(creds)
+        .http_client(http)
         .load()
         .await;
 

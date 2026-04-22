@@ -91,6 +91,56 @@ const PrefToggle: React.FC<{
   );
 };
 
+/// Text input backed by a `prefs` key. Debounces save-on-change so we don't
+/// hammer SQLite on every keystroke. Empty string saved as empty — the Rust
+/// side treats empty-or-missing as "unset".
+const PrefInput: React.FC<{
+  theme: Theme; token: string;
+  prefKey: string; label: string; sub?: string;
+  placeholder?: string; mono?: boolean;
+}> = ({ theme, token, prefKey, label, sub, placeholder, mono }) => {
+  const t = getTokens(theme);
+  const [value, setValue] = React.useState<string>('');
+  const [loaded, setLoaded] = React.useState(false);
+
+  React.useEffect(() => {
+    invoke<string | null>('get_pref', { token, key: prefKey })
+      .then(v => { setValue(v ?? ''); setLoaded(true); })
+      .catch(() => setLoaded(true));
+  }, [token, prefKey]);
+
+  // Debounced persistence.
+  React.useEffect(() => {
+    if (!loaded) return;
+    const handle = window.setTimeout(() => {
+      invoke('set_pref', { token, key: prefKey, value }).catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [value, loaded, token, prefKey]);
+
+  return (
+    <div>
+      <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>{label}</div>
+      {sub && <div style={{ fontSize: 11, color: t.textMd, marginTop: 2, marginBottom: 8 }}>{sub}</div>}
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={e => setValue(e.target.value)}
+        style={{
+          width: '100%', boxSizing: 'border-box',
+          padding: '10px 12px',
+          background: t.surface1,
+          border: `1px solid ${t.border}`,
+          borderRadius: 3, outline: 'none',
+          color: t.textHi, fontSize: 13,
+          fontFamily: mono ? NC_FONT_MONO : undefined,
+        }}
+      />
+    </div>
+  );
+};
+
 /// "Launch at Windows sign-in" toggle backed by the HKCU\...\Run registry
 /// key. Reads the current state on mount; writes through set_autostart.
 const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
@@ -350,11 +400,29 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             <Spacer />
             <ToggleRow theme={theme} label="Limit download speed" comingSoon />
           </NCCard>
-          <PlaceholderSection
-            theme={theme}
-            title="Proxy & TLS"
-            body="Configure an HTTP/SOCKS proxy and custom CA certificates for corporate environments. These settings apply to all S3 provider connections."
-          />
+          <NCCard theme={theme} pad={20}>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Proxy & TLS</NCEyebrow>
+            <div style={{ fontSize: 12, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+              Route all S3 traffic through a corporate HTTPS proxy and/or trust an extra root CA certificate. Changes apply to new mounts and test connections — remount a drive to pick them up.
+            </div>
+            <PrefInput
+              theme={theme} token={token}
+              prefKey="proxy_url"
+              label="HTTPS proxy"
+              sub="e.g. http://proxy.corp:8080 or http://user:pass@proxy.corp:8080. Leave blank to connect directly."
+              placeholder="http://proxy.example.com:8080"
+              mono
+            />
+            <Spacer />
+            <PrefInput
+              theme={theme} token={token}
+              prefKey="custom_ca_pem_path"
+              label="Custom CA certificate (PEM)"
+              sub="Absolute path to a .pem file containing one or more trusted root certificates. Added alongside OS roots and SSL_CERT_FILE."
+              placeholder="C:\\path\\to\\corp-root-ca.pem"
+              mono
+            />
+          </NCCard>
         </>;
 
       case 'Cache & storage':

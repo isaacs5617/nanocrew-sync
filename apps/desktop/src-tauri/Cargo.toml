@@ -41,6 +41,11 @@ rand_core   = { version = "0.6", features = ["getrandom"] }
 aws-config          = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3          = { version = "1" }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+# Custom HTTP client — lets us inject HTTPS proxy config + extra root CA
+# certificates for corporate networks (Phase 7.3).
+aws-smithy-http-client = { version = "1", features = ["default-client", "rustls-ring"] }
+aws-smithy-runtime-api = { version = "1" }
+url = "2"
 
 # WinFsp — user-mode Windows filesystem driver. Replaces cloud-filter
 # (see src-tauri.cloudfilter-backup-* for the previous implementation).

@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use winfsp::{
     host::{FileSystemHost, VolumeParams},
     FspInit,
@@ -22,6 +22,8 @@ use winfsp::{
 
 use crate::{
     error::AppError,
+    http_client,
+    state::AppState,
     types::{DriveStatusPayload, FileLockEvent, TransferPayload},
     winfsp_vfs::S3Fs,
 };
@@ -128,6 +130,20 @@ pub fn spawn_mount(
                 None,
                 "nanocrew-sync",
             );
+
+            // Build the shared HTTP client (rustls + optional proxy + optional
+            // extra CA) from the prefs DB. We do this inside the thread so we
+            // always pick up the latest saved values.
+            let http = {
+                let state: tauri::State<AppState> = app_handle.state();
+                match http_client::build_from_prefs(&state.db) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!("http_client build: {e}")));
+                        return;
+                    }
+                }
+            };
             // Retry plumbing (Phase 5.7): the AWS SDK's default retry mode is
             // "Standard" with 3 attempts. We bump to 8 attempts with adaptive
             // backoff so a transient network blip (Wi-Fi handoff, DNS hiccup,
@@ -141,6 +157,7 @@ pub fn spawn_mount(
                     .endpoint_url(format!("https://{}", config.endpoint))
                     .credentials_provider(creds)
                     .retry_config(retry_config)
+                    .http_client(http)
                     .load()
                     .await
             });

@@ -11,6 +11,7 @@ mod db;
 mod dpapi;
 mod error;
 mod file_lock;
+mod http_client;
 mod logging;
 mod mounts;
 mod state;

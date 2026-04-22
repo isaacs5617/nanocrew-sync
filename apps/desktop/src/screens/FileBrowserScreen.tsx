@@ -25,6 +25,15 @@ interface S3Entry {
   modified: number;
 }
 
+interface FileLockEntry {
+  key: string;
+  machine: string;
+  owner: string;
+  acquired_at: number;
+  expires_at: number;
+  is_ours: boolean;
+}
+
 function formatSize(bytes: number): string {
   if (!bytes) return '—';
   if (bytes < 1024) return `${bytes} B`;
@@ -67,6 +76,7 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   const [error, setError] = React.useState<string | null>(null);
   const [refreshKey, setRefreshKey] = React.useState(0);
   const [pinned, setPinned] = React.useState<Set<string>>(new Set());
+  const [locks, setLocks] = React.useState<Map<string, FileLockEntry>>(new Map());
   const [menu, setMenu] = React.useState<{ x: number; y: number; entry: S3Entry } | null>(null);
 
   // Load mounted drives
@@ -135,6 +145,37 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   }, [selectedDrive, token]);
 
   React.useEffect(reloadPinned, [reloadPinned, refreshKey]);
+
+  // Fetch the drive's active sentinels so we can paint padlocks and expose
+  // a "Break lock" admin action. Cheap — sentinel count ≪ file count.
+  const reloadLocks = React.useCallback(() => {
+    if (!selectedDrive) { setLocks(new Map()); return; }
+    invoke<FileLockEntry[]>('list_file_locks', { token, driveId: selectedDrive.id })
+      .then(rows => setLocks(new Map(rows.map(r => [r.key, r]))))
+      .catch(() => setLocks(new Map()));
+  }, [selectedDrive, token]);
+  React.useEffect(reloadLocks, [reloadLocks, refreshKey]);
+
+  const breakLock = async (entry: S3Entry) => {
+    if (!selectedDrive) return;
+    const info = locks.get(entry.key);
+    if (!info) return;
+    const who = info.is_ours ? 'this machine' : `${info.owner} on ${info.machine.slice(0, 8)}…`;
+    const ok = window.confirm(
+      `Force-release the lock on "${entry.name}"?\n\nHeld by: ${who}\n` +
+      `Breaking an active lock may cause the other writer's upload to fail or ` +
+      `leave a partial object. Only do this if you're sure the other writer has ` +
+      `crashed or disconnected. This action is logged.`
+    );
+    if (!ok) return;
+    try {
+      await invoke('break_file_lock', { token, driveId: selectedDrive.id, key: entry.key });
+      setLocks(prev => { const n = new Map(prev); n.delete(entry.key); return n; });
+    } catch (e) {
+      setError(String(e));
+    }
+    setMenu(null);
+  };
 
   const togglePin = async (entry: S3Entry) => {
     if (!selectedDrive) return;
@@ -320,6 +361,7 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
             ) : (
               entries.map((entry, i) => {
                 const isPinned = pinned.has(entry.key);
+                const lockInfo = locks.get(entry.key);
                 return (
                 <div
                   key={entry.key + i}
@@ -355,6 +397,16 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                         title="Pinned — kept on device"
                         style={{ color: t.lime, fontSize: 11, flexShrink: 0 }}
                       >●</span>
+                    )}
+                    {lockInfo && (
+                      <span
+                        title={lockInfo.is_ours
+                          ? `Locked by this machine (${lockInfo.owner})`
+                          : `Locked by ${lockInfo.owner} on ${lockInfo.machine.slice(0, 8)}… — expires ${new Date(lockInfo.expires_at * 1000).toLocaleTimeString()}`}
+                        style={{ color: lockInfo.is_ours ? t.textMd : t.danger, fontSize: 11, flexShrink: 0, display: 'inline-flex' }}
+                      >
+                        <I.lock size={11} />
+                      </span>
                     )}
                   </div>
                   <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd }}>
@@ -423,6 +475,22 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
               {pinned.has(menu.entry.key) ? 'Unpin from device' : 'Keep on device'}
             </span>
           </div>
+          {locks.has(menu.entry.key) && (
+            <div
+              onClick={() => breakLock(menu.entry)}
+              style={{
+                padding: '7px 12px', cursor: 'pointer',
+                color: t.danger, borderRadius: 2,
+                display: 'flex', alignItems: 'center', gap: 8,
+                borderTop: `1px solid ${t.border}`, marginTop: 4, paddingTop: 8,
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+            >
+              <I.lock size={12} />
+              <span>Break lock</span>
+            </div>
+          )}
           <div style={{
             padding: '4px 12px 6px',
             color: t.textLo, fontSize: 10, fontFamily: NC_FONT_MONO,

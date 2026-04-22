@@ -186,6 +186,8 @@ pub fn run() {
             commands::cache::unpin_file,
             commands::cache::is_file_pinned,
             commands::cache::list_pinned_files,
+            commands::locks::list_file_locks,
+            commands::locks::break_file_lock,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")

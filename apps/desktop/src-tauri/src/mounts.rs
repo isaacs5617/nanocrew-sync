@@ -21,11 +21,12 @@ use winfsp::{
 };
 
 use crate::{
+    cache::DiskCache,
     error::AppError,
     http_client,
     state::AppState,
     types::{DriveStatusPayload, FileLockEvent, TransferPayload},
-    winfsp_vfs::S3Fs,
+    winfsp_vfs::{cache_dir_for_drive, S3Fs},
 };
 
 // ── Global WinFsp init ───────────────────────────────────────────────────────
@@ -68,6 +69,15 @@ pub struct MountConfig {
     /// the two MountConfig build sites (manual mount + auto_mount_drives).
     pub upload_rate_bps: Option<u64>,
     pub download_rate_bps: Option<u64>,
+
+    /// On-disk cache parameters (Phase 5.6). `cache_enabled=false` disables
+    /// the block cache entirely — `get_range` becomes a pass-through.
+    pub cache_enabled: bool,
+    /// Cache size cap in bytes. Derived from `drives.cache_size_gb`.
+    pub cache_max_bytes: u64,
+    /// Absolute path to the app SQLite file — the cache opens its own
+    /// connection so it never fights the main app's Mutex.
+    pub db_path: std::path::PathBuf,
 }
 
 /// A live mounted drive. Dropping `stop_tx` unblocks the host thread.
@@ -77,10 +87,19 @@ pub struct MountHandle {
     pub letter: String,
     pub stop_tx: tokio::sync::oneshot::Sender<()>,
     pub thread: Option<std::thread::JoinHandle<()>>,
+    /// Shared reference to the disk cache so external commands (pin/unpin)
+    /// can poke it while the mount is live. `None` when caching is disabled
+    /// for this drive.
+    pub cache: Option<std::sync::Arc<DiskCache>>,
 }
 
 impl MountHandle {
     pub fn stop(mut self) {
+        // Stop the sweeper thread before tearing down the mount so we don't
+        // leave it running against a half-demolished context.
+        if let Some(c) = &self.cache {
+            c.stop();
+        }
         let _ = self.stop_tx.send(());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -104,6 +123,41 @@ pub fn spawn_mount(
 
     let drive_id = config.drive_id;
     let letter = config.letter.clone();
+
+    // Build the disk cache up-front so we can (a) hand a clone into the
+    // WinFsp thread for S3Fs, and (b) return another clone on the
+    // MountHandle for pin/unpin commands to use while the drive is live.
+    let cache: Option<std::sync::Arc<DiskCache>> = if config.cache_enabled
+        && config.cache_max_bytes > 0
+    {
+        match cache_dir_for_drive(config.drive_id) {
+            Some(root) => match DiskCache::new(
+                config.drive_id,
+                root,
+                &config.db_path,
+                config.cache_max_bytes,
+                true,
+            ) {
+                Ok(c) => {
+                    c.start_eviction();
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(target: "nanocrew::cache",
+                        drive_id = config.drive_id, "cache init failed: {e}");
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(target: "nanocrew::cache",
+                    drive_id = config.drive_id, "LOCALAPPDATA unavailable — cache disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cache_for_thread = cache.clone();
 
     let thread = std::thread::Builder::new()
         .name(format!("winfsp-{}", config.letter))
@@ -191,6 +245,7 @@ pub fn spawn_mount(
                 config.owner.clone(),
                 config.upload_rate_bps,
                 config.download_rate_bps,
+                cache_for_thread,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -301,12 +356,19 @@ pub fn spawn_mount(
             letter,
             stop_tx,
             thread: Some(thread),
+            cache,
         }),
         Ok(Err(msg)) => {
+            if let Some(c) = &cache {
+                c.stop();
+            }
             let _ = thread.join();
             Err(AppError::Mount(msg))
         }
         Err(_) => {
+            if let Some(c) = &cache {
+                c.stop();
+            }
             let _ = stop_tx.send(());
             let _ = thread.join();
             Err(AppError::Mount("Mount timed out after 30 s".into()))

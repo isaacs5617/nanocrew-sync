@@ -53,6 +53,33 @@ CREATE TABLE IF NOT EXISTS prefs (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
+
+-- On-disk range cache index. Each row records a byte range we've fetched
+-- from S3 and still have on disk. The filename on disk is derived from
+-- sha256(key) + offset + len — see cache.rs. `last_access` is a unix
+-- timestamp (seconds) refreshed on every hit; the eviction loop evicts
+-- oldest first, skipping any row whose `key` is in `pinned_keys`.
+CREATE TABLE IF NOT EXISTS cache_entries (
+    drive_id    INTEGER NOT NULL,
+    key         TEXT    NOT NULL,
+    offset      INTEGER NOT NULL,
+    len         INTEGER NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    etag        TEXT,
+    last_access INTEGER NOT NULL,
+    PRIMARY KEY (drive_id, key, offset, len)
+);
+CREATE INDEX IF NOT EXISTS idx_cache_lru ON cache_entries(drive_id, last_access);
+CREATE INDEX IF NOT EXISTS idx_cache_key ON cache_entries(drive_id, key);
+
+-- Per-drive pin list. Pinned keys are exempt from LRU eviction. Matched
+-- as exact object keys (case-sensitive, as S3 itself is).
+CREATE TABLE IF NOT EXISTS pinned_keys (
+    drive_id   INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    pinned_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (drive_id, key)
+);
 ";
 
 pub fn open(path: &Path) -> Result<Connection, AppError> {

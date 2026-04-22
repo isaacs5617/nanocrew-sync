@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     auth::require_auth,
@@ -217,10 +217,10 @@ pub async fn mount_drive(
         return Err(AppError::AlreadyMounted.to_string());
     }
 
-    let (_name, provider, endpoint, bucket, region, letter, aki, readonly) = {
+    let (_name, provider, endpoint, bucket, region, letter, aki, readonly, cache_size_gb) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
-            "SELECT name,provider,endpoint,bucket,region,letter,access_key_id,readonly
+            "SELECT name,provider,endpoint,bucket,region,letter,access_key_id,readonly,cache_size_gb
              FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
@@ -232,6 +232,7 @@ pub async fn mount_drive(
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
                 r.get::<_, bool>(7)?,
+                r.get::<_, i64>(8)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
@@ -255,12 +256,25 @@ pub async fn mount_drive(
     let upload_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
     let download_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
 
+    // Disk cache (Phase 5.6). `cache_enabled` pref defaults to on; size comes
+    // from the per-drive `drives.cache_size_gb` column.
+    let cache_enabled = crate::commands::prefs::get_bool(&state.db, "cache_enabled", true);
+    let cache_max_bytes = (cache_size_gb.max(0) as u64).saturating_mul(1_073_741_824);
+    let db_path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?
+        .join("nanocrew.db");
+
     let mount_config = MountConfig {
         drive_id, letter, provider, endpoint, bucket, region,
         access_key_id: aki, secret_access_key: secret, readonly,
         owner,
         upload_rate_bps,
         download_rate_bps,
+        cache_enabled,
+        cache_max_bytes,
+        db_path,
     };
     let app2 = app.clone();
     let handle = tokio::task::spawn_blocking(move || mounts::spawn_mount(mount_config, app2))

@@ -447,9 +447,14 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
           <NCCard theme={theme} pad={20}>
             <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Local cache</NCEyebrow>
             <div style={{ fontSize: 13, color: t.textMd, marginBottom: 14, lineHeight: 1.55 }}>
-              NanoCrew Sync caches S3 metadata in memory with a 5-second TTL. Temp files used during uploads are deleted automatically after each write.
+              NanoCrew Sync keeps a per-drive on-disk cache of recently read byte ranges. Hits are served without touching the network; misses are fetched from S3 and written to disk for next time. The size cap is configured per drive on the Drives screen; pinned files are exempt from eviction.
             </div>
-            <ToggleRow theme={theme} label="Automatically evict stale cache entries" comingSoon />
+            <PrefToggle
+              theme={theme} token={token}
+              prefKey="cache_enabled" defaultOn
+              label="Enable on-disk range cache"
+              sub="When off, every read fetches bytes from S3 even if they're already on disk. Applies at next mount."
+            />
             <Spacer />
             <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 4 }}>
               <div style={{ flex: 1 }}>

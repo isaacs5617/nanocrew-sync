@@ -66,6 +66,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [refreshKey, setRefreshKey] = React.useState(0);
+  const [pinned, setPinned] = React.useState<Set<string>>(new Set());
+  const [menu, setMenu] = React.useState<{ x: number; y: number; entry: S3Entry } | null>(null);
 
   // Load mounted drives
   React.useEffect(() => {
@@ -119,6 +121,49 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
     setPrefix('');
     setEntries([]);
   };
+
+  // Pull the drive's pin list any time the drive changes or a pin toggles.
+  // Small set — cheap to fetch up-front and keep in memory.
+  const reloadPinned = React.useCallback(() => {
+    if (!selectedDrive) {
+      setPinned(new Set());
+      return;
+    }
+    invoke<string[]>('list_pinned_files', { token, driveId: selectedDrive.id })
+      .then(keys => setPinned(new Set(keys)))
+      .catch(() => setPinned(new Set()));
+  }, [selectedDrive, token]);
+
+  React.useEffect(reloadPinned, [reloadPinned, refreshKey]);
+
+  const togglePin = async (entry: S3Entry) => {
+    if (!selectedDrive) return;
+    const cmd = pinned.has(entry.key) ? 'unpin_file' : 'pin_file';
+    try {
+      await invoke(cmd, { token, driveId: selectedDrive.id, key: entry.key });
+      setPinned(prev => {
+        const next = new Set(prev);
+        if (cmd === 'pin_file') next.add(entry.key); else next.delete(entry.key);
+        return next;
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+    setMenu(null);
+  };
+
+  // Dismiss the context menu on any click outside or on Escape.
+  React.useEffect(() => {
+    if (!menu) return;
+    const onClick = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(null); };
+    window.addEventListener('click', onClick);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('click', onClick);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [menu]);
 
   // Breadcrumbs from prefix
   const breadcrumbs: { label: string; prefix: string }[] = [{ label: selectedDrive?.letter ?? '—', prefix: '' }];
@@ -273,10 +318,17 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                 This folder is empty.
               </div>
             ) : (
-              entries.map((entry, i) => (
+              entries.map((entry, i) => {
+                const isPinned = pinned.has(entry.key);
+                return (
                 <div
                   key={entry.key + i}
                   onDoubleClick={() => navigateInto(entry)}
+                  onContextMenu={e => {
+                    if (entry.is_dir) return;
+                    e.preventDefault();
+                    setMenu({ x: e.clientX, y: e.clientY, entry });
+                  }}
                   style={{
                     display: 'grid',
                     gridTemplateColumns: '22px 1fr 110px 150px',
@@ -295,8 +347,15 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                     fontWeight: entry.is_dir ? 500 : 400,
                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                     fontFamily: NC_FONT_UI,
+                    display: 'flex', alignItems: 'center', gap: 6,
                   }}>
-                    {entry.name}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
+                    {isPinned && (
+                      <span
+                        title="Pinned — kept on device"
+                        style={{ color: t.lime, fontSize: 11, flexShrink: 0 }}
+                      >●</span>
+                    )}
                   </div>
                   <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd }}>
                     {entry.is_dir ? '—' : formatSize(entry.size)}
@@ -305,7 +364,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                     {entry.is_dir ? '—' : formatDate(entry.modified)}
                   </div>
                 </div>
-              ))
+                );
+              })
             )}
           </div>
         )}
@@ -332,6 +392,49 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           </div>
         )}
       </div>
+
+      {/* Context menu — pin/unpin a file. Positioned at the cursor and
+          dismissed by Escape or any outside click (see effect above). */}
+      {menu && (
+        <div
+          onClick={e => e.stopPropagation()}
+          style={{
+            position: 'fixed', left: menu.x, top: menu.y, zIndex: 100,
+            background: t.surface2, border: `1px solid ${t.border}`,
+            borderRadius: 3, padding: 4, minWidth: 180,
+            fontFamily: NC_FONT_UI, fontSize: 12,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+          }}
+        >
+          <div
+            onClick={() => togglePin(menu.entry)}
+            style={{
+              padding: '7px 12px', cursor: 'pointer',
+              color: t.textHi, borderRadius: 2,
+              display: 'flex', alignItems: 'center', gap: 8,
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+          >
+            <span style={{ color: t.lime, width: 10 }}>
+              {pinned.has(menu.entry.key) ? '●' : '○'}
+            </span>
+            <span>
+              {pinned.has(menu.entry.key) ? 'Unpin from device' : 'Keep on device'}
+            </span>
+          </div>
+          <div style={{
+            padding: '4px 12px 6px',
+            color: t.textLo, fontSize: 10, fontFamily: NC_FONT_MONO,
+            letterSpacing: 0.5, borderTop: `1px solid ${t.border}`,
+            marginTop: 4,
+          }}>
+            {menu.entry.name.length > 28
+              ? menu.entry.name.slice(0, 26) + '…'
+              : menu.entry.name}
+          </div>
+        </div>
+      )}
     </>
   );
 };

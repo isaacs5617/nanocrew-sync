@@ -66,6 +66,7 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
+use crate::cache::{DiskCache, CACHE_BLOCK};
 use crate::file_lock;
 use crate::throttle::RateLimiter;
 use crate::types::{FileLockEvent, TransferPayload};
@@ -278,6 +279,11 @@ pub struct S3Fs {
     /// whether throttling is configured.
     upload_limiter: Arc<RateLimiter>,
     download_limiter: Arc<RateLimiter>,
+
+    /// On-disk block cache (Phase 5.6). Optional — `None` means the cache
+    /// was disabled via pref, in which case `get_range` always fetches from
+    /// S3 and `invalidate_key` is a no-op.
+    cache: Option<Arc<DiskCache>>,
 }
 
 impl S3Fs {
@@ -292,6 +298,7 @@ impl S3Fs {
         owner: String,
         upload_rate_bps: Option<u64>,
         download_rate_bps: Option<u64>,
+        cache: Option<Arc<DiskCache>>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
@@ -313,6 +320,7 @@ impl S3Fs {
             owner,
             upload_limiter: Arc::new(RateLimiter::new(upload_rate_bps)),
             download_limiter: Arc::new(RateLimiter::new(download_rate_bps)),
+            cache,
         })
     }
 
@@ -350,6 +358,15 @@ impl S3Fs {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(key);
+    }
+
+    /// Drop all on-disk cached blocks for `key`. Called after uploads,
+    /// deletes, and renames so the next reader sees fresh bytes. No-op when
+    /// the disk cache is disabled.
+    fn invalidate_cache(&self, key: &str) {
+        if let Some(c) = &self.cache {
+            c.invalidate_key(key);
+        }
     }
 
     // ── S3 operations ────────────────────────────────────────────────────────
@@ -556,7 +573,11 @@ impl S3Fs {
         Ok(self.resolve(key)?.map(|(_, m)| m))
     }
 
-    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+    /// Fetch a byte range from S3. Direct — no cache, no block alignment.
+    fn fetch_s3_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key_s = key.to_string();
@@ -581,6 +602,59 @@ impl S3Fs {
                 .into_bytes();
             Ok(bytes.to_vec())
         })
+    }
+
+    /// Return `len` bytes starting at `offset`. When the disk cache is
+    /// enabled, this decomposes the request into `CACHE_BLOCK`-aligned
+    /// windows: each block is served from disk on a hit, or fetched from S3
+    /// (and written through to the cache) on a miss.
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let cache = match &self.cache {
+            Some(c) if c.is_enabled() => c,
+            _ => return self.fetch_s3_range(key, offset, len),
+        };
+
+        let end = offset + len;
+        let mut out: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut pos = offset;
+        while pos < end {
+            let block_start = pos - (pos % CACHE_BLOCK);
+            let block_limit = block_start + CACHE_BLOCK;
+            let chunk_end = end.min(block_limit);
+
+            let block_bytes = if let Some(b) = cache.get_block(key, block_start) {
+                b
+            } else {
+                // Miss: fetch a full block (or whatever remains before EOF —
+                // S3 will clamp automatically if the range runs past end-of-
+                // object, returning fewer bytes than requested).
+                match self.fetch_s3_range(key, block_start, CACHE_BLOCK) {
+                    Ok(b) => {
+                        cache.put_block(key, block_start, &b);
+                        b
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            // Clamp into the user-requested subrange. A short block (EOF)
+            // may mean the caller's requested window runs past data; copy
+            // only what's actually there.
+            let lo = (pos - block_start) as usize;
+            let hi = ((chunk_end - block_start) as usize).min(block_bytes.len());
+            if hi > lo {
+                out.extend_from_slice(&block_bytes[lo..hi]);
+            }
+            if block_bytes.len() < (block_limit - block_start) as usize {
+                // Short block = EOF hit; nothing useful beyond here.
+                break;
+            }
+            pos = block_limit;
+        }
+        Ok(out)
     }
 
     // ── Upload path ──────────────────────────────────────────────────────────
@@ -1564,6 +1638,7 @@ impl FileSystemContext for S3Fs {
                     };
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
+                    let marker_key = marker.clone();
                     let _ = self.rt.block_on(async move {
                         client
                             .delete_object()
@@ -1574,6 +1649,7 @@ impl FileSystemContext for S3Fs {
                     });
                     self.invalidate_parent(key);
                     self.invalidate_meta(key);
+                    self.invalidate_cache(&marker_key);
                 }
             }
             OpenFile::File {
@@ -1598,6 +1674,7 @@ impl FileSystemContext for S3Fs {
                             Ok(_final_size) => {
                                 self.invalidate_meta(key);
                                 self.invalidate_parent(key);
+                                self.invalidate_cache(key);
                             }
                             Err(e) => {
                                 eprintln!("[winfsp] upload failed key={key}: {e}");
@@ -1615,6 +1692,7 @@ impl FileSystemContext for S3Fs {
                     });
                     self.invalidate_parent(key);
                     self.invalidate_meta(key);
+                    self.invalidate_cache(key);
                 }
             }
         }
@@ -1945,6 +2023,8 @@ impl FileSystemContext for S3Fs {
         self.invalidate_parent(&new_key);
         self.invalidate_meta(&old_key);
         self.invalidate_meta(&new_key);
+        self.invalidate_cache(&old_key);
+        self.invalidate_cache(&new_key);
         Ok(())
     }
 

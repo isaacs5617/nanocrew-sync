@@ -5,6 +5,7 @@ use tauri::{
 };
 
 mod auth;
+mod cache;
 mod commands;
 mod credentials;
 mod db;
@@ -179,6 +180,10 @@ pub fn run() {
             commands::prefs::get_pref,
             commands::prefs::set_pref,
             commands::prefs::clear_pref,
+            commands::cache::pin_file,
+            commands::cache::unpin_file,
+            commands::cache::is_file_pinned,
+            commands::cache::list_pinned_files,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")
@@ -206,11 +211,11 @@ pub fn run() {
 async fn auto_mount_drives(app: tauri::AppHandle) {
     // ── Pull drive rows from DB ───────────────────────────────────────────────
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, String, String, String, String, bool)> = {
+    let rows: Vec<(i64, String, String, String, String, String, String, bool, i64)> = {
         let state: tauri::State<AppState> = app.state();
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match db.prepare(
-            "SELECT id, endpoint, bucket, region, letter, access_key_id, provider, readonly
+            "SELECT id, endpoint, bucket, region, letter, access_key_id, provider, readonly, cache_size_gb
              FROM drives WHERE auto_mount = 1",
         ) {
             Ok(s) => s,
@@ -231,6 +236,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, bool>(7)?,
+                    r.get::<_, i64>(8)?,
                 ))
             })
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -243,7 +249,16 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         }
     }; // db lock released
 
-    for (id, endpoint, bucket, region, letter, aki, provider, readonly) in rows {
+    // Resolve the app data DB path once — passed into every cache per drive.
+    let db_path = match app.path().app_data_dir() {
+        Ok(p) => p.join("nanocrew.db"),
+        Err(e) => {
+            tracing::error!(target: "nanocrew::auto_mount", "app_data_dir: {e}");
+            return;
+        }
+    };
+
+    for (id, endpoint, bucket, region, letter, aki, provider, readonly, cache_size_gb) in rows {
         let state: tauri::State<AppState> = app.state();
 
         // Skip if already mounted (e.g. user mounted manually during setup window)
@@ -273,6 +288,8 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         // respect them too.
         let upload_rate_bps = commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
         let download_rate_bps = commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
+        let cache_enabled = commands::prefs::get_bool(&state.db, "cache_enabled", true);
+        let cache_max_bytes = (cache_size_gb.max(0) as u64).saturating_mul(1_073_741_824);
 
         let config = mounts::MountConfig {
             drive_id: id,
@@ -290,6 +307,9 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             owner: "auto-mount".to_string(),
             upload_rate_bps,
             download_rate_bps,
+            cache_enabled,
+            cache_max_bytes,
+            db_path: db_path.clone(),
         };
 
         let _ = app.emit(

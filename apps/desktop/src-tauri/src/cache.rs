@@ -40,8 +40,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use rand_core::RngCore;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
+
+/// Nonce length for AES-256-GCM per RFC 5116. Must be unique per (key,
+/// encryption) — we generate a fresh random nonce for every `put_block`.
+const NONCE_LEN: usize = 12;
+/// GCM's 128-bit authentication tag, appended to the ciphertext by the
+/// `aes-gcm` crate's `encrypt` API.
+const TAG_LEN: usize = 16;
 
 /// Block size we align cached ranges to. 1 MiB is a good trade-off: small
 /// enough that partial-file reads don't drag in excessive extra bytes, large
@@ -61,6 +73,11 @@ pub struct DiskCache {
     db: Mutex<Connection>,
     stop: Arc<AtomicBool>,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Per-drive AES-256-GCM cipher. Derived from machine ID + a per-install
+    /// random salt + the drive id so a stolen laptop backup can't trivially
+    /// decrypt another install's cache. `None` when encryption is disabled
+    /// (cache disabled, or salt couldn't be read/written).
+    cipher: Option<Aes256Gcm>,
 }
 
 impl DiskCache {
@@ -82,6 +99,8 @@ impl DiskCache {
         // install that somehow opens us first still gets it.
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
 
+        let cipher = derive_cipher(&conn, drive_id);
+
         Ok(Arc::new(Self {
             drive_id,
             root,
@@ -90,6 +109,7 @@ impl DiskCache {
             db: Mutex::new(conn),
             stop: Arc::new(AtomicBool::new(false)),
             evict_thread: Mutex::new(None),
+            cipher,
         }))
     }
 
@@ -130,14 +150,39 @@ impl DiskCache {
         let (len, _size) = row?;
         let path = self.path_for(key, block_start, len as u64);
         let mut f = fs::File::open(&path).ok()?;
-        let mut buf = Vec::with_capacity(len as usize);
+        let mut buf = Vec::new();
         f.read_to_end(&mut buf).ok()?;
-        if buf.len() as i64 != len {
+
+        // Decrypt if we have a cipher. Layout: [nonce:12][ciphertext+tag].
+        // A failed decrypt means tampering, wrong key, or pre-encryption
+        // legacy blob — drop it and re-fetch.
+        let plaintext = if let Some(cipher) = &self.cipher {
+            if buf.len() < NONCE_LEN + TAG_LEN {
+                let _ = self.remove_row(key, block_start);
+                let _ = fs::remove_file(&path);
+                return None;
+            }
+            let (nonce_bytes, ct) = buf.split_at(NONCE_LEN);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            match cipher.decrypt(nonce, ct) {
+                Ok(pt) => pt,
+                Err(_) => {
+                    let _ = self.remove_row(key, block_start);
+                    let _ = fs::remove_file(&path);
+                    return None;
+                }
+            }
+        } else {
+            buf
+        };
+
+        if plaintext.len() as i64 != len {
             // Out-of-sync — drop the row so a future hit re-fetches.
             let _ = self.remove_row(key, block_start);
             let _ = fs::remove_file(&path);
             return None;
         }
+        let buf = plaintext;
         // Touch LRU. Separate scope so we don't double-lock.
         {
             let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
@@ -166,12 +211,39 @@ impl DiskCache {
                 return;
             }
         }
+
+        // Encrypt if a cipher is configured. Each block gets its own fresh
+        // random nonce, which is prepended to the ciphertext on disk. GCM's
+        // 128-bit auth tag is appended by `encrypt` — a corrupted cache file
+        // will fail to decrypt and be dropped on read.
+        let (disk_bytes, disk_len) = if let Some(cipher) = &self.cipher {
+            let mut nonce_bytes = [0u8; NONCE_LEN];
+            rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            match cipher.encrypt(nonce, bytes) {
+                Ok(ct) => {
+                    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+                    out.extend_from_slice(&nonce_bytes);
+                    out.extend_from_slice(&ct);
+                    let disk_len = out.len() as u64;
+                    (out, disk_len)
+                }
+                Err(e) => {
+                    tracing::warn!(target: "nanocrew::cache",
+                        drive_id = self.drive_id, "encrypt: {e}");
+                    return;
+                }
+            }
+        } else {
+            (bytes.to_vec(), len)
+        };
+
         // Write to a tmp file and rename so a partial write can't be
         // resurfaced as a bogus cache hit.
         let tmp = path.with_extension("tmp");
         let write_result = (|| -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
-            f.write_all(bytes)?;
+            f.write_all(&disk_bytes)?;
             f.sync_data()?;
             fs::rename(&tmp, &path)?;
             Ok(())
@@ -193,7 +265,7 @@ impl DiskCache {
                 key,
                 block_start as i64,
                 len as i64,
-                len as i64,
+                disk_len as i64,
                 now_secs(),
             ],
         );
@@ -396,6 +468,88 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Derive the per-drive AES-256-GCM key and return a ready-to-use cipher.
+///
+/// The key is `SHA-256(machine_id || salt || "drive-{id}")` where:
+/// - `machine_id` comes from `HKLM\...\MachineGuid` (Windows) — stable across
+///   reboots and NanoCrew reinstalls, changes when the OS image is re-laid.
+/// - `salt` is 32 random bytes generated on first use and stored hex in the
+///   `prefs` table under `cache_key_salt`. This makes each install's cache
+///   files unique even if someone recovers `machine_id` out-of-band.
+/// - The drive-id suffix prevents a stolen drive-A cache file from decrypting
+///   if renamed into drive-B's folder.
+///
+/// Returns `None` and logs on failure — callers treat that as "encryption
+/// disabled" rather than failing the mount outright.
+fn derive_cipher(conn: &Connection, drive_id: i64) -> Option<Aes256Gcm> {
+    let salt = match load_or_create_salt(conn) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(target: "nanocrew::cache",
+                drive_id, "cache encryption disabled: could not read/write cache_key_salt");
+            return None;
+        }
+    };
+
+    let machine = crate::file_lock::machine_id();
+    let mut h = Sha256::new();
+    h.update(machine.as_bytes());
+    h.update(&salt);
+    h.update(format!("drive-{drive_id}").as_bytes());
+    let digest = h.finalize();
+
+    // `Aes256Gcm::new_from_slice` requires exactly 32 bytes, which SHA-256 is.
+    Aes256Gcm::new_from_slice(&digest).ok()
+}
+
+/// Fetch `cache_key_salt` from `prefs`; generate + persist one if it's absent.
+/// Returns the raw 32 bytes.
+fn load_or_create_salt(conn: &Connection) -> Option<Vec<u8>> {
+    if let Ok(hex) = conn.query_row(
+        "SELECT value FROM prefs WHERE key = 'cache_key_salt'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        if let Some(bytes) = hex_decode(&hex) {
+            if bytes.len() == 32 {
+                return Some(bytes);
+            }
+        }
+    }
+    let mut salt = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut salt);
+    let hex = hex_encode(&salt);
+    conn.execute(
+        "INSERT INTO prefs (key, value) VALUES ('cache_key_salt', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![hex],
+    ).ok()?;
+    Some(salt.to_vec())
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = nibble(b[i])?;
+        let lo = nibble(b[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

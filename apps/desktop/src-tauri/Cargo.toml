@@ -70,8 +70,16 @@ windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", 
 # SHA-256 for deriving sentinel-lock object names
 sha2 = "0.10"
 
+# AES-256-GCM for on-disk cache encryption (Phase 3.1). Derived key +
+# random 12-byte nonce per block; 16-byte auth tag detects tampering.
+aes-gcm = "0.10"
+
 # Base64 for encoding DPAPI blobs in the SQLite credentials column.
 base64 = "0.22"
+
+# JWT verification for license key activation (Phase 9). RS256 (public-key
+# verify only — signing happens in our license-server workflow).
+jsonwebtoken = "9"
 
 # Structured logging. Everything under the `nanocrew=` target flows through
 # `tracing`; `tracing-appender` writes rolling daily files to %APPDATA%.

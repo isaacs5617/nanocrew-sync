@@ -339,6 +339,16 @@ impl S3Fs {
             .replace('\\', "/")
     }
 
+    /// Prepend `bucket_prefix` to a VFS-relative key to get the actual S3 key.
+    /// When `bucket_prefix` is empty (root-mounted drive) this is a no-op.
+    fn abs_s3_key(&self, rel_key: &str) -> String {
+        if self.bucket_prefix.is_empty() {
+            rel_key.to_string()
+        } else {
+            format!("{}{}", self.bucket_prefix, rel_key)
+        }
+    }
+
     /// Split a key into `(parent_prefix, basename)`. Parent prefix has no
     /// trailing slash; root returns `("", name)`.
     fn split_key(key: &str) -> (&str, &str) {
@@ -389,9 +399,9 @@ impl S3Fs {
         }
 
         let s3_prefix = if prefix.is_empty() {
-            String::new()
+            self.bucket_prefix.clone()
         } else {
-            format!("{}/", prefix)
+            format!("{}{}/", self.bucket_prefix, prefix)
         };
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -585,7 +595,7 @@ impl S3Fs {
         }
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_s = key.to_string();
+        let key_s = self.abs_s3_key(key);
         let limiter = self.download_limiter.clone();
         self.rt.block_on(async move {
             limiter.acquire(len).await;
@@ -711,7 +721,7 @@ impl S3Fs {
         }
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_s = key.to_string();
+        let key_s = self.abs_s3_key(key);
         let resp = self.rt.block_on(async move {
             client
                 .create_multipart_upload()
@@ -777,7 +787,7 @@ impl S3Fs {
             let upload_id = state.upload_id.clone().unwrap();
             let client = self.client.clone();
             let bucket = self.bucket.clone();
-            let key_s = key.to_string();
+            let key_s = self.abs_s3_key(key);
             let temp_path = state.temp_path.clone();
             let completed_parts = state.completed_parts.clone();
             let upload_err = state.upload_err.clone();
@@ -923,7 +933,7 @@ impl S3Fs {
                 let upload_id = state.upload_id.clone().unwrap();
                 let client = self.client.clone();
                 let bucket = self.bucket.clone();
-                let key_s = key.to_string();
+                let key_s = self.abs_s3_key(key);
                 self.rt
                     .block_on(async move {
                         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
@@ -986,7 +996,7 @@ impl S3Fs {
         let bytes = std::fs::read(temp_path).map_err(|e| format!("read temp: {e}"))?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_s = key.to_string();
+        let key_s = self.abs_s3_key(key);
         let limiter = self.upload_limiter.clone();
         let size = bytes.len() as u64;
         self.rt
@@ -1009,7 +1019,7 @@ impl S3Fs {
     fn abort_multipart(&self, key: &str, upload_id: &str) {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_s = key.to_string();
+        let key_s = self.abs_s3_key(key);
         let uid = upload_id.to_string();
         let _ = self.rt.block_on(async move {
             client
@@ -1322,7 +1332,7 @@ impl FileSystemContext for S3Fs {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
             let mid = self.machine_id.clone();
-            let key = real_key.clone();
+            let key = self.abs_s3_key(&real_key);
             let state = self.rt.block_on(async move {
                 match file_lock::check(&client, &bucket, &key, &mid).await {
                     Ok(st) => Ok(st),
@@ -1356,7 +1366,7 @@ impl FileSystemContext for S3Fs {
             let bucket = self.bucket.clone();
             let mid = self.machine_id.clone();
             let owner = self.owner.clone();
-            let key = real_key.clone();
+            let key = self.abs_s3_key(&real_key);
             let _ = self.rt.block_on(async move {
                 file_lock::acquire(&client, &bucket, &key, &mid, &owner).await
             });
@@ -1440,7 +1450,7 @@ impl FileSystemContext for S3Fs {
                     .remove(&key.to_ascii_lowercase());
                 let client = self.client.clone();
                 let bucket = self.bucket.clone();
-                let k = key.clone();
+                let k = self.abs_s3_key(key);
                 let _ = self
                     .rt
                     .block_on(async move { file_lock::release(&client, &bucket, &k).await });
@@ -1514,7 +1524,7 @@ impl FileSystemContext for S3Fs {
             };
             let client = self.client.clone();
             let bucket = self.bucket.clone();
-            let k = marker_key.clone();
+            let k = self.abs_s3_key(&marker_key);
             self.rt
                 .block_on(async move {
                     client
@@ -1567,7 +1577,7 @@ impl FileSystemContext for S3Fs {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
             let mid = self.machine_id.clone();
-            let k = key.clone();
+            let k = self.abs_s3_key(&key);
             if let Ok(file_lock::LockState::Foreign(s)) =
                 self.rt.block_on(async move { file_lock::check(&client, &bucket, &k, &mid).await })
             {
@@ -1590,7 +1600,7 @@ impl FileSystemContext for S3Fs {
             let bucket = self.bucket.clone();
             let mid = self.machine_id.clone();
             let owner = self.owner.clone();
-            let k = key.clone();
+            let k = self.abs_s3_key(&key);
             let _ = self.rt.block_on(async move {
                 file_lock::acquire(&client, &bucket, &k, &mid, &owner).await
             });
@@ -1644,11 +1654,12 @@ impl FileSystemContext for S3Fs {
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
                     let marker_key = marker.clone();
+                    let abs_marker = self.abs_s3_key(&marker);
                     let _ = self.rt.block_on(async move {
                         client
                             .delete_object()
                             .bucket(&bucket)
-                            .key(&marker)
+                            .key(&abs_marker)
                             .send()
                             .await
                     });
@@ -1691,7 +1702,7 @@ impl FileSystemContext for S3Fs {
                 if flags & CLEANUP_DELETE != 0 || pending_delete.load(Ordering::Relaxed) {
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
-                    let k = key.clone();
+                    let k = self.abs_s3_key(key);
                     let _ = self.rt.block_on(async move {
                         client.delete_object().bucket(&bucket).key(&k).send().await
                     });
@@ -1992,13 +2003,15 @@ impl FileSystemContext for S3Fs {
         }
         let client = self.client.clone();
         let bucket = self.bucket.clone();
+        let old_k_abs = self.abs_s3_key(&old_key);
+        let new_k_abs = self.abs_s3_key(&new_key);
         // `x-amz-copy-source` must be URL-encoded per S3 spec. `/` is a path
         // separator and must stay un-encoded; other special chars get
         // percent-encoded. Wasabi rejects raw spaces, `+`, `:` etc.
-        let copy_src = format!("{}/{}", bucket, percent_encode_key(&old_key));
+        let copy_src = format!("{}/{}", bucket, percent_encode_key(&old_k_abs));
         let copy_src_c = copy_src.clone();
-        let old_k = old_key.clone();
-        let new_k = new_key.clone();
+        let old_k = old_k_abs;
+        let new_k = new_k_abs;
         self.rt
             .block_on(async move {
                 client

@@ -1928,10 +1928,18 @@ impl FileSystemContext for S3Fs {
         // Windows calls this before a copy to pre-size the file. We record it
         // so the progress bar has a meaningful "total" without actually
         // reserving S3 storage.
-        if let OpenFile::File { meta, .. } = context.as_ref() {
-            let mut m = meta.lock().unwrap_or_else(|p| p.into_inner());
-            m.size = new_size;
-            fill_file_info(file_info, &m);
+        // Always fill file_info — returning Ok() with an uninitialised buffer
+        // lets WinFsp see a garbage AllocationSize that can exceed our reported
+        // TotalSize (1 TiB), which causes STATUS_FILE_TOO_LARGE.
+        match context.as_ref() {
+            OpenFile::File { meta, .. } => {
+                let mut m = meta.lock().unwrap_or_else(|p| p.into_inner());
+                m.size = new_size;
+                fill_file_info(file_info, &m);
+            }
+            OpenFile::Dir { .. } => {
+                fill_file_info(file_info, &Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() });
+            }
         }
         Ok(())
     }
@@ -2009,38 +2017,101 @@ impl FileSystemContext for S3Fs {
         let bucket = self.bucket.clone();
         let old_k_abs = self.abs_s3_key(&old_key);
         let new_k_abs = self.abs_s3_key(&new_key);
-        // `x-amz-copy-source` must be URL-encoded per S3 spec. `/` is a path
-        // separator and must stay un-encoded; other special chars get
-        // percent-encoded. Wasabi rejects raw spaces, `+`, `:` etc.
-        let copy_src = format!("{}/{}", bucket, percent_encode_key(&old_k_abs));
-        let copy_src_c = copy_src.clone();
-        let old_k = old_k_abs;
-        let new_k = new_k_abs;
-        self.rt
-            .block_on(async move {
-                client
-                    .copy_object()
-                    .bucket(&bucket)
-                    .key(&new_k)
-                    .copy_source(&copy_src_c)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        let svc = e.as_service_error().map(|s| format!("{s:?}"));
-                        format!("copy_object: {e:?} svc={svc:?}")
-                    })?;
-                client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(&old_k)
-                    .send()
-                    .await
-                    .map_err(|e| format!("delete_object: {e:?}"))
-            })
-            .map_err(|e| {
-                eprintln!("[winfsp] rename failed src={old_key} dst={new_key} copy_src={copy_src}: {e}");
-                nt(STATUS_INVALID_PARAMETER)
-            })?;
+
+        let is_dir = matches!(context.as_ref(), OpenFile::Dir { .. });
+        if is_dir {
+            // Directory rename: list every object under the old S3 prefix,
+            // copy each to the new prefix, then delete the originals.
+            // S3 has no native rename, and a directory is just a shared key
+            // prefix — there is no object at the directory key itself.
+            let old_prefix = format!("{}/", old_k_abs);
+            let new_prefix_base = new_k_abs.clone();
+            let old_prefix_base = old_k_abs.clone();
+            self.rt
+                .block_on(async move {
+                    // Collect all keys under old prefix.
+                    let mut keys: Vec<String> = Vec::new();
+                    let mut cont: Option<String> = None;
+                    loop {
+                        let mut req = client
+                            .list_objects_v2()
+                            .bucket(&bucket)
+                            .prefix(&old_prefix);
+                        if let Some(c) = cont.as_ref() {
+                            req = req.continuation_token(c);
+                        }
+                        let resp = req.send().await
+                            .map_err(|e| format!("list_objects_v2: {e}"))?;
+                        for obj in resp.contents() {
+                            if let Some(k) = obj.key() {
+                                keys.push(k.to_string());
+                            }
+                        }
+                        match resp.next_continuation_token() {
+                            Some(t) => cont = Some(t.to_string()),
+                            None => break,
+                        }
+                    }
+                    // Copy each key to the new prefix, then delete the old.
+                    for old_obj_key in &keys {
+                        let suffix = &old_obj_key[old_prefix_base.len()..]; // "/name" or "/.keep"
+                        let new_obj_key = format!("{}{}", new_prefix_base, suffix);
+                        let copy_src = format!("{}/{}", bucket, percent_encode_key(old_obj_key));
+                        client
+                            .copy_object()
+                            .bucket(&bucket)
+                            .key(&new_obj_key)
+                            .copy_source(&copy_src)
+                            .send()
+                            .await
+                            .map_err(|e| format!("copy_object {old_obj_key}: {e:?}"))?;
+                        client
+                            .delete_object()
+                            .bucket(&bucket)
+                            .key(old_obj_key)
+                            .send()
+                            .await
+                            .map_err(|e| format!("delete_object {old_obj_key}: {e:?}"))?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .map_err(|e| {
+                    eprintln!("[winfsp] dir rename failed src={old_key} dst={new_key}: {e}");
+                    nt(STATUS_INVALID_PARAMETER)
+                })?;
+        } else {
+            // File rename: single copy_object + delete_object.
+            // `x-amz-copy-source` must be URL-encoded per S3 spec. `/` is a path
+            // separator and must stay un-encoded; other special chars get
+            // percent-encoded. Wasabi rejects raw spaces, `+`, `:` etc.
+            let copy_src = format!("{}/{}", bucket, percent_encode_key(&old_k_abs));
+            let copy_src_c = copy_src.clone();
+            self.rt
+                .block_on(async move {
+                    client
+                        .copy_object()
+                        .bucket(&bucket)
+                        .key(&new_k_abs)
+                        .copy_source(&copy_src_c)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            let svc = e.as_service_error().map(|s| format!("{s:?}"));
+                            format!("copy_object: {e:?} svc={svc:?}")
+                        })?;
+                    client
+                        .delete_object()
+                        .bucket(&bucket)
+                        .key(&old_k_abs)
+                        .send()
+                        .await
+                        .map_err(|e| format!("delete_object: {e:?}"))
+                })
+                .map_err(|e| {
+                    eprintln!("[winfsp] rename failed src={old_key} dst={new_key}: {e}");
+                    nt(STATUS_INVALID_PARAMETER)
+                })?;
+        }
         self.invalidate_parent(&old_key);
         self.invalidate_parent(&new_key);
         self.invalidate_meta(&old_key);

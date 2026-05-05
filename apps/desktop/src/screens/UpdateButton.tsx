@@ -1,11 +1,15 @@
 import React from 'react';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { invoke } from '@tauri-apps/api/core';
 import {
   getTokens, NC_FONT_MONO,
   NCBtn,
   type Theme,
 } from '@nanocrew/ui';
+import { useAuth } from '../context/auth.js';
+
+const RELEASES_URL = 'https://github.com/isaacs5617/nanocrew-sync/releases/latest';
 
 type UpdateState =
   | { kind: 'idle' }
@@ -25,6 +29,7 @@ function formatBytes(b: number) {
 
 export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
   const t = getTokens(theme);
+  const { token } = useAuth();
   const [state, setState] = React.useState<UpdateState>({ kind: 'idle' });
 
   const check_ = React.useCallback(async () => {
@@ -35,11 +40,10 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
         setState({ kind: 'none' });
         return;
       }
-      setState({ kind: 'available', version: update.version, notes: update.body });
 
-      // Begin download + install immediately — user already clicked "check"
       let downloaded = 0;
       let total = 0;
+      setState({ kind: 'available', version: update.version, notes: update.body });
       await update.downloadAndInstall(ev => {
         switch (ev.event) {
           case 'Started':
@@ -56,20 +60,22 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
         }
       });
 
-      // Installer finished — on Windows NSIS 'passive' mode, it has already
-      // launched the installer in the background. Relaunch the app to pick up
-      // the new binary once the installer completes.
+      // On Windows NSIS passive mode the installer has been launched — exit so
+      // it can replace the binary, then the installer restarts the app.
       await relaunch();
     } catch (e: any) {
       setState({ kind: 'error', message: e?.message ?? String(e) });
     }
   }, []);
 
+  const openReleases = () =>
+    invoke('open_path', { token, path: RELEASES_URL }).catch(() => {});
+
   const label = (() => {
     switch (state.kind) {
       case 'idle':        return 'Check for updates';
       case 'checking':    return 'Checking…';
-      case 'none':        return 'Up to date';
+      case 'none':        return 'Check again';
       case 'available':   return `Updating to ${state.version}…`;
       case 'downloading': {
         const pct = state.total > 0 ? Math.round((state.downloaded / state.total) * 100) : 0;
@@ -80,28 +86,61 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
     }
   })();
 
-  const busy = state.kind === 'checking' || state.kind === 'available' || state.kind === 'downloading' || state.kind === 'ready';
+  const busy = state.kind === 'checking' || state.kind === 'available'
+    || state.kind === 'downloading' || state.kind === 'ready';
+
+  const subtitle = (() => {
+    switch (state.kind) {
+      case 'idle':
+        return 'Check if a newer signed build is available.';
+      case 'checking':
+        return 'Contacting update server…';
+      case 'none':
+        return <span style={{ color: t.lime }}>You're on the latest version.</span>;
+      case 'available':
+        return (
+          <span>
+            New version <strong style={{ color: t.textHi }}>{state.version}</strong> found — downloading…
+          </span>
+        );
+      case 'downloading':
+        return (
+          <span style={{ fontFamily: NC_FONT_MONO }}>
+            {formatBytes(state.downloaded)}
+            {state.total > 0 ? ` / ${formatBytes(state.total)}` : ''}
+          </span>
+        );
+      case 'ready':
+        return 'Update installed — relaunching.';
+      case 'error':
+        return <span style={{ color: t.danger }}>{state.message}</span>;
+    }
+  })();
+
+  // Show the manual-download escape hatch once the auto-updater has
+  // confirmed "up to date" or failed — gives users a way out.
+  const showFallback = state.kind === 'none' || state.kind === 'error';
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 14 }}>
-      <div style={{ flex: 1 }}>
-        <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Application updates</div>
-        <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>
-          {state.kind === 'none'     && <span style={{ color: t.lime }}>You're on the latest version.</span>}
-          {state.kind === 'error'    && <span style={{ color: t.danger }}>{state.message}</span>}
-          {state.kind === 'downloading' && (
-            <span style={{ fontFamily: NC_FONT_MONO }}>
-              {formatBytes(state.downloaded)}
-              {state.total > 0 ? ` / ${formatBytes(state.total)}` : ''}
-            </span>
-          )}
-          {state.kind === 'idle' && 'Check if a newer signed build is available.'}
-          {state.kind === 'checking' && 'Contacting update server…'}
-          {state.kind === 'available' && `New version ${state.version} found, installing…`}
-          {state.kind === 'ready' && 'Update installed — relaunching.'}
+    <div style={{ marginTop: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Application updates</div>
+          <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>{subtitle}</div>
         </div>
+        <NCBtn theme={theme} small ghost onClick={check_} disabled={busy}>{label}</NCBtn>
       </div>
-      <NCBtn theme={theme} small ghost onClick={check_} disabled={busy}>{label}</NCBtn>
+      {showFallback && (
+        <div style={{ marginTop: 6, fontSize: 11, color: t.textLo }}>
+          Update not working?{' '}
+          <span
+            onClick={openReleases}
+            style={{ color: t.lime, cursor: 'pointer', textDecoration: 'underline' }}
+          >
+            Download manually from GitHub
+          </span>
+        </div>
+      )}
     </div>
   );
 };

@@ -1539,6 +1539,9 @@ impl FileSystemContext for S3Fs {
                 .map_err(|_| nt(STATUS_ACCESS_DENIED))?;
 
             self.invalidate_parent(&key);
+            // Clear any negative meta-cache entry left by Explorer's pre-create
+            // existence check, so the immediate post-create lookup succeeds.
+            self.invalidate_meta(&key);
 
             let meta = Meta {
                 is_dir: true,
@@ -1629,6 +1632,7 @@ impl FileSystemContext for S3Fs {
         };
         fill_file_info(file_info.as_mut(), &meta);
         self.invalidate_parent(&key);
+        self.invalidate_meta(&key);
         Ok(Box::new(OpenFile::File {
             key,
             meta: Mutex::new(meta),

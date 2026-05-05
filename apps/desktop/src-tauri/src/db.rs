@@ -94,5 +94,10 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
         "ALTER TABLE drives ADD COLUMN secret_key TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Migration: add bucket_prefix for subdirectory-volume support.
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN bucket_prefix TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     Ok(conn)
 }

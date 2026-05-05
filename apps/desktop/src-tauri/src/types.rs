@@ -17,6 +17,9 @@ pub struct DriveInfo {
     pub provider: String,
     pub endpoint: String,
     pub bucket: String,
+    /// Optional S3 prefix to restrict this volume to a bucket subdirectory.
+    /// Empty string means root of bucket.
+    pub bucket_prefix: String,
     pub region: String,
     pub letter: String,
     pub access_key_id: String,
@@ -36,6 +39,9 @@ pub struct AddDriveInput {
     pub provider: String,
     pub endpoint: String,
     pub bucket: String,
+    /// Optional subdirectory prefix within the bucket (no leading slash,
+    /// trailing slash added automatically if non-empty). Empty = root.
+    pub bucket_prefix: String,
     pub region: String,
     pub letter: String,
     pub access_key_id: String,

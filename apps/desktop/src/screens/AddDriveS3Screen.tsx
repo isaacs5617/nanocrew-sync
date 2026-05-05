@@ -54,6 +54,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
   const [customEndpoint, setCustomEndpoint] = React.useState('');
   const [customRegion, setCustomRegion] = React.useState(preset?.fixedRegion ?? '');
   const [bucket, setBucket] = React.useState('');
+  const [bucketPrefix, setBucketPrefix] = React.useState('');
   const [accessKeyId, setAccessKeyId] = React.useState('');
   const [secretKey, setSecretKey] = React.useState('');
   const [showSecret, setShowSecret] = React.useState(false);
@@ -205,6 +206,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
           provider: preset.id,
           endpoint: resolved.endpoint,
           bucket: bucket.trim(),
+          bucket_prefix: bucketPrefix.trim(),
           region: resolved.region,
           letter,
           access_key_id: accessKeyId.trim(),
@@ -310,7 +312,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
               </Field>
             )}
 
-            <Field theme={theme} label="Bucket" last>
+            <Field theme={theme} label="Bucket">
               <div style={{ display: 'flex', gap: 8 }}>
                 {availableBuckets ? (
                   <div style={{ position: 'relative', flex: 1 }}>
@@ -333,6 +335,18 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                 <NCBtn theme={theme} small ghost disabled={browsing} onClick={handleBrowse}>
                   {browsing ? '…' : availableBuckets ? 'Refresh' : 'Browse'}
                 </NCBtn>
+              </div>
+            </Field>
+            <Field theme={theme} label="Folder prefix (optional — mount a subfolder as the drive root)" last>
+              <NCInput
+                theme={theme} mono
+                value={bucketPrefix}
+                onChange={setBucketPrefix}
+                placeholder="e.g. users/alice  or  team/shared/projects"
+                prefix={<I.folder size={13} />}
+              />
+              <div style={{ marginTop: 6, fontSize: 11, color: t.textMd }}>
+                Leave blank to mount the whole bucket. Enter a path to restrict this drive to a specific subfolder — useful for personal volumes or shared sub-buckets.
               </div>
             </Field>
           </NCCard>

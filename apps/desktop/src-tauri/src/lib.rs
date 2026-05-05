@@ -172,6 +172,8 @@ pub fn run() {
             commands::drives::get_available_letters,
             commands::drives::list_drive_objects,
             commands::drives::list_buckets,
+            commands::drives::create_folder,
+            commands::drives::rename_object,
             commands::drives::open_path,
             commands::drives::check_winfsp,
             commands::system::get_autostart,
@@ -219,11 +221,12 @@ pub fn run() {
 async fn auto_mount_drives(app: tauri::AppHandle) {
     // ── Pull drive rows from DB ───────────────────────────────────────────────
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, String, String, String, String, bool, i64)> = {
+    let rows: Vec<(i64, String, String, String, String, String, String, bool, i64, String)> = {
         let state: tauri::State<AppState> = app.state();
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match db.prepare(
-            "SELECT id, endpoint, bucket, region, letter, access_key_id, provider, readonly, cache_size_gb
+            "SELECT id, endpoint, bucket, region, letter, access_key_id, provider, readonly,
+                    cache_size_gb, COALESCE(bucket_prefix,'')
              FROM drives WHERE auto_mount = 1",
         ) {
             Ok(s) => s,
@@ -245,6 +248,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
                     r.get::<_, String>(6)?,
                     r.get::<_, bool>(7)?,
                     r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
                 ))
             })
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -278,7 +282,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         }
     };
 
-    for (id, endpoint, bucket, region, letter, aki, provider, readonly, cache_size_gb) in rows {
+    for (id, endpoint, bucket, region, letter, aki, provider, readonly, cache_size_gb, bucket_prefix) in rows {
         let state: tauri::State<AppState> = app.state();
 
         // Skip if already mounted (e.g. user mounted manually during setup window)
@@ -317,6 +321,7 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             provider,
             endpoint,
             bucket,
+            bucket_prefix,
             region,
             access_key_id: aki,
             secret_access_key: secret,

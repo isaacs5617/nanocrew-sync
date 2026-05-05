@@ -78,6 +78,10 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   const [pinned, setPinned] = React.useState<Set<string>>(new Set());
   const [locks, setLocks] = React.useState<Map<string, FileLockEntry>>(new Map());
   const [menu, setMenu] = React.useState<{ x: number; y: number; entry: S3Entry } | null>(null);
+  const [newFolderName, setNewFolderName] = React.useState('');
+  const [showNewFolder, setShowNewFolder] = React.useState(false);
+  const [creatingFolder, setCreatingFolder] = React.useState(false);
+  const [renaming, setRenaming] = React.useState<{ entry: S3Entry; value: string } | null>(null);
 
   // Load mounted drives
   React.useEffect(() => {
@@ -177,6 +181,58 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
     setMenu(null);
   };
 
+  const createFolder = async () => {
+    if (!selectedDrive || !newFolderName.trim()) return;
+    setCreatingFolder(true);
+    setError(null);
+    try {
+      await invoke('create_folder', {
+        token, driveId: selectedDrive.id, prefix, name: newFolderName.trim(),
+      });
+      setNewFolderName('');
+      setShowNewFolder(false);
+      setRefreshKey(k => k + 1);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreatingFolder(false);
+    }
+  };
+
+  const doRename = async () => {
+    if (!selectedDrive || !renaming) return;
+    const { entry, value } = renaming;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === entry.name) { setRenaming(null); return; }
+    if (trimmed.includes('/') || trimmed.includes('\\')) {
+      setError('Name must not contain slashes.'); setRenaming(null); return;
+    }
+    setError(null);
+    try {
+      let oldKey = entry.key;
+      let newKey: string;
+      if (entry.is_dir) {
+        // key is the full prefix like "photos/", we swap last segment
+        const parts = oldKey.replace(/\/$/, '').split('/');
+        parts[parts.length - 1] = trimmed;
+        newKey = parts.join('/') + '/';
+      } else {
+        const parts = oldKey.split('/');
+        parts[parts.length - 1] = trimmed;
+        newKey = parts.join('/');
+      }
+      await invoke('rename_object', {
+        token, driveId: selectedDrive.id, oldKey, newKey, isDir: entry.is_dir,
+      });
+      setRefreshKey(k => k + 1);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRenaming(null);
+      setMenu(null);
+    }
+  };
+
   const togglePin = async (entry: S3Entry) => {
     if (!selectedDrive) return;
     const cmd = pinned.has(entry.key) ? 'unpin_file' : 'pin_file';
@@ -236,6 +292,12 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         }
         subtitle={subtitle}
         actions={<>
+          {selectedDrive && (
+            <NCBtn
+              theme={theme} small ghost iconLeft={<I.folder size={13} />}
+              onClick={() => { setShowNewFolder(true); setNewFolderName(''); }}
+            >New Folder</NCBtn>
+          )}
           <NCBtn
             theme={theme} small iconLeft={<I.refresh size={13} />}
             onClick={() => setRefreshKey(k => k + 1)}
@@ -299,6 +361,36 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
             ))}
           </div>
         </div>
+
+        {/* New folder inline form */}
+        {showNewFolder && selectedDrive && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 20px', borderBottom: `1px solid ${t.border}`,
+            background: t.surface1, flexShrink: 0,
+          }}>
+            <I.folder size={14} color={t.lime} />
+            <input
+              autoFocus
+              value={newFolderName}
+              onChange={e => setNewFolderName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') createFolder();
+                if (e.key === 'Escape') setShowNewFolder(false);
+              }}
+              placeholder="New folder name"
+              style={{
+                flex: 1, background: t.bg, border: `1px solid ${t.lime}`,
+                color: t.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
+                borderRadius: 3, padding: '5px 10px', outline: 'none',
+              }}
+            />
+            <NCBtn theme={theme} small primary disabled={creatingFolder || !newFolderName.trim()} onClick={createFolder}>
+              {creatingFolder ? 'Creating…' : 'Create'}
+            </NCBtn>
+            <NCBtn theme={theme} small ghost onClick={() => setShowNewFolder(false)}>Cancel</NCBtn>
+          </div>
+        )}
 
         {/* No drives */}
         {drives.length === 0 && !loading && (
@@ -367,7 +459,6 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                   key={entry.key + i}
                   onDoubleClick={() => navigateInto(entry)}
                   onContextMenu={e => {
-                    if (entry.is_dir) return;
                     e.preventDefault();
                     setMenu({ x: e.clientX, y: e.clientY, entry });
                   }}
@@ -391,7 +482,27 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                     fontFamily: NC_FONT_UI,
                     display: 'flex', alignItems: 'center', gap: 6,
                   }}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
+                    {renaming?.entry.key === entry.key ? (
+                      <input
+                        autoFocus
+                        value={renaming.value}
+                        onChange={e => setRenaming(r => r ? { ...r, value: e.target.value } : r)}
+                        onBlur={doRename}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') doRename();
+                          if (e.key === 'Escape') setRenaming(null);
+                        }}
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                          background: t.surface2, border: `1px solid ${t.lime}`,
+                          color: t.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
+                          borderRadius: 3, padding: '2px 6px', outline: 'none',
+                          width: '100%',
+                        }}
+                      />
+                    ) : (
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
+                    )}
                     {isPinned && (
                       <span
                         title="Pinned — kept on device"
@@ -459,7 +570,10 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           }}
         >
           <div
-            onClick={() => togglePin(menu.entry)}
+            onClick={() => {
+              setRenaming({ entry: menu.entry, value: menu.entry.name });
+              setMenu(null);
+            }}
             style={{
               padding: '7px 12px', cursor: 'pointer',
               color: t.textHi, borderRadius: 2,
@@ -468,13 +582,28 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
             onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
             onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
           >
-            <span style={{ color: t.lime, width: 10 }}>
-              {pinned.has(menu.entry.key) ? '●' : '○'}
-            </span>
-            <span>
-              {pinned.has(menu.entry.key) ? 'Unpin from device' : 'Keep on device'}
-            </span>
+            <I.pencil size={12} color={t.textMd} />
+            <span>Rename</span>
           </div>
+          {!menu.entry.is_dir && (
+            <div
+              onClick={() => togglePin(menu.entry)}
+              style={{
+                padding: '7px 12px', cursor: 'pointer',
+                color: t.textHi, borderRadius: 2,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+            >
+              <span style={{ color: t.lime, width: 10 }}>
+                {pinned.has(menu.entry.key) ? '●' : '○'}
+              </span>
+              <span>
+                {pinned.has(menu.entry.key) ? 'Unpin from device' : 'Keep on device'}
+              </span>
+            </div>
+          )}
           {locks.has(menu.entry.key) && (
             <div
               onClick={() => breakLock(menu.entry)}

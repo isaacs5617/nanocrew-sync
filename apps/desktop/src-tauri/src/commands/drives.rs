@@ -33,12 +33,13 @@ pub async fn list_drives(
 
     // Collect rows first, then drop the DB lock before acquiring mounts lock
     // to avoid AB/BA deadlock (mount_drive acquires mounts then db).
-    let rows: Vec<(i64, String, String, String, String, String, String, String, i64, bool, bool, i64)> = {
+    let rows: Vec<(i64, String, String, String, String, String, String, String, i64, bool, bool, i64, String)> = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = db
             .prepare(
                 "SELECT id, name, provider, endpoint, bucket, region, letter,
-                        access_key_id, cache_size_gb, auto_mount, readonly, created_at
+                        access_key_id, cache_size_gb, auto_mount, readonly, created_at,
+                        COALESCE(bucket_prefix, '')
                  FROM drives ORDER BY created_at",
             )
             .map_err(|e| AppError::Db(e).to_string())?;
@@ -58,6 +59,7 @@ pub async fn list_drives(
                     r.get::<_, bool>(9)?,
                     r.get::<_, bool>(10)?,
                     r.get::<_, i64>(11)?,
+                    r.get::<_, String>(12)?,
                 ))
             })
             .map_err(|e| AppError::Db(e).to_string())?
@@ -69,9 +71,9 @@ pub async fn list_drives(
     let mount_map = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
     let drives = rows
         .into_iter()
-        .map(|(id, name, provider, endpoint, bucket, region, letter, aki, csz, am, ro, ca)| {
+        .map(|(id, name, provider, endpoint, bucket, region, letter, aki, csz, am, ro, ca, bp)| {
             let status = if mount_map.contains_key(&id) { "mounted" } else { "offline" }.to_string();
-            DriveInfo { id, name, provider, endpoint, bucket, region, letter, access_key_id: aki, cache_size_gb: csz, auto_mount: am, readonly: ro, created_at: ca, status }
+            DriveInfo { id, name, provider, endpoint, bucket, bucket_prefix: bp, region, letter, access_key_id: aki, cache_size_gb: csz, auto_mount: am, readonly: ro, created_at: ca, status }
         })
         .collect();
 
@@ -90,6 +92,8 @@ pub async fn add_drive(
     let actor = actor_for(&state, &token);
 
     let letter = input.letter.to_uppercase();
+    // Normalise prefix: no leading slash, always trailing slash if non-empty.
+    let bucket_prefix = normalise_prefix(&input.bucket_prefix);
 
     // Insert the row with an empty secret placeholder, then let credentials::store
     // write the DPAPI-wrapped blob. Two-step so the secret is never plaintext
@@ -98,11 +102,11 @@ pub async fn add_drive(
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.execute(
             "INSERT INTO drives
-             (name, provider, endpoint, bucket, region, letter,
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
               access_key_id, secret_key, cache_size_gb, auto_mount, readonly)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,?9,?10)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,?9,?10,?11)",
             rusqlite::params![
-                input.name, input.provider, input.endpoint, input.bucket,
+                input.name, input.provider, input.endpoint, input.bucket, bucket_prefix,
                 input.region, letter, input.access_key_id,
                 input.cache_size_gb, input.auto_mount, input.readonly,
             ],
@@ -137,6 +141,7 @@ pub async fn add_drive(
         provider: input.provider,
         endpoint: input.endpoint,
         bucket: input.bucket,
+        bucket_prefix,
         region: input.region,
         letter,
         access_key_id: input.access_key_id,
@@ -217,10 +222,11 @@ pub async fn mount_drive(
         return Err(AppError::AlreadyMounted.to_string());
     }
 
-    let (_name, provider, endpoint, bucket, region, letter, aki, readonly, cache_size_gb) = {
+    let (_name, provider, endpoint, bucket, bucket_prefix, region, letter, aki, readonly, cache_size_gb) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
-            "SELECT name,provider,endpoint,bucket,region,letter,access_key_id,readonly,cache_size_gb
+            "SELECT name,provider,endpoint,bucket,COALESCE(bucket_prefix,''),region,letter,
+                    access_key_id,readonly,cache_size_gb
              FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
@@ -231,8 +237,9 @@ pub async fn mount_drive(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
-                r.get::<_, bool>(7)?,
-                r.get::<_, i64>(8)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
+                r.get::<_, i64>(9)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
@@ -272,7 +279,7 @@ pub async fn mount_drive(
         .ok_or_else(|| "LOCALAPPDATA not set — cannot resolve cache root".to_string())?;
 
     let mount_config = MountConfig {
-        drive_id, letter, provider, endpoint, bucket, region,
+        drive_id, letter, provider, endpoint, bucket, bucket_prefix, region,
         access_key_id: aki, secret_access_key: secret, readonly,
         owner,
         upload_rate_bps,
@@ -430,20 +437,26 @@ pub async fn list_drive_objects(
 ) -> Result<Vec<S3Entry>, String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
 
-    let (endpoint, bucket, region, aki) = {
+    let (endpoint, bucket, bucket_prefix_raw, region, aki) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
-            "SELECT endpoint, bucket, region, access_key_id FROM drives WHERE id = ?1",
+            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id
+             FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
     };
+    // Build the absolute S3 prefix by prepending bucket_prefix to the
+    // caller-supplied directory prefix.
+    let volume_prefix = normalise_prefix(&bucket_prefix_raw);
+    let abs_prefix = format!("{volume_prefix}{prefix}");
 
     let secret = credentials::retrieve(&state.db, drive_id).map_err(|e| e.to_string())?;
 
@@ -469,8 +482,8 @@ pub async fn list_drive_objects(
             .list_objects_v2()
             .bucket(&bucket)
             .delimiter("/");
-        if !prefix.is_empty() {
-            req = req.prefix(&prefix);
+        if !abs_prefix.is_empty() {
+            req = req.prefix(&abs_prefix);
         }
         if let Some(ref tok) = continuation {
             req = req.continuation_token(tok);
@@ -478,23 +491,27 @@ pub async fn list_drive_objects(
 
         let resp = req.send().await.map_err(|e| AppError::ConnectionTest(e.to_string()).to_string())?;
 
-        // Common prefixes → directories
+        // Common prefixes → directories. Strip the absolute prefix so keys
+        // returned to the frontend are relative to the volume root.
         for cp in resp.common_prefixes() {
             let Some(p) = cp.prefix() else { continue };
-            let name = p.strip_prefix(&prefix).unwrap_or(p)
+            let rel_key = p.strip_prefix(&volume_prefix).unwrap_or(p);
+            let name = rel_key.strip_prefix(&prefix).unwrap_or(rel_key)
                 .trim_end_matches('/').to_string();
             if name.is_empty() || name.contains('/') { continue; }
-            entries.push(S3Entry { name, key: p.to_string(), is_dir: true, size: 0, modified: 0 });
+            let rel_full = rel_key.to_string();
+            entries.push(S3Entry { name, key: rel_full, is_dir: true, size: 0, modified: 0 });
         }
 
-        // Object keys → files
+        // Object keys → files. Strip volume_prefix from keys returned to frontend.
         for obj in resp.contents() {
             let Some(key) = obj.key() else { continue };
-            let name = key.strip_prefix(&prefix).unwrap_or(key).to_string();
+            let rel_key = key.strip_prefix(&volume_prefix).unwrap_or(key);
+            let name = rel_key.strip_prefix(&prefix).unwrap_or(rel_key).to_string();
             if name.is_empty() || name.contains('/') || name.ends_with('/') { continue; }
             let size = obj.size().unwrap_or(0).max(0);
             let modified = obj.last_modified().map(|d| d.secs()).unwrap_or(0);
-            entries.push(S3Entry { name, key: key.to_string(), is_dir: false, size, modified });
+            entries.push(S3Entry { name, key: rel_key.to_string(), is_dir: false, size, modified });
         }
 
         if resp.is_truncated().unwrap_or(false) {
@@ -582,6 +599,165 @@ pub async fn open_path(
     Ok(())
 }
 
+// ── Folder operations ────────────────────────────────────────────────────────
+
+/// Create a virtual S3 folder by PUT-ing a zero-byte object at `<prefix><name>/`.
+/// `prefix` is the current directory prefix (empty = root), relative to the
+/// drive's `bucket_prefix`.
+#[tauri::command]
+pub async fn create_folder(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    prefix: String,
+    name: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let name = name.trim().to_string();
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err("Folder name must not be empty or contain slashes.".into());
+    }
+
+    let (endpoint, bucket, bucket_prefix_raw, region, aki) = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id
+             FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            )),
+        )
+        .map_err(|_| AppError::DriveNotFound.to_string())?
+    };
+
+    let secret = credentials::retrieve(&state.db, drive_id).map_err(|e| e.to_string())?;
+    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret).await?;
+
+    let volume_prefix = normalise_prefix(&bucket_prefix_raw);
+    let folder_key = format!("{volume_prefix}{prefix}{name}/");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(&folder_key)
+        .content_length(0)
+        .send()
+        .await
+        .map_err(|e| format!("create folder: {e}"))?;
+
+    Ok(())
+}
+
+/// Rename a file or folder in S3 (copy + delete; for folders, bulk copy/delete
+/// of all keys under the prefix).
+/// `old_key` and `new_key` are relative to the drive's bucket_prefix.
+#[tauri::command]
+pub async fn rename_object(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    old_key: String,
+    new_key: String,
+    is_dir: bool,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let (endpoint, bucket, bucket_prefix_raw, region, aki) = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id
+             FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            )),
+        )
+        .map_err(|_| AppError::DriveNotFound.to_string())?
+    };
+
+    let secret = credentials::retrieve(&state.db, drive_id).map_err(|e| e.to_string())?;
+    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret).await?;
+
+    let vp = normalise_prefix(&bucket_prefix_raw);
+
+    if is_dir {
+        // Collect all keys under the old prefix (including the marker object).
+        let src_prefix = format!("{vp}{old_key}");
+        let mut keys_to_move: Vec<String> = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(&bucket).prefix(&src_prefix);
+            if let Some(ref tok) = continuation {
+                req = req.continuation_token(tok);
+            }
+            let resp = req.send().await.map_err(|e| format!("list for rename: {e}"))?;
+            for obj in resp.contents() {
+                if let Some(k) = obj.key() {
+                    keys_to_move.push(k.to_string());
+                }
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                continuation = resp.next_continuation_token().map(str::to_owned);
+            } else {
+                break;
+            }
+        }
+
+        let dest_prefix = format!("{vp}{new_key}");
+        for abs_src in &keys_to_move {
+            let suffix = abs_src.strip_prefix(&src_prefix).unwrap_or("");
+            let abs_dst = format!("{dest_prefix}{suffix}");
+            let copy_src = format!("{}/{}", bucket, abs_src);
+            client
+                .copy_object()
+                .bucket(&bucket)
+                .copy_source(&copy_src)
+                .key(&abs_dst)
+                .send()
+                .await
+                .map_err(|e| format!("copy {abs_src} → {abs_dst}: {e}"))?;
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(abs_src)
+                .send()
+                .await
+                .map_err(|e| format!("delete {abs_src}: {e}"))?;
+        }
+    } else {
+        let abs_src = format!("{vp}{old_key}");
+        let abs_dst = format!("{vp}{new_key}");
+        let copy_src = format!("{}/{}", bucket, abs_src);
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .copy_source(&copy_src)
+            .key(&abs_dst)
+            .send()
+            .await
+            .map_err(|e| format!("copy: {e}"))?;
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&abs_src)
+            .send()
+            .await
+            .map_err(|e| format!("delete: {e}"))?;
+    }
+
+    Ok(())
+}
+
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 fn validate_letter(letter: &str) -> Result<(), String> {
@@ -593,6 +769,42 @@ fn validate_letter(letter: &str) -> Result<(), String> {
         return Err(AppError::InvalidInput("Drive letter must be D: through Z:".into()).to_string());
     }
     Ok(())
+}
+
+/// Normalise a bucket prefix: strip leading slash, ensure trailing slash if
+/// non-empty. `"users/alice"` → `"users/alice/"`, `""` → `""`.
+fn normalise_prefix(raw: &str) -> String {
+    let s = raw.trim().trim_start_matches('/');
+    if s.is_empty() {
+        String::new()
+    } else if s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{s}/")
+    }
+}
+
+/// Build an S3 client from per-drive credentials (shared by listing, folder
+/// ops, and rename — avoids copy-pasting the config block).
+async fn build_s3_client(
+    db: &std::sync::Mutex<rusqlite::Connection>,
+    endpoint: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<aws_sdk_s3::Client, String> {
+    let creds = aws_credential_types::Credentials::new(
+        access_key_id, secret_access_key, None, None, "nanocrew-sync",
+    );
+    let http = http_client::build_from_prefs(db).map_err(|e| e.to_string())?;
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://{}", endpoint))
+        .credentials_provider(creds)
+        .http_client(http)
+        .load()
+        .await;
+    Ok(aws_sdk_s3::Client::new(&config))
 }
 
 /// Returns the set of drive letters currently in use on this Windows machine.

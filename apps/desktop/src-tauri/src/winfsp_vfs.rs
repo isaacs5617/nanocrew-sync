@@ -243,6 +243,9 @@ pub struct S3Fs {
     pub rt: Runtime,
     pub client: Client,
     pub bucket: String,
+    /// Normalised subdirectory prefix (empty = root, otherwise trailing slash).
+    /// All Windows paths are prepended with this before forming S3 keys.
+    pub bucket_prefix: String,
     pub drive_id: i64,
     pub volume_label: String,
 
@@ -291,6 +294,7 @@ impl S3Fs {
         rt: Runtime,
         client: Client,
         bucket: String,
+        bucket_prefix: String,
         drive_id: i64,
         volume_label: String,
         emit: Box<dyn Fn(TransferPayload) + Send + Sync>,
@@ -307,6 +311,7 @@ impl S3Fs {
             rt,
             client,
             bucket,
+            bucket_prefix,
             drive_id,
             volume_label,
             next_xfer: AtomicU64::new(2_000_000),

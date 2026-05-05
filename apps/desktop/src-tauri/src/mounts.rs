@@ -56,6 +56,9 @@ pub struct MountConfig {
     pub provider: String,
     pub endpoint: String,
     pub bucket: String,
+    /// Normalised subdirectory prefix (empty = root; non-empty always has
+    /// trailing slash). Restricts the WinFsp volume to a bucket subdirectory.
+    pub bucket_prefix: String,
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -235,6 +238,7 @@ pub fn spawn_mount(
                 rt,
                 client,
                 config.bucket.clone(),
+                config.bucket_prefix.clone(),
                 config.drive_id,
                 label.clone(),
                 Box::new(move |p: TransferPayload| {

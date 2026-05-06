@@ -17,6 +17,7 @@ interface Drive {
   provider: string;
   endpoint: string;
   bucket: string;
+  bucket_prefix: string;
   region: string;
   letter: string;
   access_key_id: string;
@@ -35,8 +36,9 @@ const DriveMenu: React.FC<{
   anchorRect: DOMRect;
   onRemove: (id: number) => void;
   onOpen: (letter: string) => void;
+  onEditPrefix: (drive: Drive) => void;
   onClose: () => void;
-}> = ({ drive, theme, anchorRect, onRemove, onOpen, onClose }) => {
+}> = ({ drive, theme, anchorRect, onRemove, onOpen, onEditPrefix, onClose }) => {
   const t = getTokens(theme);
   const { t: tr } = useTranslation();
   const ref = React.useRef<HTMLDivElement>(null);
@@ -77,6 +79,8 @@ const DriveMenu: React.FC<{
     }}>
       {drive.status === 'mounted' && item(tr('dashboard.menu.openExplorer'), <I.folder size={13} />, () => onOpen(drive.letter))}
       {drive.status === 'mounted' && <div style={{ height: 1, background: t.border }} />}
+      {drive.status !== 'mounted' && item('Edit prefix', <I.pencil size={13} />, () => onEditPrefix(drive))}
+      {drive.status !== 'mounted' && <div style={{ height: 1, background: t.border }} />}
       {drive.status !== 'mounted'
         ? item(tr('dashboard.menu.remove'), <I.trash size={13} />, () => onRemove(drive.id), true)
         : (
@@ -107,7 +111,8 @@ const DriveRow: React.FC<{
   onMenuClose: () => void;
   onRemove: (id: number) => void;
   onOpen: (letter: string) => void;
-}> = ({ d, theme, last, menuOpen, menuAnchor, onMount, onUnmount, onMenuOpen, onMenuClose, onRemove, onOpen }) => {
+  onEditPrefix: (drive: Drive) => void;
+}> = ({ d, theme, last, menuOpen, menuAnchor, onMount, onUnmount, onMenuOpen, onMenuClose, onRemove, onOpen, onEditPrefix }) => {
   const t = getTokens(theme);
   const { t: tr } = useTranslation();
   const statusMap: Record<string, { label: string; color: string; dot: DriveStatus }> = {
@@ -167,7 +172,7 @@ const DriveRow: React.FC<{
         {menuOpen && menuAnchor && (
           <DriveMenu
             drive={d} theme={theme} anchorRect={menuAnchor}
-            onRemove={onRemove} onOpen={onOpen} onClose={onMenuClose}
+            onRemove={onRemove} onOpen={onOpen} onEditPrefix={onEditPrefix} onClose={onMenuClose}
           />
         )}
       </div>
@@ -190,6 +195,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
   const [loading, setLoading] = React.useState(true);
   const [actionError, setActionError] = React.useState<string | null>(null);
   const [openMenu, setOpenMenu] = React.useState<{ id: number; rect: DOMRect } | null>(null);
+  const [editPrefix, setEditPrefix] = React.useState<{ drive: Drive; value: string } | null>(null);
+  const [savingPrefix, setSavingPrefix] = React.useState(false);
 
   const loadDrives = React.useCallback(async () => {
     try {
@@ -238,6 +245,27 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
   const handleOpenInExplorer = async (letter: string) => {
     try { await invoke('open_path', { token, path: `${letter}\\` }); }
     catch (e) { setActionError(String(e)); }
+  };
+
+  const handleSavePrefix = async () => {
+    if (!editPrefix) return;
+    setSavingPrefix(true);
+    setActionError(null);
+    try {
+      await invoke('set_drive_prefix', {
+        token,
+        driveId: editPrefix.drive.id,
+        bucketPrefix: editPrefix.value,
+      });
+      setDrives(prev => prev.map(d =>
+        d.id === editPrefix.drive.id ? { ...d, bucket_prefix: editPrefix.value } : d
+      ));
+      setEditPrefix(null);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSavingPrefix(false);
+    }
   };
 
   const mounted = drives.filter(d => d.status === 'mounted' || d.status === 'syncing').length;
@@ -349,6 +377,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
                 onMenuClose={() => setOpenMenu(null)}
                 onRemove={handleRemove}
                 onOpen={handleOpenInExplorer}
+                onEditPrefix={drive => setEditPrefix({ drive, value: drive.bucket_prefix })}
               />
             ))}
           </div>
@@ -375,6 +404,48 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
           </div>
         )}
       </div>
+
+      {/* Edit prefix modal */}
+      {editPrefix && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 2000,
+          background: 'rgba(0,0,0,0.55)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: t.surface1, border: `1px solid ${t.border}`,
+            borderRadius: 6, padding: 24, width: 480,
+            boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: t.textHi, marginBottom: 6 }}>
+              Edit bucket prefix — {editPrefix.drive.name}
+            </div>
+            <div style={{ fontSize: 12, color: t.textMd, marginBottom: 16 }}>
+              Path within the bucket (no leading slash). Example: <code style={{ color: t.lime }}>users-municipex/Corrie Smit</code>
+            </div>
+            <input
+              autoFocus
+              value={editPrefix.value}
+              onChange={e => setEditPrefix(p => p ? { ...p, value: e.target.value } : p)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSavePrefix(); if (e.key === 'Escape') setEditPrefix(null); }}
+              placeholder="e.g. users/alice  (leave blank for bucket root)"
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                background: t.surface2, border: `1px solid ${t.border}`,
+                borderRadius: 3, padding: '7px 10px',
+                color: t.textHi, fontSize: 13, outline: 'none',
+                fontFamily: 'monospace', marginBottom: 16,
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <NCBtn theme={theme} ghost small onClick={() => setEditPrefix(null)}>Cancel</NCBtn>
+              <NCBtn theme={theme} primary small disabled={savingPrefix} onClick={handleSavePrefix}>
+                {savingPrefix ? 'Saving…' : 'Save'}
+              </NCBtn>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };

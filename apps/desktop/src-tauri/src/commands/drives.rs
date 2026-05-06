@@ -197,6 +197,32 @@ pub async fn remove_drive(
     Ok(())
 }
 
+/// Update a drive's `bucket_prefix` without touching credentials.
+/// The drive must be unmounted first.
+#[tauri::command]
+pub async fn set_drive_prefix(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    bucket_prefix: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    if state.mounts.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&drive_id) {
+        return Err("Unmount the drive first before changing its prefix.".into());
+    }
+
+    let prefix = normalise_prefix(&bucket_prefix);
+    state.db.lock().unwrap_or_else(|p| p.into_inner())
+        .execute(
+            "UPDATE drives SET bucket_prefix = ?1 WHERE id = ?2",
+            rusqlite::params![prefix, drive_id],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+
+    Ok(())
+}
+
 // ── Mount / unmount ──────────────────────────────────────────────────────────
 
 #[tauri::command]

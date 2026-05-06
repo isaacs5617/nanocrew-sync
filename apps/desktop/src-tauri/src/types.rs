@@ -57,6 +57,11 @@ pub struct TestConnectionInput {
     pub provider: String,
     pub endpoint: String,
     pub bucket: String,
+    /// Optional prefix to scope the LIST probe (mirrors AddDriveInput::bucket_prefix).
+    /// If present the probe lists under that prefix, which is required for
+    /// credentials that are scoped to a subdirectory of the bucket.
+    #[serde(default)]
+    pub bucket_prefix: String,
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,

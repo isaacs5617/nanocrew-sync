@@ -144,6 +144,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
           provider: preset.id,
           endpoint: resolved.endpoint,
           bucket: bucket.trim(),
+          bucket_prefix: bucketPrefix.trim(),
           region: resolved.region,
           access_key_id: accessKeyId.trim(),
           secret_access_key: secretKey,
@@ -503,5 +504,6 @@ function prettifyError(msg: string): string {
   if (/NoSuchBucket/.test(msg))                      return 'Bucket not found at this endpoint. Check the name and region.';
   if (/dns error|NameResolutionFailure/.test(msg))   return 'Could not resolve the endpoint hostname. Check the endpoint spelling.';
   if (/timed out|timeout/.test(msg))                 return 'Connection timed out — check your network and firewall.';
+  if (/500|InternalError|internal server error/i.test(msg)) return 'The storage provider returned a server error (500). Check the bucket name, prefix, and permissions, or try again shortly.';
   return msg;
 }

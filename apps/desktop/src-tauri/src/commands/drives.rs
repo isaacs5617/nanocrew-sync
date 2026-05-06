@@ -380,11 +380,12 @@ pub async fn test_connection(
 
     let client = aws_sdk_s3::Client::new(&config);
 
-    client
-        .list_objects_v2()
-        .bucket(&input.bucket)
-        .max_keys(1)
-        .send()
+    let volume_prefix = normalise_prefix(&input.bucket_prefix);
+    let mut req = client.list_objects_v2().bucket(&input.bucket).max_keys(1);
+    if !volume_prefix.is_empty() {
+        req = req.prefix(&volume_prefix);
+    }
+    req.send()
         .await
         .map_err(|e| AppError::ConnectionTest(e.to_string()).to_string())?;
 
@@ -508,7 +509,7 @@ pub async fn list_drive_objects(
             let Some(key) = obj.key() else { continue };
             let rel_key = key.strip_prefix(&volume_prefix).unwrap_or(key);
             let name = rel_key.strip_prefix(&prefix).unwrap_or(rel_key).to_string();
-            if name.is_empty() || name.contains('/') || name.ends_with('/') { continue; }
+            if name.is_empty() || name.contains('/') || name.ends_with('/') || name == ".keep" { continue; }
             let size = obj.size().unwrap_or(0).max(0);
             let modified = obj.last_modified().map(|d| d.secs()).unwrap_or(0);
             entries.push(S3Entry { name, key: rel_key.to_string(), is_dir: false, size, modified });
@@ -601,7 +602,9 @@ pub async fn open_path(
 
 // ── Folder operations ────────────────────────────────────────────────────────
 
-/// Create a virtual S3 folder by PUT-ing a zero-byte object at `<prefix><name>/`.
+/// Create a virtual S3 folder by PUT-ing a zero-byte `.keep` marker at
+/// `<volume_prefix><prefix><name>/.keep`. Using `.keep` instead of a bare
+/// trailing-slash key avoids HTTP 500/400 errors on R2, MinIO, and B2.
 /// `prefix` is the current directory prefix (empty = root), relative to the
 /// drive's `bucket_prefix`.
 #[tauri::command]
@@ -640,13 +643,17 @@ pub async fn create_folder(
     let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret).await?;
 
     let volume_prefix = normalise_prefix(&bucket_prefix_raw);
-    let folder_key = format!("{volume_prefix}{prefix}{name}/");
+    // Use a `.keep` marker instead of a bare trailing-slash key: some S3
+    // providers (Cloudflare R2, MinIO, Backblaze B2) reject zero-byte objects
+    // whose key ends with `/` with an HTTP 500 or 400.
+    let marker_key = format!("{volume_prefix}{prefix}{name}/.keep");
 
     client
         .put_object()
         .bucket(&bucket)
-        .key(&folder_key)
+        .key(&marker_key)
         .content_length(0)
+        .body(aws_sdk_s3::primitives::ByteStream::from(bytes::Bytes::new()))
         .send()
         .await
         .map_err(|e| format!("create folder: {e}"))?;

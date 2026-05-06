@@ -505,5 +505,6 @@ function prettifyError(msg: string): string {
   if (/dns error|NameResolutionFailure/.test(msg))   return 'Could not resolve the endpoint hostname. Check the endpoint spelling.';
   if (/timed out|timeout/.test(msg))                 return 'Connection timed out — check your network and firewall.';
   if (/500|InternalError|internal server error/i.test(msg)) return 'The storage provider returned a server error (500). Check the bucket name, prefix, and permissions, or try again shortly.';
+  if (/service.?error|ServiceError/i.test(msg))      return 'The storage provider rejected the request. Check the endpoint, bucket name, region, and key permissions.';
   return msg;
 }

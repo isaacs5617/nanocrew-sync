@@ -413,7 +413,19 @@ pub async fn test_connection(
     }
     req.send()
         .await
-        .map_err(|e| AppError::ConnectionTest(e.to_string()).to_string())?;
+        .map_err(|e| {
+            // Extract the S3 error code + message from the SDK's service-error
+            // metadata so prettifyError can match on "AccessDenied", "403", etc.
+            // The default e.to_string() only yields the useless "service error".
+            let detail = e.as_service_error()
+                .map(|se| {
+                    let code = se.meta().code().unwrap_or("service_error");
+                    let msg  = se.meta().message().unwrap_or("no message");
+                    format!("{code}: {msg}")
+                })
+                .unwrap_or_else(|| e.to_string());
+            AppError::ConnectionTest(detail).to_string()
+        })?;
 
     Ok(())
 }

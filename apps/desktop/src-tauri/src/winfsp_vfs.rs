@@ -423,7 +423,14 @@ impl S3Fs {
                     .send()
                     .await
                     .map_err(|e| {
-                        let msg = format!("list_objects_v2 prefix={s3_prefix:?}: {e}");
+                        let detail = e.as_service_error()
+                            .map(|se| {
+                                let code = se.meta().code().unwrap_or("service_error");
+                                let msg  = se.meta().message().unwrap_or("no message");
+                                format!("{code}: {msg}")
+                            })
+                            .unwrap_or_else(|| e.to_string());
+                        let msg = format!("list_objects_v2 prefix={s3_prefix:?}: {detail}");
                         tracing::error!(target: "nanocrew::vfs", "{msg}");
                         msg
                     })?;

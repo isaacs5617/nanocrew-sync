@@ -811,7 +811,10 @@ async fn build_s3_client(
         .http_client(http)
         .load()
         .await;
-    Ok(aws_sdk_s3::Client::new(&config))
+    let s3_conf = aws_sdk_s3::config::Builder::from(&config)
+        .force_path_style(true)
+        .build();
+    Ok(aws_sdk_s3::Client::from_conf(s3_conf))
 }
 
 /// Returns the set of drive letters currently in use on this Windows machine.

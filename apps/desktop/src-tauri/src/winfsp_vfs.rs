@@ -422,7 +422,11 @@ impl S3Fs {
                 let resp = req
                     .send()
                     .await
-                    .map_err(|e| format!("list_objects_v2: {e}"))?;
+                    .map_err(|e| {
+                        let msg = format!("list_objects_v2 prefix={s3_prefix:?}: {e}");
+                        tracing::error!(target: "nanocrew::vfs", "{msg}");
+                        msg
+                    })?;
 
                 for cp in resp.common_prefixes() {
                     if let Some(full) = cp.prefix() {
@@ -1767,7 +1771,11 @@ impl FileSystemContext for S3Fs {
         if marker.is_none() {
             let listing = self
                 .list_dir(key)
-                .map_err(|_| nt(STATUS_INVALID_PARAMETER))?;
+                .map_err(|e| {
+                    tracing::error!(target: "nanocrew::vfs",
+                        "read_directory key={key:?} failed: {e}");
+                    nt(STATUS_ACCESS_DENIED)
+                })?;
             let lock = dir_buffer.acquire(true, None)?;
 
             // "." and ".." for subdirectories (not for root).

@@ -2,7 +2,7 @@
 
 Mount S3-compatible cloud storage (Wasabi, Amazon S3, Backblaze B2, Cloudflare R2, MinIO) as native Windows drive letters. Built on Tauri 2 and WinFsp.
 
-> **Status:** Early access (v0.1.0-alpha). Single-user, single-machine. Paid tiers and multi-provider support land in upcoming releases — see [PHASES.md](./PHASES.md) for the roadmap.
+> **Status:** Early access (v0.1.11). Single-user, single-machine. Auto-updater shipping; licensing scaffolded with 14-day Pro trial (real key issuance lands before GA). See [PHASES.md](./PHASES.md) for the full roadmap.
 
 ---
 

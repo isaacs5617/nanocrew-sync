@@ -37,8 +37,9 @@ const DriveMenu: React.FC<{
   onRemove: (id: number) => void;
   onOpen: (letter: string) => void;
   onEditPrefix: (drive: Drive) => void;
+  onEditCredentials: (drive: Drive) => void;
   onClose: () => void;
-}> = ({ drive, theme, anchorRect, onRemove, onOpen, onEditPrefix, onClose }) => {
+}> = ({ drive, theme, anchorRect, onRemove, onOpen, onEditPrefix, onEditCredentials, onClose }) => {
   const t = getTokens(theme);
   const { t: tr } = useTranslation();
   const ref = React.useRef<HTMLDivElement>(null);
@@ -80,6 +81,7 @@ const DriveMenu: React.FC<{
       {drive.status === 'mounted' && item(tr('dashboard.menu.openExplorer'), <I.folder size={13} />, () => onOpen(drive.letter))}
       {drive.status === 'mounted' && <div style={{ height: 1, background: t.border }} />}
       {drive.status !== 'mounted' && item('Edit prefix', <I.pencil size={13} />, () => onEditPrefix(drive))}
+      {drive.status !== 'mounted' && item('Edit credentials', <I.lock size={13} />, () => onEditCredentials(drive))}
       {drive.status !== 'mounted' && <div style={{ height: 1, background: t.border }} />}
       {drive.status !== 'mounted'
         ? item(tr('dashboard.menu.remove'), <I.trash size={13} />, () => onRemove(drive.id), true)
@@ -112,7 +114,8 @@ const DriveRow: React.FC<{
   onRemove: (id: number) => void;
   onOpen: (letter: string) => void;
   onEditPrefix: (drive: Drive) => void;
-}> = ({ d, theme, last, menuOpen, menuAnchor, onMount, onUnmount, onMenuOpen, onMenuClose, onRemove, onOpen, onEditPrefix }) => {
+  onEditCredentials: (drive: Drive) => void;
+}> = ({ d, theme, last, menuOpen, menuAnchor, onMount, onUnmount, onMenuOpen, onMenuClose, onRemove, onOpen, onEditPrefix, onEditCredentials }) => {
   const t = getTokens(theme);
   const { t: tr } = useTranslation();
   const statusMap: Record<string, { label: string; color: string; dot: DriveStatus }> = {
@@ -172,7 +175,7 @@ const DriveRow: React.FC<{
         {menuOpen && menuAnchor && (
           <DriveMenu
             drive={d} theme={theme} anchorRect={menuAnchor}
-            onRemove={onRemove} onOpen={onOpen} onEditPrefix={onEditPrefix} onClose={onMenuClose}
+            onRemove={onRemove} onOpen={onOpen} onEditPrefix={onEditPrefix} onEditCredentials={onEditCredentials} onClose={onMenuClose}
           />
         )}
       </div>
@@ -197,6 +200,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
   const [openMenu, setOpenMenu] = React.useState<{ id: number; rect: DOMRect } | null>(null);
   const [editPrefix, setEditPrefix] = React.useState<{ drive: Drive; value: string } | null>(null);
   const [savingPrefix, setSavingPrefix] = React.useState(false);
+  const [editCreds, setEditCreds] = React.useState<{ drive: Drive; accessKeyId: string; secretAccessKey: string } | null>(null);
+  const [savingCreds, setSavingCreds] = React.useState(false);
 
   const loadDrives = React.useCallback(async () => {
     try {
@@ -265,6 +270,28 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
       setActionError(String(e));
     } finally {
       setSavingPrefix(false);
+    }
+  };
+
+  const handleSaveCreds = async () => {
+    if (!editCreds) return;
+    setSavingCreds(true);
+    setActionError(null);
+    try {
+      await invoke('set_drive_credentials', {
+        token,
+        driveId: editCreds.drive.id,
+        accessKeyId: editCreds.accessKeyId,
+        secretAccessKey: editCreds.secretAccessKey,
+      });
+      setDrives(prev => prev.map(d =>
+        d.id === editCreds.drive.id ? { ...d, access_key_id: editCreds.accessKeyId } : d
+      ));
+      setEditCreds(null);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSavingCreds(false);
     }
   };
 
@@ -378,6 +405,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
                 onRemove={handleRemove}
                 onOpen={handleOpenInExplorer}
                 onEditPrefix={drive => setEditPrefix({ drive, value: drive.bucket_prefix })}
+                onEditCredentials={drive => setEditCreds({ drive, accessKeyId: drive.access_key_id, secretAccessKey: '' })}
               />
             ))}
           </div>
@@ -404,6 +432,63 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ theme, onAddDr
           </div>
         )}
       </div>
+
+      {/* Edit credentials modal */}
+      {editCreds && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 2000,
+          background: 'rgba(0,0,0,0.55)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: t.surface1, border: `1px solid ${t.border}`,
+            borderRadius: 6, padding: 24, width: 480,
+            boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: t.textHi, marginBottom: 6 }}>
+              Edit credentials — {editCreds.drive.name}
+            </div>
+            <div style={{ fontSize: 12, color: t.textMd, marginBottom: 16 }}>
+              Enter the correct access key ID and secret key. The drive must be unmounted.
+            </div>
+            <div style={{ fontSize: 11, color: t.textMd, marginBottom: 4 }}>Access Key ID</div>
+            <input
+              autoFocus
+              value={editCreds.accessKeyId}
+              onChange={e => setEditCreds(p => p ? { ...p, accessKeyId: e.target.value } : p)}
+              placeholder="Access Key ID"
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                background: t.surface2, border: `1px solid ${t.border}`,
+                borderRadius: 3, padding: '7px 10px',
+                color: t.textHi, fontSize: 13, outline: 'none',
+                fontFamily: 'monospace', marginBottom: 12,
+              }}
+            />
+            <div style={{ fontSize: 11, color: t.textMd, marginBottom: 4 }}>Secret Access Key</div>
+            <input
+              type="password"
+              value={editCreds.secretAccessKey}
+              onChange={e => setEditCreds(p => p ? { ...p, secretAccessKey: e.target.value } : p)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSaveCreds(); if (e.key === 'Escape') setEditCreds(null); }}
+              placeholder="Secret Access Key"
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                background: t.surface2, border: `1px solid ${t.border}`,
+                borderRadius: 3, padding: '7px 10px',
+                color: t.textHi, fontSize: 13, outline: 'none',
+                fontFamily: 'monospace', marginBottom: 16,
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <NCBtn theme={theme} ghost small onClick={() => setEditCreds(null)}>Cancel</NCBtn>
+              <NCBtn theme={theme} primary small disabled={savingCreds || !editCreds.accessKeyId || !editCreds.secretAccessKey} onClick={handleSaveCreds}>
+                {savingCreds ? 'Saving…' : 'Save'}
+              </NCBtn>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Edit prefix modal */}
       {editPrefix && (

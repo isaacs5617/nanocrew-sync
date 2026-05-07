@@ -197,6 +197,35 @@ pub async fn remove_drive(
     Ok(())
 }
 
+/// Update a drive's credentials (access key + secret) without touching other fields.
+/// The drive must be unmounted first.
+#[tauri::command]
+pub async fn set_drive_credentials(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    access_key_id: String,
+    secret_access_key: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    if state.mounts.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&drive_id) {
+        return Err("Unmount the drive first before changing its credentials.".into());
+    }
+
+    state.db.lock().unwrap_or_else(|p| p.into_inner())
+        .execute(
+            "UPDATE drives SET access_key_id = ?1 WHERE id = ?2",
+            rusqlite::params![access_key_id, drive_id],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+
+    credentials::store(&state.db, drive_id, &secret_access_key)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Update a drive's `bucket_prefix` without touching credentials.
 /// The drive must be unmounted first.
 #[tauri::command]

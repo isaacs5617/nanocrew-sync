@@ -173,6 +173,7 @@ pub fn run() {
             commands::drives::list_drive_objects,
             commands::drives::list_buckets,
             commands::drives::set_drive_prefix,
+            commands::drives::set_drive_credentials,
             commands::drives::create_folder,
             commands::drives::rename_object,
             commands::drives::open_path,

@@ -104,7 +104,7 @@ pub async fn add_drive(
             "INSERT INTO drives
              (name, provider, endpoint, bucket, bucket_prefix, region, letter,
               access_key_id, secret_key, cache_size_gb, auto_mount, readonly)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,?9,?10,?11)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9,?10,?11)",
             rusqlite::params![
                 input.name, input.provider, input.endpoint, input.bucket, bucket_prefix,
                 input.region, letter, input.access_key_id,

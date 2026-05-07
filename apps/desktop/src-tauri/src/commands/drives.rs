@@ -660,10 +660,10 @@ pub async fn create_folder(
         return Err("Folder name must not be empty or contain slashes.".into());
     }
 
-    let (endpoint, bucket, bucket_prefix_raw, region, aki) = {
+    let (endpoint, bucket, bucket_prefix_raw, region, aki, provider) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
-            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id
+            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id, provider
              FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
@@ -672,13 +672,14 @@ pub async fn create_folder(
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
     };
 
     let secret = credentials::retrieve(&state.db, drive_id).map_err(|e| e.to_string())?;
-    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret).await?;
+    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret, &provider).await?;
 
     let volume_prefix = normalise_prefix(&bucket_prefix_raw);
     // Use a `.keep` marker instead of a bare trailing-slash key: some S3
@@ -713,10 +714,10 @@ pub async fn rename_object(
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
 
-    let (endpoint, bucket, bucket_prefix_raw, region, aki) = {
+    let (endpoint, bucket, bucket_prefix_raw, region, aki, provider) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
-            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id
+            "SELECT endpoint, bucket, COALESCE(bucket_prefix,''), region, access_key_id, provider
              FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
@@ -725,13 +726,14 @@ pub async fn rename_object(
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
     };
 
     let secret = credentials::retrieve(&state.db, drive_id).map_err(|e| e.to_string())?;
-    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret).await?;
+    let client = build_s3_client(&state.db, &endpoint, &region, &aki, &secret, &provider).await?;
 
     let vp = normalise_prefix(&bucket_prefix_raw);
 
@@ -837,6 +839,7 @@ async fn build_s3_client(
     region: &str,
     access_key_id: &str,
     secret_access_key: &str,
+    provider: &str,
 ) -> Result<aws_sdk_s3::Client, String> {
     let creds = aws_credential_types::Credentials::new(
         access_key_id, secret_access_key, None, None, "nanocrew-sync",
@@ -849,8 +852,12 @@ async fn build_s3_client(
         .http_client(http)
         .load()
         .await;
+    let needs_path_style = matches!(
+        provider.to_lowercase().as_str(),
+        "minio" | "cloudflare" | "r2" | "backblaze" | "other"
+    );
     let s3_conf = aws_sdk_s3::config::Builder::from(&config)
-        .force_path_style(true)
+        .force_path_style(needs_path_style)
         .build();
     Ok(aws_sdk_s3::Client::from_conf(s3_conf))
 }

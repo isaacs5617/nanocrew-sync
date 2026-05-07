@@ -224,8 +224,17 @@ pub fn spawn_mount(
                     .load()
                     .await
             });
+            // Force path-style only for providers whose endpoints don't support
+            // virtual-hosted-style bucket URLs. Wasabi and AWS use virtual-hosted
+            // style (bucket.endpoint) and can fail with force_path_style when the
+            // SDK constructs the URL against a custom endpoint_url. MinIO,
+            // Cloudflare R2, and generic "other" endpoints need path-style.
+            let needs_path_style = matches!(
+                config.provider.to_lowercase().as_str(),
+                "minio" | "cloudflare" | "r2" | "backblaze" | "other"
+            );
             let s3_conf = aws_sdk_s3::config::Builder::from(&aws_cfg)
-                .force_path_style(true)
+                .force_path_style(needs_path_style)
                 .build();
             let client = aws_sdk_s3::Client::from_conf(s3_conf);
 

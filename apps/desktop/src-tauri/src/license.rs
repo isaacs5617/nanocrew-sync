@@ -232,6 +232,17 @@ fn mask_key_id(id: &str) -> String {
     format!("{prefix}•••")
 }
 
+/// Returns `Ok(())` if the current license is trial or pro-level.
+/// Returns `Err(…)` for free/expired tiers.
+pub fn require_pro(db: &Mutex<rusqlite::Connection>) -> Result<(), String> {
+    let status = compute_status(db);
+    if status.is_pro {
+        Ok(())
+    } else {
+        Err("This feature requires a Pro license. Upgrade at https://nanocrew.dev/pricing".into())
+    }
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -304,6 +315,34 @@ pub async fn deactivate_license(
         None, actor.as_deref(), None, None,
     );
     Ok(compute_status(&state.db))
+}
+
+#[tauri::command]
+pub async fn request_trial(email: String) -> Result<String, String> {
+    let email = email.trim().to_string();
+    if email.is_empty() || !email.contains('@') {
+        return Err("please enter a valid email address".into());
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://licenses.nanocrew.dev/issue-trial")
+        .json(&serde_json::json!({ "email": email }))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("server error {status}: {body}"));
+    }
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+    payload["token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "server response missing token".into())
 }
 
 #[cfg(test)]

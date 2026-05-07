@@ -16,6 +16,7 @@ mod http_client;
 mod license;
 mod logging;
 mod mounts;
+mod providers;
 mod state;
 mod throttle;
 mod types;
@@ -26,6 +27,21 @@ use types::DriveStatusPayload;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _sentry = sentry::init((
+        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+    sentry::configure_scope(|scope| {
+        let machine_id = license::machine_fingerprint();
+        scope.set_user(Some(sentry::User {
+            id: Some(machine_id),
+            ..Default::default()
+        }));
+    });
+
     tauri::Builder::default()
         // Enforce single-instance: a second launch refocuses the existing
         // window (and un-hides it from tray) instead of spawning a twin
@@ -73,6 +89,22 @@ pub fn run() {
                 state.attach_log_guard(guard);
             }
             tracing::info!(target: "nanocrew", "startup: log dir = {}", log_dir.display());
+
+            // Disable Sentry if the user has opted out of telemetry.
+            {
+                let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                let telemetry_on = db.query_row(
+                    "SELECT value FROM prefs WHERE key = 'telemetry_enabled'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true);
+                if !telemetry_on {
+                    sentry::Hub::current().client().map(|c| c.close(None));
+                }
+            }
 
             app.manage(state);
 
@@ -178,6 +210,26 @@ pub fn run() {
             commands::drives::rename_object,
             commands::drives::open_path,
             commands::drives::check_winfsp,
+            commands::drives::get_drive_cache_stats,
+            commands::drives::set_drive_cache_quota,
+            commands::drives::clear_drive_cache,
+            commands::drives::set_drive_cache_enabled,
+            commands::drives::get_drive_connectivity,
+            commands::drives::get_drive_offline_coverage,
+            commands::drives::prefetch_pinned,
+            commands::drives::set_drive_bandwidth,
+            commands::drives::test_sftp_connection,
+            commands::drives::add_sftp_drive,
+            commands::drives::test_ftp_connection,
+            commands::drives::add_ftp_drive,
+            commands::drives::test_webdav_connection,
+            commands::drives::add_webdav_drive,
+            commands::drives::start_gdrive_auth,
+            commands::drives::add_gdrive_drive,
+            commands::drives::start_dropbox_auth,
+            commands::drives::add_dropbox_drive,
+            commands::drives::start_onedrive_auth,
+            commands::drives::add_onedrive_drive,
             commands::system::get_autostart,
             commands::system::set_autostart,
             commands::activity::list_activity,
@@ -196,6 +248,7 @@ pub fn run() {
             license::get_license_status,
             license::activate_license,
             license::deactivate_license,
+            license::request_trial,
         ])
         .build(tauri::generate_context!())
         .expect("error building nanocrew sync")
@@ -223,12 +276,16 @@ pub fn run() {
 async fn auto_mount_drives(app: tauri::AppHandle) {
     // ── Pull drive rows from DB ───────────────────────────────────────────────
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, String, String, String, String, bool, i64, String)> = {
+    let rows: Vec<(i64, String, String, String, String, String, String, bool, String, i64, i64, f64, f64)> = {
         let state: tauri::State<AppState> = app.state();
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match db.prepare(
             "SELECT id, endpoint, bucket, region, letter, access_key_id, provider, readonly,
-                    cache_size_gb, COALESCE(bucket_prefix,'')
+                    COALESCE(bucket_prefix,''),
+                    COALESCE(cache_max_bytes, 10737418240),
+                    COALESCE(cache_enabled, 1),
+                    COALESCE(upload_rate_mbps, 0.0),
+                    COALESCE(download_rate_mbps, 0.0)
              FROM drives WHERE auto_mount = 1",
         ) {
             Ok(s) => s,
@@ -249,8 +306,11 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, bool>(7)?,
-                    r.get::<_, i64>(8)?,
-                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, f64>(11)?,
+                    r.get::<_, f64>(12)?,
                 ))
             })
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -284,7 +344,8 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
         }
     };
 
-    for (id, endpoint, bucket, region, letter, aki, provider, readonly, cache_size_gb, bucket_prefix) in rows {
+    for (id, endpoint, bucket, region, letter, aki, provider, readonly, bucket_prefix,
+         drive_cache_max_bytes, drive_cache_enabled, drive_upload_mbps, drive_download_mbps) in rows {
         let state: tauri::State<AppState> = app.state();
 
         // Skip if already mounted (e.g. user mounted manually during setup window)
@@ -310,12 +371,20 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             }
         };
 
-        // Read global bandwidth caps from prefs so auto-mounted drives
-        // respect them too.
-        let upload_rate_bps = commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
-        let download_rate_bps = commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
-        let cache_enabled = commands::prefs::get_bool(&state.db, "cache_enabled", true);
-        let cache_max_bytes = (cache_size_gb.max(0) as u64).saturating_mul(1_073_741_824);
+        // Per-drive bandwidth overrides: if the drive row has a non-zero value,
+        // use it; otherwise fall back to the global pref.
+        let upload_rate_bps = if drive_upload_mbps > 0.0 {
+            Some((drive_upload_mbps * 1_048_576.0) as u64)
+        } else {
+            commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps")
+        };
+        let download_rate_bps = if drive_download_mbps > 0.0 {
+            Some((drive_download_mbps * 1_048_576.0) as u64)
+        } else {
+            commands::prefs::get_rate_bps(&state.db, "download_rate_mbps")
+        };
+        let cache_enabled = drive_cache_enabled != 0;
+        let cache_max_bytes = drive_cache_max_bytes.max(0) as u64;
 
         let config = mounts::MountConfig {
             drive_id: id,

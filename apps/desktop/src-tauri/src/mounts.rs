@@ -24,6 +24,7 @@ use crate::{
     cache::DiskCache,
     error::AppError,
     http_client,
+    providers::{s3::S3Provider, CloudProvider},
     state::AppState,
     types::{DriveStatusPayload, FileLockEvent, TransferPayload},
     winfsp_vfs::S3Fs,
@@ -99,6 +100,8 @@ pub struct MountHandle {
     /// can poke it while the mount is live. `None` when caching is disabled
     /// for this drive.
     pub cache: Option<std::sync::Arc<DiskCache>>,
+    /// Shared connectivity flag from the VFS layer. `true` = last S3 op succeeded.
+    pub connectivity: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MountHandle {
@@ -162,6 +165,8 @@ pub fn spawn_mount(
         None
     };
     let cache_for_thread = cache.clone();
+    let connectivity = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let connectivity_for_thread = std::sync::Arc::clone(&connectivity);
 
     let thread = std::thread::Builder::new()
         .name(format!("winfsp-{}", config.letter))
@@ -240,11 +245,19 @@ pub fn spawn_mount(
 
             // 2. Build the filesystem context. The runtime we just used moves
             //    into S3Fs and stays alive for every subsequent IO call.
+            let provider: std::sync::Arc<dyn CloudProvider> = std::sync::Arc::new(S3Provider::new(
+                client.clone(),
+                config.bucket.clone(),
+                config.bucket_prefix.clone(),
+            ));
             let emit_app = app_handle.clone();
             let emit_app_lock = app_handle.clone();
+            let emit_app_status = app_handle.clone();
+            let status_drive_id = config.drive_id;
             let label = format!("NanoCrew-{}", config.bucket);
             let ctx = match S3Fs::new(
                 rt,
+                provider,
                 client,
                 config.bucket.clone(),
                 config.bucket_prefix.clone(),
@@ -260,6 +273,17 @@ pub fn spawn_mount(
                 config.upload_rate_bps,
                 config.download_rate_bps,
                 cache_for_thread,
+                Box::new(move |online: bool| {
+                    let _ = emit_app_status.emit(
+                        "drive_status_changed",
+                        crate::types::DriveStatusPayload {
+                            drive_id: status_drive_id,
+                            status: if online { "online".into() } else { "offline".into() },
+                            message: None,
+                        },
+                    );
+                }),
+                connectivity_for_thread,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -371,6 +395,7 @@ pub fn spawn_mount(
             stop_tx,
             thread: Some(thread),
             cache,
+            connectivity,
         }),
         Ok(Err(msg)) => {
             if let Some(c) = &cache {

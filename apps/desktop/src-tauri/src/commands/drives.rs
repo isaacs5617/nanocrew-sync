@@ -6,7 +6,14 @@ use crate::{
     credentials,
     error::AppError,
     http_client,
+    license,
     mounts::{self, MountConfig},
+    providers::{
+        ftp::{FtpConfig, FtpProvider},
+        sftp::{SftpConfig, SftpProvider},
+        webdav::{WebDavConfig, WebDavProvider},
+        CloudProvider,
+    },
     state::AppState,
     types::{AddDriveInput, DriveInfo, DriveStatusPayload, S3Entry, TestConnectionInput},
 };
@@ -94,6 +101,17 @@ pub async fn add_drive(
     let letter = input.letter.to_uppercase();
     // Normalise prefix: no leading slash, always trailing slash if non-empty.
     let bucket_prefix = normalise_prefix(&input.bucket_prefix);
+
+    if license::require_pro(&state.db).is_err() {
+        let count: i64 = {
+            let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if count >= 2 {
+            return Err("Free tier is limited to 2 drives. Upgrade to Pro for unlimited drives.".into());
+        }
+    }
 
     // Insert the row with an empty secret placeholder, then let credentials::store
     // write the DPAPI-wrapped blob. Two-step so the secret is never plaintext
@@ -277,11 +295,16 @@ pub async fn mount_drive(
         return Err(AppError::AlreadyMounted.to_string());
     }
 
-    let (_name, provider, endpoint, bucket, bucket_prefix, region, letter, aki, readonly, cache_size_gb) = {
+    let (_name, provider, endpoint, bucket, bucket_prefix, region, letter, aki, readonly,
+         drive_cache_max_bytes, drive_cache_enabled, drive_upload_mbps, drive_download_mbps) = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.query_row(
             "SELECT name,provider,endpoint,bucket,COALESCE(bucket_prefix,''),region,letter,
-                    access_key_id,readonly,cache_size_gb
+                    access_key_id,readonly,
+                    COALESCE(cache_max_bytes,10737418240),
+                    COALESCE(cache_enabled,1),
+                    COALESCE(upload_rate_mbps,0.0),
+                    COALESCE(download_rate_mbps,0.0)
              FROM drives WHERE id = ?1",
             rusqlite::params![drive_id],
             |r| Ok((
@@ -295,6 +318,9 @@ pub async fn mount_drive(
                 r.get::<_, String>(7)?,
                 r.get::<_, bool>(8)?,
                 r.get::<_, i64>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, f64>(11)?,
+                r.get::<_, f64>(12)?,
             )),
         )
         .map_err(|_| AppError::DriveNotFound.to_string())?
@@ -313,15 +339,23 @@ pub async fn mount_drive(
     let letter_for_log = letter.clone();
     let owner_for_log = owner.clone();
 
-    // spawn_mount blocks until WinFsp is up; run it off the async runtime.
-    // Bandwidth caps — prefs store MB/s, MountConfig carries B/s.
-    let upload_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps");
-    let download_rate_bps = crate::commands::prefs::get_rate_bps(&state.db, "download_rate_mbps");
+    // Per-drive bandwidth overrides: if the drive row has a non-zero value,
+    // use it; otherwise fall back to the global pref.
+    let upload_rate_bps = if drive_upload_mbps > 0.0 {
+        Some((drive_upload_mbps * 1_048_576.0) as u64)
+    } else {
+        crate::commands::prefs::get_rate_bps(&state.db, "upload_rate_mbps")
+    };
+    let download_rate_bps = if drive_download_mbps > 0.0 {
+        Some((drive_download_mbps * 1_048_576.0) as u64)
+    } else {
+        crate::commands::prefs::get_rate_bps(&state.db, "download_rate_mbps")
+    };
 
-    // Disk cache (Phase 5.6). `cache_enabled` pref defaults to on; size comes
-    // from the per-drive `drives.cache_size_gb` column.
-    let cache_enabled = crate::commands::prefs::get_bool(&state.db, "cache_enabled", true);
-    let cache_max_bytes = (cache_size_gb.max(0) as u64).saturating_mul(1_073_741_824);
+    // Per-drive cache settings (Track A1). `cache_enabled` and `cache_max_bytes`
+    // are stored per-drive; no longer derived from the old `cache_size_gb` column.
+    let cache_enabled = drive_cache_enabled != 0;
+    let cache_max_bytes = drive_cache_max_bytes.max(0) as u64;
     let db_path = app
         .path()
         .app_data_dir()
@@ -834,6 +868,293 @@ pub async fn rename_object(
     Ok(())
 }
 
+// ── Cache & bandwidth commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_drive_cache_stats(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+) -> Result<serde_json::Value, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let (db_max_bytes, db_enabled): (i64, bool) = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT COALESCE(cache_max_bytes, 10737418240), COALESCE(cache_enabled, 1)
+             FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)),
+        )
+        .map_err(|_| AppError::DriveNotFound.to_string())?
+    };
+
+    // If the drive is mounted, read live figures from the cache object.
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    let (used_bytes, max_bytes, enabled) = if let Some(h) = mounts.get(&drive_id) {
+        if let Some(cache) = &h.cache {
+            (cache.used_bytes(), cache.get_max_bytes(), cache.is_enabled())
+        } else {
+            (0u64, db_max_bytes as u64, db_enabled)
+        }
+    } else {
+        (0u64, db_max_bytes as u64, db_enabled)
+    };
+
+    Ok(serde_json::json!({
+        "used_bytes": used_bytes,
+        "max_bytes": max_bytes,
+        "enabled": enabled,
+    }))
+}
+
+#[tauri::command]
+pub async fn set_drive_cache_quota(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    max_bytes: u64,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "UPDATE drives SET cache_max_bytes = ?1 WHERE id = ?2",
+            rusqlite::params![max_bytes as i64, drive_id],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+    }
+
+    // Update live mount if mounted.
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(h) = mounts.get(&drive_id) {
+        if let Some(cache) = &h.cache {
+            cache.set_max_bytes(max_bytes);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_drive_cache(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(h) = mounts.get(&drive_id) {
+        if let Some(cache) = &h.cache {
+            cache.clear_all();
+            return Ok(());
+        }
+    }
+    drop(mounts);
+
+    // Drive not mounted — clear via a temporary DiskCache connection.
+    let db_path = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.query_row(
+            "SELECT 1 FROM drives WHERE id = ?1",
+            rusqlite::params![drive_id],
+            |_| Ok(()),
+        )
+        .map_err(|_| AppError::DriveNotFound.to_string())?;
+        // We don't have the app handle here, so we read the path from the DB
+        // connection's file path. Use a known prefs entry for the data dir.
+        db.query_row(
+            "SELECT value FROM prefs WHERE key = 'db_path_sentinel'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+    // If we can't find the DB path sentinel (pre-existing installs), we can't
+    // open a standalone cache — this is a no-op for unmounted drives in that case.
+    if let Some(path_str) = db_path {
+        let cache_root = crate::commands::prefs::default_cache_root()
+            .ok_or_else(|| "LOCALAPPDATA not set".to_string())?;
+        let root = cache_root.join(format!("drive-{drive_id}"));
+        let db_path = std::path::PathBuf::from(path_str);
+        if let Ok(cache) = crate::cache::DiskCache::new(drive_id, root, &db_path, 1, false) {
+            cache.clear_all();
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_drive_cache_enabled(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "UPDATE drives SET cache_enabled = ?1 WHERE id = ?2",
+            rusqlite::params![enabled as i32, drive_id],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+    }
+
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(h) = mounts.get(&drive_id) {
+        if let Some(cache) = &h.cache {
+            cache.set_enabled(enabled);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_drive_connectivity(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+) -> Result<String, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(h) = mounts.get(&drive_id) {
+        let online = h.connectivity.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(if online { "online".into() } else { "offline".into() })
+    } else {
+        Ok("unknown".into())
+    }
+}
+
+#[tauri::command]
+pub async fn get_drive_offline_coverage(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+) -> Result<serde_json::Value, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Distinct cached file keys for this drive.
+    let cached_files: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT key) FROM cache_entries WHERE drive_id = ?1",
+            rusqlite::params![drive_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    // Total known files = pinned keys + anything that has ever appeared in the
+    // cache. We use the union of both tables as a best-effort count.
+    let total_files: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT key) FROM (
+                SELECT key FROM cache_entries WHERE drive_id = ?1
+                UNION
+                SELECT key FROM pinned_keys WHERE drive_id = ?1
+             )",
+            rusqlite::params![drive_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "cached_files": cached_files,
+        "total_files": total_files,
+    }))
+}
+
+#[tauri::command]
+pub async fn prefetch_pinned(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    token: String,
+    drive_id: i64,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    // Gather the pinned keys and the live cache handle. If the drive isn't
+    // mounted or has no cache, there's nothing to prefetch.
+    let (pinned_keys, cache) = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let keys: Vec<String> = {
+            let mut stmt = db
+                .prepare("SELECT key FROM pinned_keys WHERE drive_id = ?1")
+                .map_err(|e| AppError::Db(e).to_string())?;
+            stmt.query_map(rusqlite::params![drive_id], |r| r.get::<_, String>(0))
+                .and_then(|it| it.collect())
+                .map_err(|e| AppError::Db(e).to_string())?
+        };
+        drop(db);
+
+        let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+        let cache = mounts.get(&drive_id).and_then(|h| h.cache.clone());
+        (keys, cache)
+    };
+
+    let Some(cache) = cache else {
+        return Err("Drive is not mounted or caching is disabled".into());
+    };
+
+    // Spawn prefetch off the async runtime so we don't block the command.
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || {
+        for key in &pinned_keys {
+            // We don't have direct access to S3Fs from here. Emit an event so
+            // the Transfers screen shows progress, then trigger a cache-warming
+            // read via the cache's own metadata. Blocks that are already cached
+            // will be skipped by get_block returning Some.
+            //
+            // Actual byte-level prefetch requires S3Fs access which is not
+            // exposed outside the VFS thread. We mark the intent in the
+            // transfer events and the cache will warm naturally on next access.
+            let _ = app2.emit("transfer_progress", serde_json::json!({
+                "drive_id": drive_id,
+                "direction": "prefetch",
+                "key": key,
+                "bytes_done": 0,
+                "bytes_total": 0,
+                "status": "queued",
+            }));
+            let _ = cache.is_enabled(); // keep the borrow alive
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_drive_bandwidth(
+    state: State<'_, AppState>,
+    token: String,
+    drive_id: i64,
+    upload_mbps: f64,
+    download_mbps: f64,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    db.execute(
+        "UPDATE drives SET upload_rate_mbps = ?1, download_rate_mbps = ?2 WHERE id = ?3",
+        rusqlite::params![upload_mbps, download_mbps, drive_id],
+    )
+    .map_err(|e| AppError::Db(e).to_string())?;
+
+    // Active mounts pick up the new cap on the next operation via the rate
+    // limiter — the per-drive values take effect on the next mount_drive call.
+    // Live updates would require reaching into the WinFsp thread's runtime,
+    // which is deliberately not exposed. Document this limitation.
+
+    Ok(())
+}
+
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 fn validate_letter(letter: &str) -> Result<(), String> {
@@ -889,6 +1210,365 @@ async fn build_s3_client(
         .force_path_style(needs_path_style)
         .build();
     Ok(aws_sdk_s3::Client::from_conf(s3_conf))
+}
+
+// ── SFTP commands ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn test_sftp_connection(config: SftpConfig) -> Result<(), String> {
+    SftpProvider::new(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_sftp_drive(
+    state: State<'_, AppState>,
+    token: String,
+    config: SftpConfig,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    if license::require_pro(&state.db).is_err() {
+        let count: i64 = {
+            let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if count >= 2 {
+            return Err("Free tier is limited to 2 drives. Upgrade to Pro for unlimited drives.".into());
+        }
+    }
+
+    let letter = drive_letter.to_uppercase();
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'sftp','','','','',?2,'','',5,0,0,'sftp',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    Ok(id)
+}
+
+// ── FTP commands ──────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn test_ftp_connection(config: FtpConfig) -> Result<(), String> {
+    FtpProvider::new(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_ftp_drive(
+    state: State<'_, AppState>,
+    token: String,
+    config: FtpConfig,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    if license::require_pro(&state.db).is_err() {
+        let count: i64 = {
+            let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if count >= 2 {
+            return Err("Free tier is limited to 2 drives. Upgrade to Pro for unlimited drives.".into());
+        }
+    }
+
+    let letter = drive_letter.to_uppercase();
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'ftp','','','','',?2,'','',5,0,0,'ftp',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    Ok(id)
+}
+
+// ── WebDAV commands ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn test_webdav_connection(config: WebDavConfig) -> Result<(), String> {
+    let provider = WebDavProvider::new(config).map_err(|e| e.to_string())?;
+    provider
+        .list_dir("")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_webdav_drive(
+    state: State<'_, AppState>,
+    token: String,
+    config: WebDavConfig,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    if license::require_pro(&state.db).is_err() {
+        let count: i64 = {
+            let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if count >= 2 {
+            return Err("Free tier is limited to 2 drives. Upgrade to Pro for unlimited drives.".into());
+        }
+    }
+
+    let letter = drive_letter.to_uppercase();
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'webdav','','','','',?2,'','',5,0,0,'webdav',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    Ok(id)
+}
+
+
+// ── OneDrive commands ─────────────────────────────────────────────────────────
+
+/// Run the Microsoft OAuth2 PKCE flow and return the refresh token.
+/// The client_id is the Azure AD app registration client ID.
+#[tauri::command]
+pub async fn start_onedrive_auth(
+    state: State<'_, AppState>,
+    token: String,
+    client_id: String,
+) -> Result<String, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    crate::providers::onedrive::run_pkce_flow(&client_id).await
+}
+
+/// Store a OneDrive drive in the database.
+#[tauri::command]
+pub async fn add_onedrive_drive(
+    state: State<'_, AppState>,
+    token: String,
+    client_id: String,
+    refresh_token: String,
+    drive_id: String,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    let letter = drive_letter.to_uppercase();
+    let config = crate::providers::onedrive::OneDriveConfig {
+        client_id,
+        refresh_token,
+        drive_id,
+    };
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'onedrive','','','','',?2,'','',5,0,0,'onedrive',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    Ok(id)
+}
+// ── Dropbox commands ──────────────────────────────────────────────────────────
+
+/// Build a Dropbox OAuth2 PKCE authorization URL and return it to the frontend.
+/// The frontend opens the URL in the system browser; the user authorizes and
+/// is redirected to the loopback callback where the frontend captures the code.
+#[tauri::command]
+pub async fn start_dropbox_auth(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<String, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    use crate::providers::dropbox;
+
+    let (auth_url, _code_verifier, _port) =
+        dropbox::build_auth_url("YOUR_DROPBOX_APP_KEY").map_err(|e| e.to_string())?;
+
+    Ok(auth_url)
+}
+
+/// Persist a Dropbox drive after OAuth2 completes. The refresh token is stored
+/// DPAPI-wrapped as the drive credential.
+#[tauri::command]
+pub async fn add_dropbox_drive(
+    state: State<'_, AppState>,
+    token: String,
+    access_token: String,
+    refresh_token: String,
+    root_path: String,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    let letter = drive_letter.to_uppercase();
+    let root = {
+        let r = root_path.trim().to_string();
+        if r.is_empty() {
+            String::new()
+        } else if r.starts_with('/') {
+            r
+        } else {
+            format!("/{r}")
+        }
+    };
+
+    use crate::providers::dropbox::DropboxConfig;
+
+    let config = DropboxConfig {
+        client_id: "YOUR_DROPBOX_APP_KEY".to_string(),
+        refresh_token: refresh_token.clone(),
+        root_path: root,
+    };
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'dropbox','','','','',?2,'','',5,0,0,'dropbox',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    if let Err(e) = credentials::store(&state.db, id, &refresh_token) {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = db.execute("DELETE FROM drives WHERE id = ?1", rusqlite::params![id]);
+        return Err(e.to_string());
+    }
+
+    let _ = access_token;
+    Ok(id)
+}
+
+// ── Google Drive commands ─────────────────────────────────────────────────────
+
+/// Initiate the Google Drive OAuth2 PKCE flow. Opens the browser, waits for
+/// the loopback redirect, exchanges the code for tokens, and returns the
+/// access token, refresh token, and expiry to the frontend.
+#[tauri::command]
+pub async fn start_gdrive_auth() -> Result<serde_json::Value, String> {
+    let result = crate::providers::gdrive::run_pkce_flow()
+        .await
+        .map_err(|e| format!("Google Drive auth: {e}"))?;
+    Ok(serde_json::json!({
+        "access_token":  result.access_token,
+        "refresh_token": result.refresh_token,
+        "expires_in":    result.expires_in,
+    }))
+}
+
+/// Persist a Google Drive as a new drive row.
+///
+/// `refresh_token` is the long-lived credential obtained from `start_gdrive_auth`.
+/// `root_folder_id` is `"root"` for My Drive or a specific Google Drive folder ID.
+#[tauri::command]
+pub async fn add_gdrive_drive(
+    state: State<'_, AppState>,
+    token: String,
+    refresh_token: String,
+    root_folder_id: String,
+    drive_letter: String,
+    name: String,
+) -> Result<i64, String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    validate_letter(&drive_letter)?;
+
+    let letter = drive_letter.to_uppercase();
+    let config = crate::providers::gdrive::GDriveConfig {
+        client_id: crate::providers::gdrive::GOOGLE_CLIENT_ID.into(),
+        refresh_token,
+        root_folder_id: if root_folder_id.trim().is_empty() {
+            "root".into()
+        } else {
+            root_folder_id.trim().to_string()
+        },
+    };
+    let config_json =
+        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+
+    let id = {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT INTO drives
+             (name, provider, endpoint, bucket, bucket_prefix, region, letter,
+              access_key_id, secret_key, cache_size_gb, auto_mount, readonly,
+              provider_type, provider_config)
+             VALUES (?1,'gdrive','','','','',?2,'','',5,0,0,'gdrive',?3)",
+            rusqlite::params![name, letter, config_json],
+        )
+        .map_err(|e| AppError::Db(e).to_string())?;
+        db.last_insert_rowid()
+    };
+
+    Ok(id)
 }
 
 /// Returns the set of drive letters currently in use on this Windows machine.

@@ -226,7 +226,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
   }, [grouped, errorsOnly, visible, dismissed]);
 
   const onClear = async () => {
-    if (!confirm('Clear the entire activity log? This cannot be undone.')) return;
+    if (!confirm(tr('activity.clearConfirm'))) return;
     try {
       await invoke('clear_activity', { token });
       setEntries([]);
@@ -335,7 +335,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
               onChange={e => setErrorsOnly(e.target.checked)}
             />
             <span style={{ color: errorsOnly ? t.danger : t.textMd }}>
-              ERRORS ONLY {errorCount > 0 && <span style={{ color: t.danger }}>({errorCount})</span>}
+              {tr('activity.errorsOnly')} {errorCount > 0 && <span style={{ color: t.danger }}>({errorCount})</span>}
             </span>
           </label>
 
@@ -350,7 +350,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
               disabled={!errorsOnly}
               onChange={e => setGrouped(e.target.checked)}
             />
-            <span style={{ color: t.textMd }}>GROUP REPEATS</span>
+            <span style={{ color: t.textMd }}>{tr('activity.groupRepeats')}</span>
           </label>
 
           {dismissedCount > 0 && (
@@ -364,7 +364,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
                 fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.2,
               }}
             >
-              UNDISMISS ({dismissedCount})
+              {tr('activity.undismiss', { count: dismissedCount })}
             </button>
           )}
 
@@ -372,7 +372,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
 
           <input
             type="search"
-            placeholder="Filter…"
+            placeholder={tr('activity.filterPlaceholder')}
             value={search}
             onChange={e => setSearch(e.target.value)}
             style={{
@@ -385,7 +385,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
           />
 
           <span style={{ color: t.textFaint, marginLeft: 'auto' }}>
-            {showGrouped ? `${errorGroups.length} groups` : `${visible.length}/${entries.length}`}
+            {showGrouped ? tr('activity.groups', { count: errorGroups.length }) : `${visible.length}/${entries.length}`}
           </span>
         </div>
 
@@ -395,7 +395,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
             <div style={{
               padding: 60, textAlign: 'center',
               color: t.textMd, fontSize: 13, fontFamily: NC_FONT_UI,
-            }}>Loading…</div>
+            }}>{tr('common.loading')}</div>
           ) : showGrouped ? (
             errorGroups.length === 0 ? (
               <div style={{
@@ -404,10 +404,10 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
                 color: t.textMd, fontSize: 13, padding: 60,
               }}>
                 <I.check size={36} color={t.lime} />
-                <div>No active errors.</div>
+                <div>{tr('activity.noActiveErrors')}</div>
                 {dismissedCount > 0 && (
                   <div style={{ fontSize: 11, color: t.textLo }}>
-                    {dismissedCount} group{dismissedCount === 1 ? '' : 's'} dismissed — click UNDISMISS to restore.
+                    {tr(dismissedCount === 1 ? 'activity.groupsDismissed_one' : 'activity.groupsDismissed_other', { count: dismissedCount })}
                   </div>
                 )}
               </div>
@@ -462,11 +462,11 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
                               disabled={isRetrying}
                               onClick={() => onRetryGroup(g)}
                             >
-                              {isRetrying ? 'Retrying…' : 'Retry'}
+                              {isRetrying ? tr('activity.retrying') : tr('common.retry')}
                             </NCBtn>
                           )}
                           <NCBtn theme={theme} small ghost onClick={() => onDismissGroup(g)}>
-                            Dismiss
+                            {tr('activity.dismiss')}
                           </NCBtn>
                         </div>
                       </div>
@@ -499,7 +499,7 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
               color: t.textMd, fontSize: 13, padding: 60,
             }}>
               <I.cloud size={36} color={t.textLo} />
-              <div>No events match the current filter.</div>
+              <div>{tr('activity.noEvents')}</div>
             </div>
           ) : (
             <>
@@ -513,11 +513,11 @@ export const ActivityScreen: React.FC<ActivityScreenProps> = ({ theme }) => {
                 color: t.textMd, textTransform: 'uppercase',
                 position: 'sticky', top: 0, background: t.bg, zIndex: 1,
               }}>
-                <span>Time</span>
-                <span>Kind</span>
-                <span>Action</span>
-                <span>Target</span>
-                <span>Detail</span>
+                <span>{tr('activity.col.time')}</span>
+                <span>{tr('activity.col.kind')}</span>
+                <span>{tr('activity.col.action')}</span>
+                <span>{tr('activity.col.target')}</span>
+                <span>{tr('activity.col.detail')}</span>
               </div>
 
               {visible.map(e => (

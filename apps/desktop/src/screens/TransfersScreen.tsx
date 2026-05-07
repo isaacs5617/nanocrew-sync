@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   getTokens, NC_FONT_MONO, NC_FONT_UI,
   NCBtn, TopBar,
@@ -23,7 +24,8 @@ function formatSpeed(bytes: number, ms: number) {
 interface TransfersScreenProps { theme: Theme }
 
 export const TransfersScreen: React.FC<TransfersScreenProps> = ({ theme }) => {
-  const t = getTokens(theme);
+  const tok = getTokens(theme);
+  const { t } = useTranslation();
   const { transfers, clearFinished } = useTransfers();
   // Tick every 500ms so the live speed readout updates while a transfer is in flight.
   const [, setTick] = React.useState(0);
@@ -32,20 +34,20 @@ export const TransfersScreen: React.FC<TransfersScreenProps> = ({ theme }) => {
     return () => clearInterval(id);
   }, []);
 
-  const active   = transfers.filter(t => t.state === 'start' || t.state === 'progress');
-  const finished = transfers.filter(t => t.state === 'done' || t.state === 'error');
+  const active   = transfers.filter(tr => tr.state === 'start' || tr.state === 'progress');
+  const finished = transfers.filter(tr => tr.state === 'done' || tr.state === 'error');
 
   return (
     <>
       <TopBar
         theme={theme}
-        crumbs={['Transfers']}
-        title={<>Transfer <span style={{ color: t.lime }}>queue</span></>}
+        crumbs={[t('transfers.crumb')]}
+        title={<>{t('transfers.titlePrefix')} <span style={{ color: tok.lime }}>{t('transfers.titleAccent')}</span></>}
         subtitle={active.length > 0
-          ? `${active.length} active transfer${active.length !== 1 ? 's' : ''}`
-          : 'Active uploads and downloads across all mounted drives'}
+          ? t(active.length !== 1 ? 'transfers.activeOther' : 'transfers.activeOne', { count: active.length })
+          : t('transfers.subtitle')}
         actions={finished.length > 0
-          ? <NCBtn theme={theme} small ghost onClick={clearFinished}>Clear done</NCBtn>
+          ? <NCBtn theme={theme} small ghost onClick={clearFinished}>{t('transfers.clearDone')}</NCBtn>
           : undefined
         }
       />
@@ -56,11 +58,10 @@ export const TransfersScreen: React.FC<TransfersScreenProps> = ({ theme }) => {
             flex: 1, display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center', gap: 16, padding: 40,
           }}>
-            <I.upload size={36} color={t.textLo} />
-            <div style={{ fontSize: 15, fontWeight: 500, color: t.textHi }}>No active transfers</div>
-            <div style={{ fontSize: 13, color: t.textMd, textAlign: 'center', maxWidth: 420, lineHeight: 1.6 }}>
-              Files you copy to or from a mounted drive will appear here.
-              Only transfers of 256 KB or larger are tracked.
+            <I.upload size={36} color={tok.textLo} />
+            <div style={{ fontSize: 15, fontWeight: 500, color: tok.textHi }}>{t('transfers.empty.title')}</div>
+            <div style={{ fontSize: 13, color: tok.textMd, textAlign: 'center', maxWidth: 420, lineHeight: 1.6 }}>
+              {t('transfers.empty.body')}
             </div>
           </div>
         ) : (
@@ -69,16 +70,16 @@ export const TransfersScreen: React.FC<TransfersScreenProps> = ({ theme }) => {
             <div style={{
               display: 'grid', gridTemplateColumns: '20px 1fr 90px 200px 80px',
               gap: 12, padding: '9px 20px',
-              borderBottom: `1px solid ${t.border}`,
+              borderBottom: `1px solid ${tok.border}`,
               fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.5,
-              color: t.textMd, textTransform: 'uppercase',
-              position: 'sticky', top: 0, background: t.bg, zIndex: 1,
+              color: tok.textMd, textTransform: 'uppercase',
+              position: 'sticky', top: 0, background: tok.bg, zIndex: 1,
             }}>
               <span />
-              <span>File</span>
-              <span>Size</span>
-              <span>Progress</span>
-              <span>Speed</span>
+              <span>{t('transfers.col.file')}</span>
+              <span>{t('transfers.col.size')}</span>
+              <span>{t('transfers.col.progress')}</span>
+              <span>{t('transfers.col.speed')}</span>
             </div>
 
             {transfers.map(xfer => {
@@ -101,55 +102,55 @@ export const TransfersScreen: React.FC<TransfersScreenProps> = ({ theme }) => {
                 <div key={xfer.id} style={{
                   display: 'grid', gridTemplateColumns: '20px 1fr 90px 200px 80px',
                   gap: 12, padding: '10px 20px', alignItems: 'center',
-                  borderBottom: `1px solid ${t.border}`,
+                  borderBottom: `1px solid ${tok.border}`,
                   opacity: isError ? 0.7 : 1,
                 }}>
                   {/* Direction icon */}
-                  <div style={{ color: isError ? t.danger : isActive ? t.lime : t.textLo }}>
+                  <div style={{ color: isError ? tok.danger : isActive ? tok.lime : tok.textLo }}>
                     {xfer.direction === 'upload'
-                      ? <I.upload size={13} color={isError ? t.danger : isActive ? t.lime : t.textLo} />
-                      : <I.download size={13} color={isError ? t.danger : isActive ? t.lime : t.textLo} />
+                      ? <I.upload size={13} color={isError ? tok.danger : isActive ? tok.lime : tok.textLo} />
+                      : <I.download size={13} color={isError ? tok.danger : isActive ? tok.lime : tok.textLo} />
                     }
                   </div>
 
                   {/* Filename */}
                   <div style={{
                     fontFamily: NC_FONT_UI, fontSize: 13,
-                    color: isError ? t.danger : t.textHi,
+                    color: isError ? tok.danger : tok.textHi,
                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                   }}>
                     {xfer.filename}
                     {isError && xfer.error && (
-                      <span style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: t.danger, marginLeft: 8 }}>
+                      <span style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: tok.danger, marginLeft: 8 }}>
                         {xfer.error}
                       </span>
                     )}
                   </div>
 
                   {/* Size */}
-                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd }}>
+                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: tok.textMd }}>
                     {formatBytes(xfer.total_bytes)}
                   </div>
 
                   {/* Progress bar + label */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     <div style={{
-                      height: 4, background: t.surface2, borderRadius: 2, overflow: 'hidden',
+                      height: 4, background: tok.surface2, borderRadius: 2, overflow: 'hidden',
                     }}>
                       <div style={{
                         height: '100%', borderRadius: 2,
                         width: `${pct}%`,
-                        background: isError ? t.danger : isDone ? t.textLo : t.lime,
+                        background: isError ? tok.danger : isDone ? tok.textLo : tok.lime,
                         transition: 'width 0.2s',
                       }} />
                     </div>
-                    <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, color: t.textMd }}>
-                      {isError ? 'FAILED' : isDone ? 'DONE' : `${Math.round(pct)}% · ${formatBytes(xfer.done_bytes)}`}
+                    <div style={{ fontFamily: NC_FONT_MONO, fontSize: 9, color: tok.textMd }}>
+                      {isError ? t('transfers.state.failed') : isDone ? t('transfers.state.done') : `${Math.round(pct)}% · ${formatBytes(xfer.done_bytes)}`}
                     </div>
                   </div>
 
                   {/* Speed */}
-                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: t.textLo }}>
+                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: tok.textLo }}>
                     {speed}
                   </div>
                 </div>

@@ -22,6 +22,7 @@ use tauri::State;
 use crate::{
     auth::require_auth,
     error::AppError,
+    license,
     state::AppState,
 };
 
@@ -33,6 +34,7 @@ pub async fn pin_file(
     key: String,
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
+    license::require_pro(&state.db)?;
     let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     db.execute(
         "INSERT OR IGNORE INTO pinned_keys (drive_id, key) VALUES (?1, ?2)",

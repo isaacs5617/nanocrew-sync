@@ -53,6 +53,7 @@ pub fn init(log_dir: &Path, verbose: bool) -> Option<WorkerGuard> {
         .with(EnvFilter::try_new(&filter_spec).unwrap_or_else(|_| EnvFilter::new("info")))
         .with(file_layer)
         .with(stderr_layer)
+        .with(sentry_tracing::layer())
         .try_init();
 
     match res {

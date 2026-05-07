@@ -16,6 +16,8 @@ import { OnboardingScreen } from './screens/OnboardingScreen.js';
 import { SetupScreen } from './screens/SetupScreen.js';
 import { AddDrivePickerScreen } from './screens/AddDrivePickerScreen.js';
 import { AddDriveS3Screen } from './screens/AddDriveS3Screen.js';
+import { AddDriveOneDriveScreen } from './screens/AddDriveOneDriveScreen.js';
+import { AddDriveGDriveScreen } from './screens/AddDriveGDriveScreen.js';
 import { LockScreen } from './screens/LockScreen.js';
 import { AuthContext } from './context/auth.js';
 import { TransfersProvider } from './context/transfers.js';
@@ -96,6 +98,24 @@ function ShellLayout({ theme, setTheme, token, onSignOut, version }: {
           onCancel={() => setRoute('/drives')}
         />
       );
+      case '/add-drive/gdrive':
+        return (
+          <AddDriveGDriveScreen
+            theme={theme}
+            onBack={() => setRoute('/add-drive')}
+            onCancel={() => setRoute('/drives')}
+            onDone={() => setRoute('/drives')}
+          />
+        );
+      case '/add-drive/onedrive':
+        return (
+          <AddDriveOneDriveScreen
+            theme={theme}
+            onBack={() => setRoute('/add-drive')}
+            onCancel={() => setRoute('/drives')}
+            onDone={() => setRoute('/drives')}
+          />
+        );
       default:
         // Any `/add-drive/<providerId>` route renders the generic S3 screen.
         // The screen handles "unknown provider" itself, so we just pass the id.

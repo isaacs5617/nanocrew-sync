@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { invoke } from '@tauri-apps/api/core';
@@ -28,7 +29,8 @@ function formatBytes(b: number) {
 }
 
 export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const { token } = useAuth();
   const [state, setState] = React.useState<UpdateState>({ kind: 'idle' });
 
@@ -73,16 +75,16 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
 
   const label = (() => {
     switch (state.kind) {
-      case 'idle':        return 'Check for updates';
-      case 'checking':    return 'Checking…';
-      case 'none':        return 'Check again';
-      case 'available':   return `Updating to ${state.version}…`;
+      case 'idle':        return t('update.checkForUpdates');
+      case 'checking':    return t('update.checking');
+      case 'none':        return t('update.checkAgain');
+      case 'available':   return t('update.updating', { version: state.version });
       case 'downloading': {
         const pct = state.total > 0 ? Math.round((state.downloaded / state.total) * 100) : 0;
-        return `Downloading ${pct}%`;
+        return t('update.downloading', { pct });
       }
-      case 'ready':       return 'Restarting…';
-      case 'error':       return 'Retry';
+      case 'ready':       return t('update.restarting');
+      case 'error':       return t('update.retry');
     }
   })();
 
@@ -92,15 +94,15 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
   const subtitle = (() => {
     switch (state.kind) {
       case 'idle':
-        return 'Check if a newer signed build is available.';
+        return t('settings.about.appUpdates.idle');
       case 'checking':
-        return 'Contacting update server…';
+        return t('settings.about.appUpdates.checking');
       case 'none':
-        return <span style={{ color: t.lime }}>You're on the latest version.</span>;
+        return <span style={{ color: tok.lime }}>{t('settings.about.appUpdates.upToDate')}</span>;
       case 'available':
         return (
           <span>
-            New version <strong style={{ color: t.textHi }}>{state.version}</strong> found — downloading…
+            New version <strong style={{ color: tok.textHi }}>{state.version}</strong> found — downloading…
           </span>
         );
       case 'downloading':
@@ -111,9 +113,9 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
           </span>
         );
       case 'ready':
-        return 'Update installed — relaunching.';
+        return t('settings.about.appUpdates.ready');
       case 'error':
-        return <span style={{ color: t.danger }}>{state.message}</span>;
+        return <span style={{ color: tok.danger }}>{state.message}</span>;
     }
   })();
 
@@ -125,19 +127,19 @@ export const UpdateButton: React.FC<{ theme: Theme }> = ({ theme }) => {
     <div style={{ marginTop: 14 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Application updates</div>
-          <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>{subtitle}</div>
+          <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{t('settings.about.appUpdates')}</div>
+          <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>{subtitle}</div>
         </div>
         <NCBtn theme={theme} small ghost onClick={check_} disabled={busy}>{label}</NCBtn>
       </div>
       {showFallback && (
-        <div style={{ marginTop: 6, fontSize: 11, color: t.textLo }}>
-          Update not working?{' '}
+        <div style={{ marginTop: 6, fontSize: 11, color: tok.textLo }}>
+          {t('update.fallback')}{' '}
           <span
             onClick={openReleases}
-            style={{ color: t.lime, cursor: 'pointer', textDecoration: 'underline' }}
+            style={{ color: tok.lime, cursor: 'pointer', textDecoration: 'underline' }}
           >
-            Download manually from GitHub
+            {t('update.downloadManually')}
           </span>
         </div>
       )}

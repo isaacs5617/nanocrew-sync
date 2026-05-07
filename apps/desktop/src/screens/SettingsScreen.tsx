@@ -1,7 +1,9 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { appDataDir, join } from '@tauri-apps/api/path';
+import * as Sentry from '@sentry/react';
 import {
   getTokens, NC_FONT_MONO,
   NCCard, NCEyebrow, NCLabel, NCToggle, NCBtn,
@@ -25,7 +27,8 @@ const ToggleRow: React.FC<{
 }> = ({
   label, sub, on, theme, comingSoon, onChange,
 }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const [v, setV] = React.useState(comingSoon ? false : (on ?? false));
   // Keep internal state in sync when `on` prop changes (controlled-ish).
   React.useEffect(() => { if (!comingSoon && on !== undefined) setV(on); }, [on, comingSoon]);
@@ -38,16 +41,16 @@ const ToggleRow: React.FC<{
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, opacity: comingSoon ? 0.55 : 1 }}>
       <div style={{ flex: 1 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>{label}</div>
+          <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{label}</div>
           {comingSoon && (
             <span style={{
               fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.2,
-              color: t.textLo, background: t.surface2,
+              color: tok.textLo, background: tok.surface2,
               padding: '2px 6px', borderRadius: 2,
-            }}>COMING SOON</span>
+            }}>{t('settings.comingSoon')}</span>
           )}
         </div>
-        {sub && <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>{sub}</div>}
+        {sub && <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>{sub}</div>}
       </div>
       <NCToggle on={v} onChange={handle} theme={theme} />
     </div>
@@ -99,7 +102,7 @@ const PrefInput: React.FC<{
   prefKey: string; label: string; sub?: string;
   placeholder?: string; mono?: boolean;
 }> = ({ theme, token, prefKey, label, sub, placeholder, mono }) => {
-  const t = getTokens(theme);
+  const tok = getTokens(theme);
   const [value, setValue] = React.useState<string>('');
   const [loaded, setLoaded] = React.useState(false);
 
@@ -120,8 +123,8 @@ const PrefInput: React.FC<{
 
   return (
     <div>
-      <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>{label}</div>
-      {sub && <div style={{ fontSize: 11, color: t.textMd, marginTop: 2, marginBottom: 8 }}>{sub}</div>}
+      <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{label}</div>
+      {sub && <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2, marginBottom: 8 }}>{sub}</div>}
       <input
         type="text"
         value={value}
@@ -130,10 +133,10 @@ const PrefInput: React.FC<{
         style={{
           width: '100%', boxSizing: 'border-box',
           padding: '10px 12px',
-          background: t.surface1,
-          border: `1px solid ${t.border}`,
+          background: tok.surface1,
+          border: `1px solid ${tok.border}`,
           borderRadius: 3, outline: 'none',
-          color: t.textHi, fontSize: 13,
+          color: tok.textHi, fontSize: 13,
           fontFamily: mono ? NC_FONT_MONO : undefined,
         }}
       />
@@ -144,6 +147,7 @@ const PrefInput: React.FC<{
 /// "Launch at Windows sign-in" toggle backed by the HKCU\...\Run registry
 /// key. Reads the current state on mount; writes through set_autostart.
 const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
+  const { t } = useTranslation();
   const [on, setOn] = React.useState<boolean | null>(null);
   React.useEffect(() => {
     invoke<boolean>('get_autostart', { token })
@@ -156,16 +160,16 @@ const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token 
     return (
       <ToggleRow
         theme={theme}
-        label="Launch NanoCrew Sync at Windows sign-in"
-        sub="Reconnect mounted drives automatically."
+        label={t('settings.startup.autostart.label')}
+        sub={t('settings.startup.autostartLoading.sub')}
       />
     );
   }
   return (
     <ToggleRow
       theme={theme}
-      label="Launch NanoCrew Sync at Windows sign-in"
-      sub="Reconnect mounted drives automatically. Current-user only — no admin rights needed."
+      label={t('settings.startup.autostart.label')}
+      sub={t('settings.startup.autostart.sub')}
       on={on}
       onChange={async (next) => {
         setOn(next);
@@ -185,7 +189,8 @@ const AutostartRow: React.FC<{ theme: Theme; token: string }> = ({ theme, token 
 /// offers an "Open folder" shortcut. Changes apply at next mount — we don't
 /// try to migrate existing cache files.
 const CacheLocationCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const [info, setInfo] = React.useState<{ effective: string; def: string; isCustom: boolean } | null>(null);
   const [reloadTick, setReloadTick] = React.useState(0);
 
@@ -204,30 +209,30 @@ const CacheLocationCard: React.FC<{ theme: Theme; token: string }> = ({ theme, t
 
   return (
     <NCCard theme={theme} pad={20}>
-      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Cache location</NCEyebrow>
-      <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
-        By default, NanoCrew Sync stores its on-disk cache under <span style={{ fontFamily: NC_FONT_MONO, color: t.textHi }}>%LOCALAPPDATA%\NanoCrew\Sync\cache</span>. Override this to move the cache to a larger or faster drive. Each mounted drive gets its own subfolder. <strong style={{ color: t.textHi }}>Changes apply at next mount</strong> — existing cached data is not migrated automatically.
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.cache.location')}</NCEyebrow>
+      <div style={{ fontSize: 13, color: tok.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+        {t('settings.cache.locationDesc')}
       </div>
       <PrefInput
         theme={theme} token={token}
         prefKey="cache_root"
-        label="Custom cache folder"
-        sub="Absolute path. Leave blank to use the default."
+        label={t('settings.cache.customFolder.label')}
+        sub={t('settings.cache.customFolder.sub')}
         placeholder={info?.def ?? 'C:\\Users\\…\\AppData\\Local\\NanoCrew\\Sync\\cache'}
         mono
       />
       <div style={{
         marginTop: 12, padding: '10px 12px',
-        background: t.surface1, border: `1px solid ${t.border}`, borderRadius: 3,
+        background: tok.surface1, border: `1px solid ${tok.border}`, borderRadius: 3,
         display: 'flex', alignItems: 'center', gap: 12,
       }}>
-        <I.drive size={14} color={info?.isCustom ? t.lime : t.textLo} />
+        <I.drive size={14} color={info?.isCustom ? tok.lime : tok.textLo} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.2, color: t.textLo, marginBottom: 2 }}>
-            {info?.isCustom ? 'CUSTOM · ACTIVE' : 'DEFAULT'}
+          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.2, color: tok.textLo, marginBottom: 2 }}>
+            {info?.isCustom ? t('settings.cache.statusCustom') : t('settings.cache.statusDefault')}
           </div>
           <div style={{
-            fontFamily: NC_FONT_MONO, fontSize: 12, color: t.textHi,
+            fontFamily: NC_FONT_MONO, fontSize: 12, color: tok.textHi,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>
             {info?.effective ?? '—'}
@@ -237,7 +242,7 @@ const CacheLocationCard: React.FC<{ theme: Theme; token: string }> = ({ theme, t
           theme={theme} small ghost
           onClick={() => info && invoke('open_path', { token, path: info.effective }).catch(() => {})}
         >
-          Open folder
+          {t('settings.cache.openFolder')}
         </NCBtn>
       </div>
     </NCCard>
@@ -255,7 +260,8 @@ interface LicenseStatus {
 }
 
 const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const [status, setStatus] = React.useState<LicenseStatus | null>(null);
   const [key, setKey] = React.useState('');
   const [busy, setBusy] = React.useState(false);
@@ -302,8 +308,8 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
   if (!status) {
     return (
       <NCCard theme={theme} pad={20}>
-        <NCEyebrow theme={theme}>License</NCEyebrow>
-        <div style={{ fontSize: 12, color: t.textMd, marginTop: 10 }}>Loading…</div>
+        <NCEyebrow theme={theme}>{t('settings.license.title')}</NCEyebrow>
+        <div style={{ fontSize: 12, color: tok.textMd, marginTop: 10 }}>{t('common.loading')}</div>
       </NCCard>
     );
   }
@@ -311,14 +317,14 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
   const isActive = status.key_id !== null;
   const tierLabel = status.tier.toUpperCase();
   const badgeColor =
-    status.tier === 'pro' || status.tier === 'team' ? t.lime
+    status.tier === 'pro' || status.tier === 'team' ? tok.lime
     : status.tier === 'trial' ? '#f6c744'
-    : t.textLo;
+    : tok.textLo;
 
   return (
     <NCCard theme={theme} pad={20}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-        <NCEyebrow theme={theme}>License</NCEyebrow>
+        <NCEyebrow theme={theme}>{t('settings.license.title')}</NCEyebrow>
         <span style={{
           fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.4,
           color: '#0A0A0A', background: badgeColor,
@@ -327,47 +333,47 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
       </div>
 
       {status.tier === 'trial' && (
-        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
-          Free trial — <strong>{status.days_remaining}</strong> {status.days_remaining === 1 ? 'day' : 'days'} remaining.
+        <div style={{ fontSize: 13, color: tok.textHi, marginBottom: 10 }}>
+          {t('settings.license.trialDays', { count: status.days_remaining })}
         </div>
       )}
       {status.tier === 'free' && (
-        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
-          Trial ended. Activate a license or continue on the free tier.
+        <div style={{ fontSize: 13, color: tok.textHi, marginBottom: 10 }}>
+          {t('settings.license.trialEnded')}
         </div>
       )}
       {isActive && (
-        <div style={{ fontSize: 13, color: t.textHi, marginBottom: 10 }}>
-          Thanks for supporting NanoCrew. {status.days_remaining > 0 && (
-            <span style={{ color: t.textMd }}>Expires in {status.days_remaining} days.</span>
+        <div style={{ fontSize: 13, color: tok.textHi, marginBottom: 10 }}>
+          {t('settings.license.thankYou')}{status.days_remaining > 0 && (
+            <span style={{ color: tok.textMd }}>{' '}{t('settings.license.expiresIn', { count: status.days_remaining })}</span>
           )}
         </div>
       )}
 
       {isActive ? (
-        <div style={{ display: 'grid', gap: 6, fontSize: 12, color: t.textMd, marginBottom: 14 }}>
-          <div><span style={{ color: t.textLo }}>Key ID:</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.key_id}</span></div>
-          {status.email && <div><span style={{ color: t.textLo }}>Email:</span> {status.email}</div>}
-          <div><span style={{ color: t.textLo }}>This machine:</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span></div>
+        <div style={{ display: 'grid', gap: 6, fontSize: 12, color: tok.textMd, marginBottom: 14 }}>
+          <div><span style={{ color: tok.textLo }}>{t('settings.license.keyId')}</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.key_id}</span></div>
+          {status.email && <div><span style={{ color: tok.textLo }}>{t('settings.license.email')}</span> {status.email}</div>}
+          <div><span style={{ color: tok.textLo }}>{t('settings.license.thisMachine')}</span> <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span></div>
         </div>
       ) : (
         <>
-          <NCLabel theme={theme}>License key</NCLabel>
+          <NCLabel theme={theme}>{t('settings.license.keyLabel')}</NCLabel>
           <textarea
             value={key}
             onChange={e => setKey(e.target.value)}
-            placeholder="Paste your license JWT here…"
+            placeholder={t('settings.license.keyPlaceholder')}
             rows={3}
             style={{
               width: '100%', boxSizing: 'border-box', resize: 'vertical',
               fontFamily: NC_FONT_MONO, fontSize: 11,
-              background: t.surface2, color: t.textHi,
-              border: `1px solid ${t.border}`, borderRadius: 3,
+              background: tok.surface2, color: tok.textHi,
+              border: `1px solid ${tok.border}`, borderRadius: 3,
               padding: '8px 10px', marginTop: 6, marginBottom: 10,
             }}
           />
-          <div style={{ fontSize: 11, color: t.textLo, marginBottom: 10 }}>
-            This machine: <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span>
+          <div style={{ fontSize: 11, color: tok.textLo, marginBottom: 10 }}>
+            {t('settings.license.thisMachine')} <span style={{ fontFamily: NC_FONT_MONO }}>{status.machine_fingerprint_short}…</span>
           </div>
         </>
       )}
@@ -383,11 +389,11 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         {isActive ? (
           <NCBtn theme={theme} small ghost onClick={deactivate} disabled={busy}>
-            {busy ? 'Working…' : 'Deactivate'}
+            {busy ? t('settings.license.deactivating') : t('settings.license.deactivate')}
           </NCBtn>
         ) : (
           <NCBtn theme={theme} small onClick={activate} disabled={busy || !key.trim()}>
-            {busy ? 'Activating…' : 'Activate'}
+            {busy ? t('settings.license.activating') : t('settings.license.activate')}
           </NCBtn>
         )}
         {!status.is_pro && (
@@ -395,7 +401,7 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
             theme={theme} small ghost
             onClick={() => invoke('open_path', { token, path: 'https://nanocrew.dev/buy' }).catch(() => {})}
           >
-            Upgrade to Pro
+            {t('settings.license.upgradePro')}
           </NCBtn>
         )}
       </div>
@@ -404,26 +410,28 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
 };
 
 const PlaceholderSection: React.FC<{ title: string; body: string; theme: Theme }> = ({ title, body, theme }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   return (
     <NCCard theme={theme} pad={24} style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
-      <I.settings size={20} color={t.textLo} style={{ marginTop: 2, flexShrink: 0 }} />
+      <I.settings size={20} color={tok.textLo} style={{ marginTop: 2, flexShrink: 0 }} />
       <div>
-        <div style={{ fontSize: 14, fontWeight: 600, color: t.textHi, marginBottom: 6 }}>{title}</div>
-        <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.55 }}>{body}</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: tok.textHi, marginBottom: 6 }}>{title}</div>
+        <div style={{ fontSize: 13, color: tok.textMd, lineHeight: 1.55 }}>{body}</div>
         <div style={{
           marginTop: 12, display: 'inline-block',
           fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.5,
-          color: t.textLo, background: t.surface2,
+          color: tok.textLo, background: tok.surface2,
           padding: '4px 8px', borderRadius: 2,
-        }}>COMING IN A FUTURE RELEASE</div>
+        }}>{t('settings.comingInFutureRelease')}</div>
       </div>
     </NCCard>
   );
 };
 
 const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const [winfspStatus, setWinfspStatus] = React.useState<'checking' | 'installed' | 'missing'>('checking');
 
   React.useEffect(() => {
@@ -434,12 +442,12 @@ const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, tok
 
   return <>
     <NCCard theme={theme} pad={20}>
-      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Logging</NCEyebrow>
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.advanced.logging')}</NCEyebrow>
       <PrefToggle
         theme={theme} token={token}
         prefKey="verbose_logging"
-        label="Enable verbose logging"
-        sub="Writes detailed (debug-level) logs to %APPDATA%\NanoCrew\Sync\logs. Takes effect on next launch."
+        label={t('settings.advanced.verboseLogging.label')}
+        sub={t('settings.advanced.verboseLogging.sub')}
       />
       <div style={{ marginTop: 14, display: 'flex', gap: 10 }}>
         <NCBtn
@@ -454,26 +462,26 @@ const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, tok
             }
           }}
         >
-          Open log folder
+          {t('settings.advanced.openLogFolder')}
         </NCBtn>
       </div>
     </NCCard>
     <NCCard theme={theme} pad={20}>
-      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>WinFsp</NCEyebrow>
-      <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.55, marginBottom: 14 }}>
-        NanoCrew Sync uses WinFsp to mount cloud buckets as Windows drive letters. WinFsp is installed automatically alongside NanoCrew Sync.
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.advanced.winfsp')}</NCEyebrow>
+      <div style={{ fontSize: 13, color: tok.textMd, lineHeight: 1.55, marginBottom: 14 }}>
+        {t('settings.advanced.winfspDesc')}
       </div>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 12,
-        padding: '10px 14px', background: t.surface1,
-        border: `1px solid ${winfspStatus === 'missing' ? t.danger : t.border}`,
+        padding: '10px 14px', background: tok.surface1,
+        border: `1px solid ${winfspStatus === 'missing' ? tok.danger : tok.border}`,
         borderRadius: 3, marginBottom: 10,
       }}>
-        <I.drive size={16} color={winfspStatus === 'installed' ? t.lime : winfspStatus === 'missing' ? t.danger : t.textMd} />
+        <I.drive size={16} color={winfspStatus === 'installed' ? tok.lime : winfspStatus === 'missing' ? tok.danger : tok.textMd} />
         <div style={{ flex: 1 }}>
-          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 12, color: t.textHi }}>WinFsp</div>
-          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: winfspStatus === 'installed' ? t.lime : winfspStatus === 'missing' ? t.danger : t.textLo, letterSpacing: 1, marginTop: 2 }}>
-            {winfspStatus === 'checking' ? 'CHECKING…' : winfspStatus === 'installed' ? 'INSTALLED · READY' : 'NOT DETECTED'}
+          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 12, color: tok.textHi }}>WinFsp</div>
+          <div style={{ fontFamily: NC_FONT_MONO, fontSize: 10, color: winfspStatus === 'installed' ? tok.lime : winfspStatus === 'missing' ? tok.danger : tok.textLo, letterSpacing: 1, marginTop: 2 }}>
+            {winfspStatus === 'checking' ? t('settings.advanced.winfspChecking') : winfspStatus === 'installed' ? t('settings.advanced.winfspInstalled') : t('settings.advanced.winfspMissing')}
           </div>
         </div>
         {winfspStatus !== 'installed' && (
@@ -481,21 +489,35 @@ const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, tok
             theme={theme} small ghost
             onClick={() => invoke('open_path', { token, path: 'https://winfsp.dev/rel/' })}
           >
-            Download
+            {t('settings.advanced.winfspDownload')}
           </NCBtn>
         )}
       </div>
       {winfspStatus === 'missing' && (
-        <div style={{ fontSize: 12, color: t.textMd, lineHeight: 1.55 }}>
-          WinFsp was not found on this machine. Download and install it, then restart NanoCrew Sync. Drive mounting will not work until WinFsp is installed.
+        <div style={{ fontSize: 12, color: tok.textMd, lineHeight: 1.55 }}>
+          {t('settings.advanced.winfspMissingDesc')}
         </div>
       )}
+    </NCCard>
+    <NCCard theme={theme} pad={20}>
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.advanced.crashReporting')}</NCEyebrow>
+      <PrefToggle
+        theme={theme} token={token}
+        prefKey="telemetry_enabled"
+        defaultOn
+        label={t('settings.advanced.crashReporting.label')}
+        sub={t('settings.advanced.crashReporting.sub')}
+        onAfterChange={(enabled) => {
+          if (!enabled) Sentry.close().catch(() => {});
+        }}
+      />
     </NCCard>
   </>;
 };
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme }) => {
-  const t = getTokens(theme);
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
   const { token } = useAuth();
   const [activeSection, setActiveSection] = React.useState('General');
   const [cacheCleared, setCacheCleared] = React.useState(false);
@@ -509,57 +531,71 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
       setTimeout(() => setCacheCleared(false), 3000);
     } catch {}
   };
-  const sections = ['General', 'Drives', 'Network', 'Cache & storage', 'Security', 'Notifications', 'Advanced', 'About'];
+
+  const sections = [
+    { key: 'General',         label: t('settings.section.general') },
+    { key: 'Drives',          label: t('settings.section.drives') },
+    { key: 'Network',         label: t('settings.section.network') },
+    { key: 'Cache & storage', label: t('settings.section.cacheStorage') },
+    { key: 'Security',        label: t('settings.section.security') },
+    { key: 'Notifications',   label: t('settings.section.notifications') },
+    { key: 'Advanced',        label: t('settings.section.advanced') },
+    { key: 'About',           label: t('settings.section.about') },
+  ];
 
   const renderContent = () => {
     switch (activeSection) {
       case 'General':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Startup</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.startup.title')}</NCEyebrow>
             <AutostartRow theme={theme} token={token} />
             <Spacer />
             <PrefToggle
               theme={theme} token={token}
               prefKey="start_minimized"
-              label="Start minimized to system tray"
-              sub="Launch into the tray on startup — the window stays hidden until you click the tray icon."
+              label={t('settings.startup.startMinimized.label')}
+              sub={t('settings.startup.startMinimized.sub')}
             />
             <Spacer />
             <PrefToggle
               theme={theme} token={token}
               prefKey="auto_update_check"
               defaultOn
-              label="Check for updates automatically"
-              sub="Check Cortex Labs for new releases at launch. Installs still require your confirmation."
+              label={t('settings.startup.autoUpdateCheck.label')}
+              sub={t('settings.startup.autoUpdateCheck.sub')}
             />
           </NCCard>
 
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Appearance</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.appearance.title')}</NCEyebrow>
             <div style={{ marginBottom: 14 }}>
-              <NCLabel theme={theme}>Theme</NCLabel>
+              <NCLabel theme={theme}>{t('settings.appearance.theme')}</NCLabel>
               <div style={{ display: 'flex', gap: 8 }}>
-                {(['Dark', 'Light', 'Match system'] as const).map((v, i) => {
+                {([
+                  t('settings.appearance.themeDark'),
+                  t('settings.appearance.themeLight'),
+                  t('settings.appearance.themeSystem'),
+                ] as const).map((v, i) => {
                   const active = (theme === 'dark' && i === 0) || (theme === 'light' && i === 1);
                   return (
                     <div key={v}
                       onClick={() => i < 2 && setTheme(i === 0 ? 'dark' : 'light')}
                       style={{
                         flex: 1, padding: '10px 12px', textAlign: 'center',
-                        background: active ? t.limeSoft : t.surface1,
-                        border: `1px solid ${active ? t.lime : t.border}`,
-                        borderRadius: 3, color: t.textHi, fontSize: 13, fontWeight: 500, cursor: 'pointer',
+                        background: active ? tok.limeSoft : tok.surface1,
+                        border: `1px solid ${active ? tok.lime : tok.border}`,
+                        borderRadius: 3, color: tok.textHi, fontSize: 13, fontWeight: 500, cursor: 'pointer',
                       }}>{v}</div>
                   );
                 })}
               </div>
             </div>
             <div>
-              <NCLabel theme={theme}>Accent color</NCLabel>
+              <NCLabel theme={theme}>{t('settings.appearance.accentColor')}</NCLabel>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <div style={{ width: 28, height: 28, borderRadius: 3, background: t.lime, border: `1px solid ${t.lime}` }} />
-                <span style={{ fontFamily: NC_FONT_MONO, fontSize: 12, color: t.textHi }}>
+                <div style={{ width: 28, height: 28, borderRadius: 3, background: tok.lime, border: `1px solid ${tok.lime}` }} />
+                <span style={{ fontFamily: NC_FONT_MONO, fontSize: 12, color: tok.textHi }}>
                   {theme === 'dark' ? '#C8FF00 · CORTEX LIME' : '#3A5200 · OLIVE'}
                 </span>
               </div>
@@ -567,22 +603,22 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
           </NCCard>
 
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Language & region</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.language.title')}</NCEyebrow>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               {[
-                { label: 'Language', value: 'English (South Africa)' },
-                { label: 'Default region', value: 'af-south-1', mono: true },
+                { label: t('settings.language.language'), value: 'English (South Africa)' },
+                { label: t('settings.language.defaultRegion'), value: 'af-south-1', mono: true },
               ].map((f, i) => (
                 <div key={i}>
                   <NCLabel theme={theme}>{f.label}</NCLabel>
                   <div style={{
                     display: 'flex', alignItems: 'center', padding: '10px 12px',
-                    background: t.surface1, border: `1px solid ${t.border}`, borderRadius: 3,
-                    fontSize: 13, color: t.textHi,
+                    background: tok.surface1, border: `1px solid ${tok.border}`, borderRadius: 3,
+                    fontSize: 13, color: tok.textHi,
                     fontFamily: f.mono ? NC_FONT_MONO : undefined,
                   }}>
                     <span style={{ flex: 1 }}>{f.value}</span>
-                    <I.chevD size={13} color={t.textMd} />
+                    <I.chevD size={13} color={tok.textMd} />
                   </div>
                 </div>
               ))}
@@ -593,73 +629,73 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
       case 'Drives':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Defaults for new drives</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.drives.defaults')}</NCEyebrow>
             <PrefToggle
               theme={theme} token={token}
               prefKey="default_auto_mount" defaultOn
-              label="Auto-mount on startup"
-              sub="Pre-selects the auto-mount toggle for new drives added via Add Drive."
+              label={t('settings.drives.autoMount.label')}
+              sub={t('settings.drives.autoMount.sub')}
             />
             <Spacer />
             <PrefToggle
               theme={theme} token={token}
               prefKey="default_readonly"
-              label="Read-only by default"
-              sub="Pre-selects read-only for new drives. Prevents accidental writes."
+              label={t('settings.drives.readonly.label')}
+              sub={t('settings.drives.readonly.sub')}
             />
           </NCCard>
           <PlaceholderSection
             theme={theme}
-            title="Per-drive overrides"
-            body="Set cache quotas, bandwidth limits, and sync schedules per drive. Individual drive settings are configured from the drive's context menu on the Drives screen."
+            title={t('settings.drives.perDriveOverrides.title')}
+            body={t('settings.drives.perDriveOverrides.body')}
           />
         </>;
 
       case 'Network':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Bandwidth</NCEyebrow>
-            <div style={{ fontSize: 12, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
-              Global caps in megabytes per second. Applied at chunk boundaries — a blank field or <span style={{ fontFamily: NC_FONT_MONO }}>0</span> means unlimited. Remount a drive to pick up changes.
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.network.bandwidth')}</NCEyebrow>
+            <div style={{ fontSize: 12, color: tok.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+              {t('settings.network.bandwidthDesc')}
             </div>
             <PrefInput
               theme={theme} token={token}
               prefKey="upload_rate_mbps"
-              label="Upload limit (MB/s)"
-              sub="Throttle uploads so NanoCrew Sync doesn't saturate your connection. Decimals OK (e.g. 0.5)."
-              placeholder="0 (unlimited)"
+              label={t('settings.network.uploadLimit.label')}
+              sub={t('settings.network.uploadLimit.sub')}
+              placeholder={t('settings.network.uploadLimit.placeholder')}
               mono
             />
             <Spacer />
             <PrefInput
               theme={theme} token={token}
               prefKey="download_rate_mbps"
-              label="Download limit (MB/s)"
-              sub="Throttle range reads. Useful on metered connections."
-              placeholder="0 (unlimited)"
+              label={t('settings.network.downloadLimit.label')}
+              sub={t('settings.network.downloadLimit.sub')}
+              placeholder={t('settings.network.downloadLimit.placeholder')}
               mono
             />
           </NCCard>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Proxy & TLS</NCEyebrow>
-            <div style={{ fontSize: 12, color: t.textMd, lineHeight: 1.55, marginBottom: 16 }}>
-              Route all S3 traffic through a corporate HTTPS proxy and/or trust an extra root CA certificate. Changes apply to new mounts and test connections — remount a drive to pick them up.
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.network.proxyTls')}</NCEyebrow>
+            <div style={{ fontSize: 12, color: tok.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+              {t('settings.network.proxyTlsDesc')}
             </div>
             <PrefInput
               theme={theme} token={token}
               prefKey="proxy_url"
-              label="HTTPS proxy"
-              sub="e.g. http://proxy.corp:8080 or http://user:pass@proxy.corp:8080. Leave blank to connect directly."
-              placeholder="http://proxy.example.com:8080"
+              label={t('settings.network.proxy.label')}
+              sub={t('settings.network.proxy.sub')}
+              placeholder={t('settings.network.proxy.placeholder')}
               mono
             />
             <Spacer />
             <PrefInput
               theme={theme} token={token}
               prefKey="custom_ca_pem_path"
-              label="Custom CA certificate (PEM)"
-              sub="Absolute path to a .pem file containing one or more trusted root certificates. Added alongside OS roots and SSL_CERT_FILE."
-              placeholder="C:\\path\\to\\corp-root-ca.pem"
+              label={t('settings.network.ca.label')}
+              sub={t('settings.network.ca.sub')}
+              placeholder={t('settings.network.ca.placeholder')}
               mono
             />
           </NCCard>
@@ -668,25 +704,25 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
       case 'Cache & storage':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Local cache</NCEyebrow>
-            <div style={{ fontSize: 13, color: t.textMd, marginBottom: 14, lineHeight: 1.55 }}>
-              NanoCrew Sync keeps a per-drive on-disk cache of recently read byte ranges. Hits are served without touching the network; misses are fetched from S3 and written to disk for next time. The size cap is configured per drive on the Drives screen; pinned files are exempt from eviction.
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.cache.localCache')}</NCEyebrow>
+            <div style={{ fontSize: 13, color: tok.textMd, marginBottom: 14, lineHeight: 1.55 }}>
+              {t('settings.cache.localCacheDesc')}
             </div>
             <PrefToggle
               theme={theme} token={token}
               prefKey="cache_enabled" defaultOn
-              label="Enable on-disk range cache"
-              sub="When off, every read fetches bytes from S3 even if they're already on disk. Applies at next mount."
+              label={t('settings.cache.enable.label')}
+              sub={t('settings.cache.enable.sub')}
             />
             <Spacer />
             <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 4 }}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Clear all cached data</div>
-                <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>
-                  {cacheCleared ? <span style={{ color: t.lime }}>Cache cleared.</span> : 'Mounted drives will re-fetch metadata on next access.'}
+                <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{t('settings.cache.clearAll.label')}</div>
+                <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>
+                  {cacheCleared ? <span style={{ color: tok.lime }}>{t('settings.cache.cleared')}</span> : t('settings.cache.clearAll.sub')}
                 </div>
               </div>
-              <NCBtn theme={theme} small ghost onClick={handleClearCache}>Clear cache</NCBtn>
+              <NCBtn theme={theme} small ghost onClick={handleClearCache}>{t('settings.cache.clearBtn')}</NCBtn>
             </div>
           </NCCard>
           <CacheLocationCard theme={theme} token={token} />
@@ -695,26 +731,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
       case 'Security':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Session</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.security.session')}</NCEyebrow>
             <PrefToggle
               theme={theme} token={token}
               prefKey="lock_on_session_lock"
-              label="Require password after Windows lock"
-              sub="Re-authenticate when Windows resumes from sleep or the Win+L lock screen."
+              label={t('settings.security.lockOnWindowsLock.label')}
+              sub={t('settings.security.lockOnWindowsLock.sub')}
             />
             <Spacer />
             <ToggleRow
               theme={theme}
-              label="Lock app when minimized"
-              sub="Require your password to unlock. Drives stay mounted — files stay accessible in Explorer."
+              label={t('settings.security.lockOnMinimize.label')}
+              sub={t('settings.security.lockOnMinimize.sub')}
               on={readLockOnMinimize()}
               onChange={writeLockOnMinimize}
             />
           </NCCard>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Credential storage</NCEyebrow>
-            <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.55 }}>
-              S3 secret keys are stored in the <strong style={{ color: t.textHi }}>local SQLite database</strong> in your user app-data directory, protected by Windows file-system permissions. Your admin password is hashed with <strong style={{ color: t.textHi }}>Argon2id</strong> and never stored in plaintext.
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.security.credentialStorage')}</NCEyebrow>
+            <div style={{ fontSize: 13, color: tok.textMd, lineHeight: 1.55 }}>
+              {t('settings.security.credentialStorageDesc')}
             </div>
           </NCCard>
         </>;
@@ -722,29 +758,29 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
       case 'Notifications':
         return <>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>System notifications</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.notifications.system')}</NCEyebrow>
             <PrefToggle
               theme={theme} token={token}
               prefKey="notify_mount_events" defaultOn
-              label="Drive mounted / unmounted"
-              sub="Native Windows toast when a drive becomes available or is unmounted."
+              label={t('settings.notifications.mountEvents.label')}
+              sub={t('settings.notifications.mountEvents.sub')}
             />
             <Spacer />
             <PrefToggle
               theme={theme} token={token}
               prefKey="notify_errors" defaultOn
-              label="Errors (mount + upload)"
-              sub="Surface WinFsp mount failures and upload errors as toasts."
+              label={t('settings.notifications.errors.label')}
+              sub={t('settings.notifications.errors.sub')}
             />
             <Spacer />
             <PrefToggle
               theme={theme} token={token}
               prefKey="notify_uploads"
-              label="Upload completed"
-              sub="Off by default — large file transfers can get noisy."
+              label={t('settings.notifications.uploads.label')}
+              sub={t('settings.notifications.uploads.sub')}
             />
             <Spacer />
-            <ToggleRow theme={theme} label="Low disk space warning" comingSoon />
+            <ToggleRow theme={theme} label={t('settings.notifications.lowDisk.label')} comingSoon />
           </NCCard>
         </>;
 
@@ -758,24 +794,24 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             <div style={{ display: 'flex', gap: 20, alignItems: 'center', marginBottom: 20 }}>
               <div style={{
                 width: 56, height: 56, borderRadius: 6,
-                background: t.lime, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: tok.lime, display: 'flex', alignItems: 'center', justifyContent: 'center',
               }}>
                 <I.cloud size={28} color="#0A0A0A" />
               </div>
               <div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: t.textHi, letterSpacing: -0.5 }}>NanoCrew Sync</div>
-                <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd, letterSpacing: 1, marginTop: 4 }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: tok.textHi, letterSpacing: -0.5 }}>{t('settings.about.title')}</div>
+                <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: tok.textMd, letterSpacing: 1, marginTop: 4 }}>
                   VERSION {appVersion || '0.1.0'} · EARLY ACCESS
                 </div>
               </div>
             </div>
-            <div style={{ fontSize: 13, color: t.textMd, lineHeight: 1.6 }}>
+            <div style={{ fontSize: 13, color: tok.textMd, lineHeight: 1.6 }}>
               Mount S3-compatible cloud storage (Wasabi, Amazon S3, Backblaze B2) as local Windows drive letters. No subscriptions. No data routing. Your credentials stay on your machine.
             </div>
             <UpdateButton theme={theme} />
           </NCCard>
           <NCCard theme={theme} pad={20}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Built with</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.about.builtWith')}</NCEyebrow>
             {[
               ['Tauri 2', 'Rust + WebView2 desktop shell'],
               ['WinFsp', 'User-mode Windows filesystem driver'],
@@ -784,10 +820,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
             ].map(([name, desc]) => (
               <div key={name} style={{
                 display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
-                padding: '8px 0', borderBottom: `1px solid ${t.border}`,
+                padding: '8px 0', borderBottom: `1px solid ${tok.border}`,
               }}>
-                <span style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>{name}</span>
-                <span style={{ fontSize: 12, color: t.textMd, fontFamily: NC_FONT_MONO }}>{desc}</span>
+                <span style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{name}</span>
+                <span style={{ fontSize: 12, color: tok.textMd, fontFamily: NC_FONT_MONO }}>{desc}</span>
               </div>
             ))}
           </NCCard>
@@ -802,20 +838,20 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
     <>
       <TopBar
         theme={theme}
-        crumbs={['Settings']}
-        title="Preferences"
-        subtitle="Local settings · stored in Windows Credential Manager and app data directory"
+        crumbs={[t('settings.title')]}
+        title={t('settings.title')}
+        subtitle={t('settings.subtitle')}
       />
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        <div style={{ width: 200, borderRight: `1px solid ${t.border}`, padding: '20px 0', flexShrink: 0 }}>
-          {sections.map((n) => (
-            <div key={n} onClick={() => setActiveSection(n)} style={{
+        <div style={{ width: 200, borderRight: `1px solid ${tok.border}`, padding: '20px 0', flexShrink: 0 }}>
+          {sections.map(({ key: sKey, label }) => (
+            <div key={sKey} onClick={() => setActiveSection(sKey)} style={{
               padding: '8px 20px', fontSize: 13,
-              color: n === activeSection ? t.textHi : t.textMd,
-              background: n === activeSection ? t.surface2 : 'transparent',
-              borderLeft: `2px solid ${n === activeSection ? t.lime : 'transparent'}`,
-              fontWeight: n === activeSection ? 500 : 400, cursor: 'pointer',
-            }}>{n}</div>
+              color: sKey === activeSection ? tok.textHi : tok.textMd,
+              background: sKey === activeSection ? tok.surface2 : 'transparent',
+              borderLeft: `2px solid ${sKey === activeSection ? tok.lime : 'transparent'}`,
+              fontWeight: sKey === activeSection ? 500 : 400, cursor: 'pointer',
+            }}>{label}</div>
           ))}
         </div>
 

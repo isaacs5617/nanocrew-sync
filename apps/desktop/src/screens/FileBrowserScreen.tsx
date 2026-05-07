@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import {
   getTokens, NC_FONT_MONO, NC_FONT_UI,
@@ -65,7 +66,8 @@ interface FileBrowserScreenProps {
 }
 
 export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) => {
-  const t = getTokens(theme);
+  const tok = getTokens(theme);
+  const { t } = useTranslation();
   const { token } = useAuth();
 
   const [drives, setDrives] = React.useState<Drive[]>([]);
@@ -205,7 +207,7 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
     const trimmed = value.trim();
     if (!trimmed || trimmed === entry.name) { setRenaming(null); return; }
     if (trimmed.includes('/') || trimmed.includes('\\')) {
-      setError('Name must not contain slashes.'); setRenaming(null); return;
+      setError(t('fileBrowser.errors.nameSlash')); setRenaming(null); return;
     }
     setError(null);
     try {
@@ -274,12 +276,12 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   }
 
   const titleCrumbs = selectedDrive
-    ? ['Files', `${selectedDrive.letter} ${selectedDrive.name}`]
-    : ['Files'];
+    ? [t('fileBrowser.crumb'), `${selectedDrive.letter} ${selectedDrive.name}`]
+    : [t('fileBrowser.crumb')];
 
   const subtitle = selectedDrive
     ? `${selectedDrive.bucket} · ${selectedDrive.region} · ${entries.length} item${entries.length !== 1 ? 's' : ''}`
-    : 'Select a mounted drive';
+    : t('fileBrowser.subtitle');
 
   return (
     <>
@@ -287,8 +289,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         theme={theme}
         crumbs={titleCrumbs}
         title={selectedDrive
-          ? <>{selectedDrive.letter} <span style={{ color: t.lime }}>{selectedDrive.name}</span></>
-          : <>File <span style={{ color: t.lime }}>Browser</span></>
+          ? <>{selectedDrive.letter} <span style={{ color: tok.lime }}>{selectedDrive.name}</span></>
+          : <>{t('fileBrowser.title')} <span style={{ color: tok.lime }}>{t('fileBrowser.titleAccent')}</span></>
         }
         subtitle={subtitle}
         actions={<>
@@ -296,12 +298,12 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
             <NCBtn
               theme={theme} small ghost iconLeft={<I.folder size={13} />}
               onClick={() => { setShowNewFolder(true); setNewFolderName(''); }}
-            >New Folder</NCBtn>
+            >{t('fileBrowser.newFolder')}</NCBtn>
           )}
           <NCBtn
             theme={theme} small iconLeft={<I.refresh size={13} />}
             onClick={() => setRefreshKey(k => k + 1)}
-          >Refresh</NCBtn>
+          >{t('fileBrowser.refresh')}</NCBtn>
         </>}
       />
 
@@ -309,8 +311,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         {/* Toolbar */}
         <div style={{
           display: 'flex', alignItems: 'center', gap: 10,
-          padding: '10px 20px', borderBottom: `1px solid ${t.border}`,
-          background: t.surface1, flexShrink: 0,
+          padding: '10px 20px', borderBottom: `1px solid ${tok.border}`,
+          background: tok.surface1, flexShrink: 0,
         }}>
           {/* Drive selector */}
           {drives.length > 1 && (
@@ -321,8 +323,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                 if (d) changeDrive(d);
               }}
               style={{
-                background: t.surface2, border: `1px solid ${t.border}`,
-                color: t.textHi, fontFamily: NC_FONT_MONO, fontSize: 12,
+                background: tok.surface2, border: `1px solid ${tok.border}`,
+                color: tok.textHi, fontFamily: NC_FONT_MONO, fontSize: 12,
                 borderRadius: 3, padding: '5px 8px', outline: 'none', cursor: 'pointer',
               }}
             >
@@ -342,17 +344,17 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           {/* Breadcrumb path bar */}
           <div style={{
             flex: 1, display: 'flex', alignItems: 'center', gap: 4,
-            padding: '5px 10px', background: t.bg,
-            border: `1px solid ${t.border}`, borderRadius: 3,
+            padding: '5px 10px', background: tok.bg,
+            border: `1px solid ${tok.border}`, borderRadius: 3,
             fontFamily: NC_FONT_MONO, fontSize: 12, overflow: 'hidden',
           }}>
             {breadcrumbs.map((bc, i) => (
               <React.Fragment key={i}>
-                {i > 0 && <span style={{ color: t.textFaint }}>\</span>}
+                {i > 0 && <span style={{ color: tok.textFaint }}>\</span>}
                 <span
                   onClick={() => setPrefix(bc.prefix)}
                   style={{
-                    color: i === breadcrumbs.length - 1 ? t.textHi : t.lime,
+                    color: i === breadcrumbs.length - 1 ? tok.textHi : tok.lime,
                     cursor: i === breadcrumbs.length - 1 ? 'default' : 'pointer',
                     whiteSpace: 'nowrap',
                   }}
@@ -366,10 +368,10 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         {showNewFolder && selectedDrive && (
           <div style={{
             display: 'flex', alignItems: 'center', gap: 8,
-            padding: '8px 20px', borderBottom: `1px solid ${t.border}`,
-            background: t.surface1, flexShrink: 0,
+            padding: '8px 20px', borderBottom: `1px solid ${tok.border}`,
+            background: tok.surface1, flexShrink: 0,
           }}>
-            <I.folder size={14} color={t.lime} />
+            <I.folder size={14} color={tok.lime} />
             <input
               autoFocus
               value={newFolderName}
@@ -378,17 +380,17 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                 if (e.key === 'Enter') createFolder();
                 if (e.key === 'Escape') setShowNewFolder(false);
               }}
-              placeholder="New folder name"
+              placeholder={t('fileBrowser.newFolderPlaceholder')}
               style={{
-                flex: 1, background: t.bg, border: `1px solid ${t.lime}`,
-                color: t.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
+                flex: 1, background: tok.bg, border: `1px solid ${tok.lime}`,
+                color: tok.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
                 borderRadius: 3, padding: '5px 10px', outline: 'none',
               }}
             />
             <NCBtn theme={theme} small primary disabled={creatingFolder || !newFolderName.trim()} onClick={createFolder}>
-              {creatingFolder ? 'Creating…' : 'Create'}
+              {creatingFolder ? t('fileBrowser.creating') : t('fileBrowser.create')}
             </NCBtn>
-            <NCBtn theme={theme} small ghost onClick={() => setShowNewFolder(false)}>Cancel</NCBtn>
+            <NCBtn theme={theme} small ghost onClick={() => setShowNewFolder(false)}>{t('common.cancel')}</NCBtn>
           </div>
         )}
 
@@ -397,10 +399,10 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           <div style={{
             flex: 1, display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center', gap: 12,
-            color: t.textMd, fontSize: 13,
+            color: tok.textMd, fontSize: 13,
           }}>
-            <I.cloud size={36} color={t.textLo} />
-            <div>No mounted drives. Mount a drive from the Drives tab first.</div>
+            <I.cloud size={36} color={tok.textLo} />
+            <div>{t('fileBrowser.noDrives')}</div>
           </div>
         )}
 
@@ -408,11 +410,11 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         {error && (
           <div style={{
             margin: '16px 20px', padding: '10px 14px',
-            background: `${t.danger}18`, border: `1px solid ${t.danger}50`,
-            borderRadius: 3, fontSize: 12, color: t.danger,
+            background: `${tok.danger}18`, border: `1px solid ${tok.danger}50`,
+            borderRadius: 3, fontSize: 12, color: tok.danger,
             display: 'flex', gap: 8, alignItems: 'center',
           }}>
-            <I.warn size={13} color={t.danger} style={{ flexShrink: 0 }} />
+            <I.warn size={13} color={tok.danger} style={{ flexShrink: 0 }} />
             {error}
           </div>
         )}
@@ -425,30 +427,30 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
               display: 'grid',
               gridTemplateColumns: '22px 1fr 110px 150px',
               gap: 14, padding: '9px 20px',
-              borderBottom: `1px solid ${t.border}`,
+              borderBottom: `1px solid ${tok.border}`,
               fontFamily: NC_FONT_MONO, fontSize: 9, letterSpacing: 1.5,
-              color: t.textMd, textTransform: 'uppercase',
-              position: 'sticky', top: 0, background: t.bg, zIndex: 1,
+              color: tok.textMd, textTransform: 'uppercase',
+              position: 'sticky', top: 0, background: tok.bg, zIndex: 1,
             }}>
               <span />
-              <span>Name</span>
-              <span>Size</span>
-              <span>Modified</span>
+              <span>{t('fileBrowser.col.name')}</span>
+              <span>{t('fileBrowser.col.size')}</span>
+              <span>{t('fileBrowser.col.modified')}</span>
             </div>
 
             {loading ? (
               <div style={{
                 padding: 40, textAlign: 'center',
-                fontFamily: NC_FONT_MONO, fontSize: 11, letterSpacing: 1.5, color: t.textLo,
+                fontFamily: NC_FONT_MONO, fontSize: 11, letterSpacing: 1.5, color: tok.textLo,
               }}>
-                LOADING…
+                {t('fileBrowser.loading')}
               </div>
             ) : entries.length === 0 ? (
               <div style={{
                 padding: 40, textAlign: 'center',
-                fontSize: 13, color: t.textMd,
+                fontSize: 13, color: tok.textMd,
               }}>
-                This folder is empty.
+                {t('fileBrowser.emptyFolder')}
               </div>
             ) : (
               entries.map((entry, i) => {
@@ -466,17 +468,17 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                     display: 'grid',
                     gridTemplateColumns: '22px 1fr 110px 150px',
                     gap: 14, padding: '9px 20px', alignItems: 'center',
-                    borderBottom: `1px solid ${t.border}`,
+                    borderBottom: `1px solid ${tok.border}`,
                     cursor: entry.is_dir ? 'pointer' : 'default',
                     background: 'transparent',
                     transition: 'background 0.1s',
                   }}
-                  onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+                  onMouseEnter={e => (e.currentTarget.style.background = tok.surface1)}
                   onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                 >
                   <FileIcon kind={inferKind(entry.name, entry.is_dir)} size={15} theme={theme} />
                   <div style={{
-                    fontSize: 13, color: entry.is_dir ? t.lime : t.textHi,
+                    fontSize: 13, color: entry.is_dir ? tok.lime : tok.textHi,
                     fontWeight: entry.is_dir ? 500 : 400,
                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                     fontFamily: NC_FONT_UI,
@@ -494,8 +496,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                         }}
                         onClick={e => e.stopPropagation()}
                         style={{
-                          background: t.surface2, border: `1px solid ${t.lime}`,
-                          color: t.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
+                          background: tok.surface2, border: `1px solid ${tok.lime}`,
+                          color: tok.textHi, fontFamily: NC_FONT_UI, fontSize: 13,
                           borderRadius: 3, padding: '2px 6px', outline: 'none',
                           width: '100%',
                         }}
@@ -505,8 +507,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                     )}
                     {isPinned && (
                       <span
-                        title="Pinned — kept on device"
-                        style={{ color: t.lime, fontSize: 11, flexShrink: 0 }}
+                        title={t('fileBrowser.pinned.tooltip')}
+                        style={{ color: tok.lime, fontSize: 11, flexShrink: 0 }}
                       >●</span>
                     )}
                     {lockInfo && (
@@ -514,16 +516,16 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
                         title={lockInfo.is_ours
                           ? `Locked by this machine (${lockInfo.owner})`
                           : `Locked by ${lockInfo.owner} on ${lockInfo.machine.slice(0, 8)}… — expires ${new Date(lockInfo.expires_at * 1000).toLocaleTimeString()}`}
-                        style={{ color: lockInfo.is_ours ? t.textMd : t.danger, fontSize: 11, flexShrink: 0, display: 'inline-flex' }}
+                        style={{ color: lockInfo.is_ours ? tok.textMd : tok.danger, fontSize: 11, flexShrink: 0, display: 'inline-flex' }}
                       >
                         <I.lock size={11} />
                       </span>
                     )}
                   </div>
-                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: t.textMd }}>
+                  <div style={{ fontFamily: NC_FONT_MONO, fontSize: 11, color: tok.textMd }}>
                     {entry.is_dir ? '—' : formatSize(entry.size)}
                   </div>
-                  <div style={{ fontSize: 12, color: t.textMd }}>
+                  <div style={{ fontSize: 12, color: tok.textMd }}>
                     {entry.is_dir ? '—' : formatDate(entry.modified)}
                   </div>
                 </div>
@@ -536,18 +538,18 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
         {/* Status footer */}
         {selectedDrive && !loading && (
           <div style={{
-            borderTop: `1px solid ${t.border}`, padding: '8px 20px',
+            borderTop: `1px solid ${tok.border}`, padding: '8px 20px',
             display: 'flex', alignItems: 'center', gap: 16,
             fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 0.5,
-            color: t.textMd, background: t.surface1, flexShrink: 0,
+            color: tok.textMd, background: tok.surface1, flexShrink: 0,
           }}>
             <span>
-              {entries.filter(e => e.is_dir).length} FOLDERS · {entries.filter(e => !e.is_dir).length} FILES
+              {entries.filter(e => e.is_dir).length} {t('fileBrowser.status.folders')} · {entries.filter(e => !e.is_dir).length} {t('fileBrowser.status.files')}
             </span>
             {prefix && (
               <>
-                <span style={{ color: t.textFaint }}>|</span>
-                <span style={{ color: t.textMd, fontFamily: NC_FONT_MONO, fontSize: 10 }}>
+                <span style={{ color: tok.textFaint }}>|</span>
+                <span style={{ color: tok.textMd, fontFamily: NC_FONT_MONO, fontSize: 10 }}>
                   {prefix || '(root)'}
                 </span>
               </>
@@ -563,7 +565,7 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           onClick={e => e.stopPropagation()}
           style={{
             position: 'fixed', left: menu.x, top: menu.y, zIndex: 100,
-            background: t.surface2, border: `1px solid ${t.border}`,
+            background: tok.surface2, border: `1px solid ${tok.border}`,
             borderRadius: 3, padding: 4, minWidth: 180,
             fontFamily: NC_FONT_UI, fontSize: 12,
             boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
@@ -576,31 +578,31 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
             }}
             style={{
               padding: '7px 12px', cursor: 'pointer',
-              color: t.textHi, borderRadius: 2,
+              color: tok.textHi, borderRadius: 2,
               display: 'flex', alignItems: 'center', gap: 8,
             }}
-            onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+            onMouseEnter={e => (e.currentTarget.style.background = tok.surface1)}
             onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
           >
-            <I.pencil size={12} color={t.textMd} />
-            <span>Rename</span>
+            <I.pencil size={12} color={tok.textMd} />
+            <span>{t('fileBrowser.menu.rename')}</span>
           </div>
           {!menu.entry.is_dir && (
             <div
               onClick={() => togglePin(menu.entry)}
               style={{
                 padding: '7px 12px', cursor: 'pointer',
-                color: t.textHi, borderRadius: 2,
+                color: tok.textHi, borderRadius: 2,
                 display: 'flex', alignItems: 'center', gap: 8,
               }}
-              onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+              onMouseEnter={e => (e.currentTarget.style.background = tok.surface1)}
               onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
             >
-              <span style={{ color: t.lime, width: 10 }}>
+              <span style={{ color: tok.lime, width: 10 }}>
                 {pinned.has(menu.entry.key) ? '●' : '○'}
               </span>
               <span>
-                {pinned.has(menu.entry.key) ? 'Unpin from device' : 'Keep on device'}
+                {pinned.has(menu.entry.key) ? t('fileBrowser.menu.unpin') : t('fileBrowser.menu.pin')}
               </span>
             </div>
           )}
@@ -609,21 +611,21 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
               onClick={() => breakLock(menu.entry)}
               style={{
                 padding: '7px 12px', cursor: 'pointer',
-                color: t.danger, borderRadius: 2,
+                color: tok.danger, borderRadius: 2,
                 display: 'flex', alignItems: 'center', gap: 8,
-                borderTop: `1px solid ${t.border}`, marginTop: 4, paddingTop: 8,
+                borderTop: `1px solid ${tok.border}`, marginTop: 4, paddingTop: 8,
               }}
-              onMouseEnter={e => (e.currentTarget.style.background = t.surface1)}
+              onMouseEnter={e => (e.currentTarget.style.background = tok.surface1)}
               onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
             >
               <I.lock size={12} />
-              <span>Break lock</span>
+              <span>{t('fileBrowser.menu.breakLock')}</span>
             </div>
           )}
           <div style={{
             padding: '4px 12px 6px',
-            color: t.textLo, fontSize: 10, fontFamily: NC_FONT_MONO,
-            letterSpacing: 0.5, borderTop: `1px solid ${t.border}`,
+            color: tok.textLo, fontSize: 10, fontFamily: NC_FONT_MONO,
+            letterSpacing: 0.5, borderTop: `1px solid ${tok.border}`,
             marginTop: 4,
           }}>
             {menu.entry.name.length > 28

@@ -32,7 +32,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aws_sdk_s3::{types::CompletedPart, Client};
+use aws_sdk_s3::Client;
+use bytes::Bytes;
 use tokio::runtime::Runtime;
 use windows::{
     core::PCWSTR,
@@ -68,6 +69,7 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
 use crate::cache::{DiskCache, CACHE_BLOCK};
 use crate::file_lock;
+use crate::providers::CloudProvider;
 use crate::throttle::RateLimiter;
 use crate::types::{FileLockEvent, TransferPayload};
 
@@ -174,7 +176,7 @@ pub struct WriteState {
     /// Next part number to assign (1-based).
     next_part_number: i32,
     /// Collected CompletedParts. Tasks push their result here.
-    completed_parts: Arc<std::sync::Mutex<Vec<CompletedPart>>>,
+    completed_parts: Arc<std::sync::Mutex<Vec<crate::providers::CompletedPart>>>,
     /// First error encountered by any worker, sticky.
     upload_err: Arc<std::sync::Mutex<Option<String>>>,
     /// Permits = max in-flight parts. Acquiring blocks in `write()` when
@@ -241,11 +243,15 @@ impl WriteState {
 
 pub struct S3Fs {
     pub rt: Runtime,
-    pub client: Client,
-    pub bucket: String,
+    /// Storage backend. Accepts VFS-relative keys (no bucket_prefix applied).
+    pub provider: Arc<dyn CloudProvider>,
+    /// Raw S3 client + bucket name kept exclusively for `file_lock` calls,
+    /// which take `&Client` + `&str` directly and are not yet behind the trait.
+    pub file_lock_client: Client,
+    pub file_lock_bucket: String,
     /// Normalised subdirectory prefix (empty = root, otherwise trailing slash).
-    /// All Windows paths are prepended with this before forming S3 keys.
-    pub bucket_prefix: String,
+    /// Used only to construct absolute S3 keys for `file_lock` sentinel paths.
+    pub file_lock_prefix: String,
     pub drive_id: i64,
     pub volume_label: String,
 
@@ -287,14 +293,23 @@ pub struct S3Fs {
     /// was disabled via pref, in which case `get_range` always fetches from
     /// S3 and `invalidate_key` is a no-op.
     cache: Option<Arc<DiskCache>>,
+
+    /// Network reachability. Flipped to `false` on connection-class S3 errors
+    /// and back to `true` on success. Read by `get_drive_connectivity`.
+    pub connectivity: Arc<AtomicBool>,
+    /// Callback to emit Tauri events (drive_status_changed) when connectivity
+    /// flips. Stored as a boxed closure so we don't need the AppHandle in scope
+    /// for every S3 call.
+    emit_status: Box<dyn Fn(bool) + Send + Sync>,
 }
 
 impl S3Fs {
     pub fn new(
         rt: Runtime,
-        client: Client,
-        bucket: String,
-        bucket_prefix: String,
+        provider: Arc<dyn CloudProvider>,
+        file_lock_client: Client,
+        file_lock_bucket: String,
+        file_lock_prefix: String,
         drive_id: i64,
         volume_label: String,
         emit: Box<dyn Fn(TransferPayload) + Send + Sync>,
@@ -303,15 +318,18 @@ impl S3Fs {
         upload_rate_bps: Option<u64>,
         download_rate_bps: Option<u64>,
         cache: Option<Arc<DiskCache>>,
+        emit_status: Box<dyn Fn(bool) + Send + Sync>,
+        connectivity: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
 
         Ok(Self {
             rt,
-            client,
-            bucket,
-            bucket_prefix,
+            provider,
+            file_lock_client,
+            file_lock_bucket,
+            file_lock_prefix,
             drive_id,
             volume_label,
             next_xfer: AtomicU64::new(2_000_000),
@@ -326,6 +344,8 @@ impl S3Fs {
             upload_limiter: Arc::new(RateLimiter::new(upload_rate_bps)),
             download_limiter: Arc::new(RateLimiter::new(download_rate_bps)),
             cache,
+            connectivity,
+            emit_status,
         })
     }
 
@@ -339,13 +359,12 @@ impl S3Fs {
             .replace('\\', "/")
     }
 
-    /// Prepend `bucket_prefix` to a VFS-relative key to get the actual S3 key.
-    /// When `bucket_prefix` is empty (root-mounted drive) this is a no-op.
-    fn abs_s3_key(&self, rel_key: &str) -> String {
-        if self.bucket_prefix.is_empty() {
+    /// Build the absolute S3 key for `file_lock` sentinel operations.
+    fn file_lock_abs_key(&self, rel_key: &str) -> String {
+        if self.file_lock_prefix.is_empty() {
             rel_key.to_string()
         } else {
-            format!("{}{}", self.bucket_prefix, rel_key)
+            format!("{}{}", self.file_lock_prefix, rel_key)
         }
     }
 
@@ -386,7 +405,7 @@ impl S3Fs {
 
     // ── S3 operations ────────────────────────────────────────────────────────
 
-    /// List a single S3 "directory" (delimited by `/`). Result is cached for
+    /// List a single "directory" (delimited by `/`). Result is cached for
     /// LIST_TTL.
     fn list_dir(&self, prefix: &str) -> Result<CachedList, String> {
         {
@@ -398,85 +417,36 @@ impl S3Fs {
             }
         }
 
-        let s3_prefix = if prefix.is_empty() {
-            self.bucket_prefix.clone()
-        } else {
-            format!("{}{}/", self.bucket_prefix, prefix)
-        };
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-
-        let listing: Result<CachedList, String> = self.rt.block_on(async move {
-            let mut dirs = Vec::<String>::new();
-            let mut files = Vec::<(String, Meta)>::new();
-            let mut cont: Option<String> = None;
-            loop {
-                let mut req = client
-                    .list_objects_v2()
-                    .bucket(&bucket)
-                    .prefix(&s3_prefix)
-                    .delimiter("/");
-                if let Some(c) = cont.as_ref() {
-                    req = req.continuation_token(c);
-                }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        let detail = e.as_service_error()
-                            .map(|se| {
-                                let code = se.meta().code().unwrap_or("service_error");
-                                let msg  = se.meta().message().unwrap_or("no message");
-                                format!("{code}: {msg}")
-                            })
-                            .unwrap_or_else(|| e.to_string());
-                        let msg = format!("list_objects_v2 prefix={s3_prefix:?}: {detail}");
-                        tracing::error!(target: "nanocrew::vfs", "{msg}");
-                        msg
-                    })?;
-
-                for cp in resp.common_prefixes() {
-                    if let Some(full) = cp.prefix() {
-                        let name = full.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                        if !name.is_empty() {
-                            dirs.push(name.to_string());
-                        }
-                    }
-                }
-                for obj in resp.contents() {
-                    let Some(full) = obj.key() else { continue };
-                    // `.keep` markers exist only to keep empty folders alive
-                    // server-side; don't surface to Explorer.
-                    if full.ends_with("/.keep") || full.ends_with('/') {
-                        continue;
-                    }
-                    let name = full.rsplit('/').next().unwrap_or("");
-                    if name.is_empty() || name == ".keep" {
-                        continue;
-                    }
-                    let size = obj.size().unwrap_or(0).max(0) as u64;
-                    let mtime_filetime = obj
-                        .last_modified()
-                        .map(|d| unix_secs_to_filetime(d.secs()))
-                        .unwrap_or(0);
-                    files.push((
-                        name.to_string(),
-                        Meta {
-                            is_dir: false,
-                            size,
-                            mtime_filetime,
-                        },
-                    ));
-                }
-                match resp.next_continuation_token() {
-                    Some(t) => cont = Some(t.to_string()),
-                    None => break,
-                }
-            }
-            Ok(CachedList { dirs, files })
+        let provider = self.provider.clone();
+        let prefix_owned = prefix.to_string();
+        let result: Result<CachedList, String> = self.rt.block_on(async move {
+            provider
+                .list_dir(&prefix_owned)
+                .await
+                .map(|r| CachedList {
+                    dirs: r.dirs,
+                    files: r
+                        .files
+                        .into_iter()
+                        .map(|(name, stat)| {
+                            (
+                                name,
+                                Meta {
+                                    is_dir: false,
+                                    size: stat.size,
+                                    mtime_filetime: stat.mtime_filetime,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+                .map_err(|e| {
+                    tracing::error!(target: "nanocrew::vfs", "list_dir {prefix_owned:?}: {e}");
+                    e.to_string()
+                })
         });
 
-        let listing = listing?;
+        let listing = result?;
         self.list_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -600,34 +570,50 @@ impl S3Fs {
     }
 
     /// Fetch a byte range from S3. Direct — no cache, no block alignment.
+    /// Classify an S3 SDK error string as a network-level failure (as opposed
+    /// to an auth / permission / not-found error that the server responded to).
+    fn is_network_error(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        m.contains("connection refused")
+            || m.contains("connection reset")
+            || m.contains("timed out")
+            || m.contains("timeout")
+            || m.contains("dns")
+            || m.contains("no such host")
+            || m.contains("failed to connect")
+            || m.contains("network unreachable")
+            || m.contains("dispatch failure")
+    }
+
+    /// Record the outcome of an S3 operation and flip connectivity if needed.
+    fn record_connectivity(&self, ok: bool) {
+        let was = self.connectivity.swap(ok, Ordering::Relaxed);
+        if was != ok {
+            (self.emit_status)(ok);
+        }
+    }
+
     fn fetch_s3_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_s = self.abs_s3_key(key);
+        let provider = self.provider.clone();
         let limiter = self.download_limiter.clone();
-        self.rt.block_on(async move {
+        let key_owned = key.to_string();
+        let result = self.rt.block_on(async move {
             limiter.acquire(len).await;
-            let end = offset + len - 1;
-            let range = format!("bytes={}-{}", offset, end);
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key_s)
-                .range(range)
-                .send()
+            provider
+                .get_range(&key_owned, offset, len)
                 .await
-                .map_err(|e| format!("get_object: {e}"))?;
-            let bytes = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| format!("body collect: {e}"))?
-                .into_bytes();
-            Ok(bytes.to_vec())
-        })
+                .map(|b| b.to_vec())
+                .map_err(|e| e.to_string())
+        });
+        match &result {
+            Ok(_) => self.record_connectivity(true),
+            Err(e) if Self::is_network_error(e) => self.record_connectivity(false),
+            Err(_) => {}
+        }
+        result
     }
 
     /// Return `len` bytes starting at `offset`. When the disk cache is
@@ -730,23 +716,15 @@ impl S3Fs {
         if state.upload_id.is_some() {
             return Ok(());
         }
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_s = self.abs_s3_key(key);
-        let resp = self.rt.block_on(async move {
-            client
-                .create_multipart_upload()
-                .bucket(&bucket)
-                .key(&key_s)
-                .send()
+        let provider = self.provider.clone();
+        let key_owned = key.to_string();
+        let upload_id = self.rt.block_on(async move {
+            provider
+                .create_multipart(&key_owned)
                 .await
-                .map_err(|e| format!("create_multipart_upload: {e}"))
+                .map_err(|e| e.to_string())
         })?;
-        state.upload_id = Some(
-            resp.upload_id()
-                .ok_or_else(|| "missing upload_id".to_string())?
-                .to_string(),
-        );
+        state.upload_id = Some(upload_id);
         Ok(())
     }
 
@@ -796,9 +774,8 @@ impl S3Fs {
             let off = state.dispatched_bytes;
             let sz = ready_size as usize;
             let upload_id = state.upload_id.clone().unwrap();
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
-            let key_s = self.abs_s3_key(key);
+            let provider = self.provider.clone();
+            let key_owned = key.to_string();
             let temp_path = state.temp_path.clone();
             let completed_parts = state.completed_parts.clone();
             let upload_err = state.upload_err.clone();
@@ -830,27 +807,18 @@ impl S3Fs {
                     // Bandwidth throttle — pace each part's send against the
                     // configured upload cap. No-op on an unlimited limiter.
                     limiter.acquire(actual as u64).await;
-                    let resp = client
-                        .upload_part()
-                        .bucket(&bucket)
-                        .key(&key_s)
-                        .upload_id(&upload_id)
-                        .part_number(pn)
-                        .body(buf.into())
-                        .send()
+                    let etag = provider
+                        .upload_part(&key_owned, &upload_id, pn, Bytes::from(buf))
                         .await
                         .map_err(|e| format!("upload_part {pn}: {e}"))?;
-                    let etag = resp.e_tag().unwrap_or("").to_string();
                     bytes_uploaded.fetch_add(actual as u64, Ordering::Relaxed);
                     completed_parts
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .push(
-                            CompletedPart::builder()
-                                .e_tag(etag)
-                                .part_number(pn)
-                                .build(),
-                        );
+                        .push(crate::providers::CompletedPart {
+                            part_number: pn,
+                            etag,
+                        });
                     Ok(())
                 }
                 .await;
@@ -940,26 +908,16 @@ impl S3Fs {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
-                parts.sort_by_key(|p| p.part_number().unwrap_or(0));
+                parts.sort_by_key(|p| p.part_number);
                 let upload_id = state.upload_id.clone().unwrap();
-                let client = self.client.clone();
-                let bucket = self.bucket.clone();
-                let key_s = self.abs_s3_key(key);
+                let provider = self.provider.clone();
+                let key_owned = key.to_string();
                 self.rt
                     .block_on(async move {
-                        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                            .set_parts(Some(parts))
-                            .build();
-                        client
-                            .complete_multipart_upload()
-                            .bucket(&bucket)
-                            .key(&key_s)
-                            .upload_id(&upload_id)
-                            .multipart_upload(completed)
-                            .send()
+                        provider
+                            .complete_multipart(&key_owned, &upload_id, parts)
                             .await
-                            .map_err(|e| format!("complete_multipart_upload: {e}"))
-                            .map(|_| ())
+                            .map_err(|e| e.to_string())
                     })
                     .map_err(|e| {
                         if let Some(uid) = state.upload_id.as_deref() {
@@ -1005,42 +963,28 @@ impl S3Fs {
 
     fn upload_single_put(&self, key: &str, temp_path: &PathBuf) -> Result<(), String> {
         let bytes = std::fs::read(temp_path).map_err(|e| format!("read temp: {e}"))?;
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_s = self.abs_s3_key(key);
+        let provider = self.provider.clone();
+        let key_owned = key.to_string();
         let limiter = self.upload_limiter.clone();
         let size = bytes.len() as u64;
-        self.rt
-            .block_on(async move {
-                limiter.acquire(size).await;
-                client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(&key_s)
-                    .body(bytes.into())
-                    .send()
-                    .await
-                    .map_err(|e| format!("put_object: {e}"))
-                    .map(|_| ())
-            })
+        self.rt.block_on(async move {
+            limiter.acquire(size).await;
+            provider
+                .put_object(&key_owned, Bytes::from(bytes))
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 
 
     /// Abort a multipart upload on error (best-effort).
     fn abort_multipart(&self, key: &str, upload_id: &str) {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_s = self.abs_s3_key(key);
+        let provider = self.provider.clone();
+        let key_owned = key.to_string();
         let uid = upload_id.to_string();
-        let _ = self.rt.block_on(async move {
-            client
-                .abort_multipart_upload()
-                .bucket(&bucket)
-                .key(&key_s)
-                .upload_id(&uid)
-                .send()
-                .await
-        });
+        let _ = self
+            .rt
+            .block_on(async move { provider.abort_multipart(&key_owned, &uid).await });
     }
 
     /// Emit `transfer_progress` for a read. Lazily allocates `DownloadState`
@@ -1140,25 +1084,6 @@ impl S3Fs {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Percent-encode an S3 key for use in `x-amz-copy-source`. RFC 3986
-/// unreserved chars (`A-Za-z0-9-._~`) plus `/` (kept as path separator) pass
-/// through; everything else is `%XX`-encoded. Wasabi rejects raw `:`, `+`,
-/// spaces, etc., and AWS recommends encoding too.
-fn percent_encode_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    for b in key.as_bytes() {
-        let c = *b;
-        let is_unreserved = c.is_ascii_alphanumeric()
-            || matches!(c, b'-' | b'.' | b'_' | b'~' | b'/');
-        if is_unreserved {
-            out.push(c as char);
-        } else {
-            out.push_str(&format!("%{:02X}", c));
-        }
-    }
-    out
-}
 
 fn unix_secs_to_filetime(secs: i64) -> u64 {
     // 11644473600 = seconds between 1601-01-01 and 1970-01-01
@@ -1340,10 +1265,10 @@ impl FileSystemContext for S3Fs {
             // the local-writer set already guarantees single-writer per file
             // on this machine, and we don't want to lock users out because
             // their connection stuttered.
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let client = self.file_lock_client.clone();
+            let bucket = self.file_lock_bucket.clone();
             let mid = self.machine_id.clone();
-            let key = self.abs_s3_key(&real_key);
+            let key = self.file_lock_abs_key(&real_key);
             let state = self.rt.block_on(async move {
                 match file_lock::check(&client, &bucket, &key, &mid).await {
                     Ok(st) => Ok(st),
@@ -1373,11 +1298,11 @@ impl FileSystemContext for S3Fs {
             // Acquire our own sentinel. Best-effort — if the PUT fails, log
             // and fall through; the local-writer set still protects against
             // same-machine conflicts.
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let client = self.file_lock_client.clone();
+            let bucket = self.file_lock_bucket.clone();
             let mid = self.machine_id.clone();
             let owner = self.owner.clone();
-            let key = self.abs_s3_key(&real_key);
+            let key = self.file_lock_abs_key(&real_key);
             let _ = self.rt.block_on(async move {
                 file_lock::acquire(&client, &bucket, &key, &mid, &owner).await
             });
@@ -1459,9 +1384,9 @@ impl FileSystemContext for S3Fs {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&key.to_ascii_lowercase());
-                let client = self.client.clone();
-                let bucket = self.bucket.clone();
-                let k = self.abs_s3_key(key);
+                let client = self.file_lock_client.clone();
+                let bucket = self.file_lock_bucket.clone();
+                let k = self.file_lock_abs_key(key);
                 let _ = self
                     .rt
                     .block_on(async move { file_lock::release(&client, &bucket, &k).await });
@@ -1533,17 +1458,12 @@ impl FileSystemContext for S3Fs {
             } else {
                 format!("{}/.keep", key)
             };
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
-            let k = self.abs_s3_key(&marker_key);
+            let provider = self.provider.clone();
+            let mk = marker_key.clone();
             self.rt
                 .block_on(async move {
-                    client
-                        .put_object()
-                        .bucket(&bucket)
-                        .key(&k)
-                        .body(Vec::<u8>::new().into())
-                        .send()
+                    provider
+                        .put_object(&mk, Bytes::new())
                         .await
                         .map_err(|e| format!("put_object .keep: {e}"))
                 })
@@ -1588,10 +1508,10 @@ impl FileSystemContext for S3Fs {
             drop(locks);
 
             // Foreign sentinel? Reject before we commit to the upload path.
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let client = self.file_lock_client.clone();
+            let bucket = self.file_lock_bucket.clone();
             let mid = self.machine_id.clone();
-            let k = self.abs_s3_key(&key);
+            let k = self.file_lock_abs_key(&key);
             if let Ok(file_lock::LockState::Foreign(s)) =
                 self.rt.block_on(async move { file_lock::check(&client, &bucket, &k, &mid).await })
             {
@@ -1610,11 +1530,11 @@ impl FileSystemContext for S3Fs {
                 return Err(nt(STATUS_SHARING_VIOLATION));
             }
 
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let client = self.file_lock_client.clone();
+            let bucket = self.file_lock_bucket.clone();
             let mid = self.machine_id.clone();
             let owner = self.owner.clone();
-            let k = self.abs_s3_key(&key);
+            let k = self.file_lock_abs_key(&key);
             let _ = self.rt.block_on(async move {
                 file_lock::acquire(&client, &bucket, &k, &mid, &owner).await
             });
@@ -1666,21 +1586,14 @@ impl FileSystemContext for S3Fs {
                     } else {
                         format!("{}/.keep", key)
                     };
-                    let client = self.client.clone();
-                    let bucket = self.bucket.clone();
+                    let provider = self.provider.clone();
                     let marker_key = marker.clone();
-                    let abs_marker = self.abs_s3_key(&marker);
-                    let _ = self.rt.block_on(async move {
-                        client
-                            .delete_object()
-                            .bucket(&bucket)
-                            .key(&abs_marker)
-                            .send()
-                            .await
-                    });
+                    let _ = self
+                        .rt
+                        .block_on(async move { provider.delete(&marker_key).await });
                     self.invalidate_parent(key);
                     self.invalidate_meta(key);
-                    self.invalidate_cache(&marker_key);
+                    self.invalidate_cache(&marker);
                 }
             }
             OpenFile::File {
@@ -1715,12 +1628,11 @@ impl FileSystemContext for S3Fs {
                 }
 
                 if flags & CLEANUP_DELETE != 0 || pending_delete.load(Ordering::Relaxed) {
-                    let client = self.client.clone();
-                    let bucket = self.bucket.clone();
-                    let k = self.abs_s3_key(key);
-                    let _ = self.rt.block_on(async move {
-                        client.delete_object().bucket(&bucket).key(&k).send().await
-                    });
+                    let provider = self.provider.clone();
+                    let k = key.to_string();
+                    let _ = self
+                        .rt
+                        .block_on(async move { provider.delete(&k).await });
                     self.invalidate_parent(key);
                     self.invalidate_meta(key);
                     self.invalidate_cache(key);
@@ -2028,65 +1940,36 @@ impl FileSystemContext for S3Fs {
         if old_key == new_key {
             return Ok(());
         }
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let old_k_abs = self.abs_s3_key(&old_key);
-        let new_k_abs = self.abs_s3_key(&new_key);
 
         let is_dir = matches!(context.as_ref(), OpenFile::Dir { .. });
         if is_dir {
-            // Directory rename: list every object under the old S3 prefix,
+            // Directory rename: list every object under the old prefix,
             // copy each to the new prefix, then delete the originals.
-            // S3 has no native rename, and a directory is just a shared key
-            // prefix — there is no object at the directory key itself.
-            let old_prefix = format!("{}/", old_k_abs);
-            let new_prefix_base = new_k_abs.clone();
-            let old_prefix_base = old_k_abs.clone();
+            // S3 has no native rename; a directory is just a shared key prefix.
+            let provider = self.provider.clone();
+            let old_prefix_arg = format!("{}/", old_key);
+            let old_key_c = old_key.clone();
+            let new_key_c = new_key.clone();
             self.rt
                 .block_on(async move {
-                    // Collect all keys under old prefix.
-                    let mut keys: Vec<String> = Vec::new();
-                    let mut cont: Option<String> = None;
-                    loop {
-                        let mut req = client
-                            .list_objects_v2()
-                            .bucket(&bucket)
-                            .prefix(&old_prefix);
-                        if let Some(c) = cont.as_ref() {
-                            req = req.continuation_token(c);
-                        }
-                        let resp = req.send().await
-                            .map_err(|e| format!("list_objects_v2: {e}"))?;
-                        for obj in resp.contents() {
-                            if let Some(k) = obj.key() {
-                                keys.push(k.to_string());
-                            }
-                        }
-                        match resp.next_continuation_token() {
-                            Some(t) => cont = Some(t.to_string()),
-                            None => break,
-                        }
-                    }
-                    // Copy each key to the new prefix, then delete the old.
-                    for old_obj_key in &keys {
-                        let suffix = &old_obj_key[old_prefix_base.len()..]; // "/name" or "/.keep"
-                        let new_obj_key = format!("{}{}", new_prefix_base, suffix);
-                        let copy_src = format!("{}/{}", bucket, percent_encode_key(old_obj_key));
-                        client
-                            .copy_object()
-                            .bucket(&bucket)
-                            .key(&new_obj_key)
-                            .copy_source(&copy_src)
-                            .send()
+                    let abs_keys = provider
+                        .list_prefix(&old_prefix_arg)
+                        .await
+                        .map_err(|e| format!("list_prefix: {e}"))?;
+                    for abs_old in &abs_keys {
+                        // list_prefix returns VFS-relative keys. Strip the
+                        // old_key prefix to get the per-object suffix
+                        // ("/name" or "/.keep"), then reattach under new_key.
+                        let suffix = &abs_old[old_key_c.len()..]; // "/name" or "/.keep"
+                        let abs_new = format!("{}{}", new_key_c, suffix);
+                        provider
+                            .copy_object(abs_old, &abs_new)
                             .await
-                            .map_err(|e| format!("copy_object {old_obj_key}: {e:?}"))?;
-                        client
-                            .delete_object()
-                            .bucket(&bucket)
-                            .key(old_obj_key)
-                            .send()
+                            .map_err(|e| format!("copy_object {abs_old}: {e}"))?;
+                        provider
+                            .delete(abs_old)
                             .await
-                            .map_err(|e| format!("delete_object {old_obj_key}: {e:?}"))?;
+                            .map_err(|e| format!("delete_object {abs_old}: {e}"))?;
                     }
                     Ok::<(), String>(())
                 })
@@ -2095,32 +1978,20 @@ impl FileSystemContext for S3Fs {
                     nt(STATUS_INVALID_PARAMETER)
                 })?;
         } else {
-            // File rename: single copy_object + delete_object.
-            // `x-amz-copy-source` must be URL-encoded per S3 spec. `/` is a path
-            // separator and must stay un-encoded; other special chars get
-            // percent-encoded. Wasabi rejects raw spaces, `+`, `:` etc.
-            let copy_src = format!("{}/{}", bucket, percent_encode_key(&old_k_abs));
-            let copy_src_c = copy_src.clone();
+            // File rename: copy then delete.
+            let provider = self.provider.clone();
+            let old_k = old_key.clone();
+            let new_k = new_key.clone();
             self.rt
                 .block_on(async move {
-                    client
-                        .copy_object()
-                        .bucket(&bucket)
-                        .key(&new_k_abs)
-                        .copy_source(&copy_src_c)
-                        .send()
+                    provider
+                        .copy_object(&old_k, &new_k)
                         .await
-                        .map_err(|e| {
-                            let svc = e.as_service_error().map(|s| format!("{s:?}"));
-                            format!("copy_object: {e:?} svc={svc:?}")
-                        })?;
-                    client
-                        .delete_object()
-                        .bucket(&bucket)
-                        .key(&old_k_abs)
-                        .send()
+                        .map_err(|e| format!("copy_object: {e}"))?;
+                    provider
+                        .delete(&old_k)
                         .await
-                        .map_err(|e| format!("delete_object: {e:?}"))
+                        .map_err(|e| format!("delete_object: {e}"))
                 })
                 .map_err(|e| {
                     eprintln!("[winfsp] rename failed src={old_key} dst={new_key}: {e}");

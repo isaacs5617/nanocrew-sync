@@ -11,6 +11,7 @@
 // / `list_buckets` / `add_drive` just take endpoint + region + key pair.
 
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import {
   getTokens, NC_FONT_MONO,
@@ -42,7 +43,8 @@ const Field: React.FC<{ label: string; children: React.ReactNode; theme: Theme; 
 export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
   theme, providerId, onBack, onCancel, onDone,
 }) => {
-  const t = getTokens(theme);
+  const tok = getTokens(theme);
+  const { t } = useTranslation();
   const { token } = useAuth();
 
   const preset: S3ProviderPreset | undefined = S3_PROVIDER_PRESETS[providerId];
@@ -114,12 +116,12 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
   if (!preset) {
     return (
       <>
-        <TopBar theme={theme} crumbs={['Drives', 'Add drive']} title="Unknown provider" />
+        <TopBar theme={theme} crumbs={[t('picker.crumb.drives'), t('picker.crumb.addDrive')]} title={t('addDrive.unknownProvider')} />
         <div style={{ padding: 28 }}>
-          <div style={{ color: t.danger, fontSize: 13 }}>
-            No preset for <code>{providerId}</code>. Please report this.
+          <div style={{ color: tok.danger, fontSize: 13 }}>
+            {t('addDrive.noPreset', { id: providerId })}
           </div>
-          <NCBtn theme={theme} ghost onClick={onBack} style={{ marginTop: 16 }}>Back</NCBtn>
+          <NCBtn theme={theme} ghost onClick={onBack} style={{ marginTop: 16 }}>{t('addDrive.back')}</NCBtn>
         </div>
       </>
     );
@@ -129,11 +131,11 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
     setError(null);
     setTestOk(null);
     if (!resolved.endpoint) {
-      setError('Endpoint is required.');
+      setError(t('addDrive.errors.endpointRequired'));
       return;
     }
     if (!bucket.trim() || !accessKeyId.trim() || !secretKey.trim()) {
-      setError('Bucket, access key, and secret are required to test.');
+      setError(t('addDrive.errors.fieldsRequired'));
       return;
     }
     setTesting(true);
@@ -161,9 +163,9 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
 
   const handleBrowse = async () => {
     setError(null);
-    if (!resolved.endpoint) { setError('Set an endpoint first.'); return; }
+    if (!resolved.endpoint) { setError(t('addDrive.errors.setEndpoint')); return; }
     if (!accessKeyId.trim() || !secretKey.trim()) {
-      setError('Enter your access key ID and secret key first.');
+      setError(t('addDrive.errors.enterKeys'));
       return;
     }
     setBrowsing(true);
@@ -182,8 +184,8 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
       const isForbidden = msg.includes('403') || msg.includes('Forbidden') || msg.includes('service error') || msg.includes('AccessDenied');
       setError(
         isForbidden
-          ? 'Bucket listing requires the s3:ListAllMyBuckets permission. Your key may be scoped to a single bucket — enter the bucket name manually instead.'
-          : `Could not list buckets: ${msg}`
+          ? t('addDrive.errors.listBucketsForbidden')
+          : t('addDrive.errors.listBucketsFailed', { msg })
       );
     } finally {
       setBrowsing(false);
@@ -192,11 +194,11 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
 
   const handleMount = async () => {
     setError(null);
-    if (!name.trim()) { setError('Display name is required.'); return; }
-    if (!resolved.endpoint) { setError('Endpoint is required.'); return; }
-    if (!bucket.trim()) { setError('Bucket is required.'); return; }
-    if (!accessKeyId.trim() || !secretKey.trim()) { setError('Access key ID and secret are required.'); return; }
-    if (!letter) { setError('Select a drive letter.'); return; }
+    if (!name.trim()) { setError(t('addDrive.errors.nameRequired')); return; }
+    if (!resolved.endpoint) { setError(t('addDrive.errors.endpointRequired')); return; }
+    if (!bucket.trim()) { setError(t('addDrive.errors.bucketRequired')); return; }
+    if (!accessKeyId.trim() || !secretKey.trim()) { setError(t('addDrive.errors.keysRequired')); return; }
+    if (!letter) { setError(t('addDrive.errors.letterRequired')); return; }
 
     setSaving(true);
     try {
@@ -227,13 +229,13 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
 
   const selectStyle: React.CSSProperties = {
     width: '100%',
-    background: t.surface1,
-    border: `1px solid ${t.border}`,
+    background: tok.surface1,
+    border: `1px solid ${tok.border}`,
     borderRadius: 3,
     padding: '10px 12px',
     fontFamily: NC_FONT_MONO,
     fontSize: 12,
-    color: t.textHi,
+    color: tok.textHi,
     outline: 'none',
     cursor: 'pointer',
     appearance: 'none',
@@ -244,37 +246,37 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
     <>
       <TopBar
         theme={theme}
-        crumbs={['Drives', 'Add drive', preset.name]}
-        title={<>Connect <span style={{ color: t.lime }}>{preset.name}</span></>}
-        subtitle={`${preset.desc}. Credentials are stored in the Windows Credential Manager — never plain text.`}
-        actions={<NCBtn theme={theme} small ghost onClick={onCancel}>Cancel</NCBtn>}
+        crumbs={[t('picker.crumb.drives'), t('picker.crumb.addDrive'), preset.name]}
+        title={<>{t('picker.title')} <span style={{ color: tok.lime }}>{preset.name}</span></>}
+        subtitle={`${preset.desc}. ${t('addDrive.credentialsSub')}`}
+        actions={<NCBtn theme={theme} small ghost onClick={onCancel}>{t('common.cancel')}</NCBtn>}
       />
       <div style={{ flex: 1, overflow: 'auto', padding: 28 }}>
         <div style={{ maxWidth: 720, display: 'flex', flexDirection: 'column', gap: 24 }}>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontFamily: NC_FONT_MONO, fontSize: 10, letterSpacing: 1.5 }}>
-            <span style={{ color: t.lime }}>01 · PROVIDER</span>
-            <span style={{ color: t.textFaint }}>—</span>
-            <span style={{ color: t.lime }}>02 · CREDENTIALS</span>
-            <span style={{ color: t.textFaint }}>—</span>
-            <span style={{ color: t.textLo }}>03 · MOUNT</span>
+            <span style={{ color: tok.lime }}>{t('addDrive.step1')}</span>
+            <span style={{ color: tok.textFaint }}>—</span>
+            <span style={{ color: tok.lime }}>{t('addDrive.step2')}</span>
+            <span style={{ color: tok.textFaint }}>—</span>
+            <span style={{ color: tok.textLo }}>{t('addDrive.step3')}</span>
           </div>
 
           <NCCard theme={theme} pad={24}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-              <NCEyebrow theme={theme}>Connection</NCEyebrow>
+              <NCEyebrow theme={theme}>{t('addDrive.section.connection')}</NCEyebrow>
               <div style={{ flex: 1 }} />
               {preset.badges.map(b => (
                 <NCBadge key={b.label} theme={theme} color={b.color}>{b.label}</NCBadge>
               ))}
             </div>
-            <Field theme={theme} label="Display name">
+            <Field theme={theme} label={t('addDrive.field.displayName')}>
               <NCInput theme={theme} value={name} onChange={setName} placeholder={`e.g. ${preset.name} · Main`} />
             </Field>
 
             {preset.customEndpoint ? (
               <>
-                <Field theme={theme} label={`Endpoint (no https:// · e.g. ${endpointExample(preset.id)})`}>
+                <Field theme={theme} label={t('addDrive.field.endpoint', { example: endpointExample(preset.id) })}>
                   <NCInput
                     theme={theme} mono
                     value={customEndpoint}
@@ -284,7 +286,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                   />
                 </Field>
                 {!preset.fixedRegion && (
-                  <Field theme={theme} label="Region">
+                  <Field theme={theme} label={t('addDrive.field.region')}>
                     <NCInput
                       theme={theme} mono
                       value={customRegion}
@@ -295,10 +297,10 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                 )}
               </>
             ) : (
-              <Field theme={theme} label="Region endpoint">
+              <Field theme={theme} label={t('addDrive.field.regionEndpoint')}>
                 <div style={{ position: 'relative' }}>
                   <div style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                    <I.chevD size={13} color={t.textMd} />
+                    <I.chevD size={13} color={tok.textMd} />
                   </div>
                   <select
                     value={regionIdx}
@@ -313,12 +315,12 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
               </Field>
             )}
 
-            <Field theme={theme} label="Bucket">
+            <Field theme={theme} label={t('addDrive.field.bucket')}>
               <div style={{ display: 'flex', gap: 8 }}>
                 {availableBuckets ? (
                   <div style={{ position: 'relative', flex: 1 }}>
                     <div style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                      <I.chevD size={13} color={t.textMd} />
+                      <I.chevD size={13} color={tok.textMd} />
                     </div>
                     <select
                       value={bucket}
@@ -334,11 +336,11 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                   </div>
                 )}
                 <NCBtn theme={theme} small ghost disabled={browsing} onClick={handleBrowse}>
-                  {browsing ? '…' : availableBuckets ? 'Refresh' : 'Browse'}
+                  {browsing ? t('addDrive.browsing') : availableBuckets ? t('addDrive.refresh') : t('addDrive.browse')}
                 </NCBtn>
               </div>
             </Field>
-            <Field theme={theme} label="Folder prefix (optional — mount a subfolder as the drive root)" last>
+            <Field theme={theme} label={t('addDrive.field.folderPrefix')} last>
               <NCInput
                 theme={theme} mono
                 value={bucketPrefix}
@@ -346,18 +348,18 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                 placeholder="e.g. users/alice  or  team/shared/projects"
                 prefix={<I.folder size={13} />}
               />
-              <div style={{ marginTop: 6, fontSize: 11, color: t.textMd }}>
-                Leave blank to mount the whole bucket. Enter a path to restrict this drive to a specific subfolder — useful for personal volumes or shared sub-buckets.
+              <div style={{ marginTop: 6, fontSize: 11, color: tok.textMd }}>
+                {t('addDrive.field.folderPrefixHint')}
               </div>
             </Field>
           </NCCard>
 
           <NCCard theme={theme} pad={24}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 16 }}>Credentials</NCEyebrow>
-            <Field theme={theme} label="Access key ID">
+            <NCEyebrow theme={theme} style={{ marginBottom: 16 }}>{t('addDrive.section.credentials')}</NCEyebrow>
+            <Field theme={theme} label={t('addDrive.field.accessKeyId')}>
               <NCInput theme={theme} mono value={accessKeyId} onChange={setAccessKeyId} placeholder={preset.keyIdHint ?? 'AKIAXXXXXXXXXXXXXXXX'} prefix={<I.lock size={13} />} />
             </Field>
-            <Field theme={theme} label="Secret access key" last>
+            <Field theme={theme} label={t('addDrive.field.secretKey')} last>
               <NCInput
                 theme={theme} mono
                 type={showSecret ? 'text' : 'password'}
@@ -374,44 +376,43 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
             </Field>
             <div style={{
               marginTop: 14, padding: '10px 12px',
-              background: t.surface2, border: `1px solid ${t.border}`,
+              background: tok.surface2, border: `1px solid ${tok.border}`,
               borderRadius: 3, display: 'flex', alignItems: 'flex-start', gap: 10,
             }}>
-              <I.shield size={14} color={t.lime} style={{ marginTop: 2 }} />
-              <div style={{ fontSize: 11, color: t.textMd, lineHeight: 1.6 }}>
-                Stored encrypted in the <span style={{ color: t.textHi, fontFamily: NC_FONT_MONO }}>Windows Credential Manager</span>.
-                NanoCrew Sync never sees or transmits your keys.
+              <I.shield size={14} color={tok.lime} style={{ marginTop: 2 }} />
+              <div style={{ fontSize: 11, color: tok.textMd, lineHeight: 1.6 }}>
+                {t('addDrive.credentialNote')}
                 {preset.docsUrl && (
-                  <> · <a href={preset.docsUrl} target="_blank" rel="noreferrer" style={{ color: t.lime }}>{preset.name} docs</a></>
+                  <> · <a href={preset.docsUrl} target="_blank" rel="noreferrer" style={{ color: tok.lime }}>{preset.name} docs</a></>
                 )}
               </div>
             </div>
           </NCCard>
 
           <NCCard theme={theme} pad={24}>
-            <NCEyebrow theme={theme} style={{ marginBottom: 16 }}>Mount options</NCEyebrow>
+            <NCEyebrow theme={theme} style={{ marginBottom: 16 }}>{t('addDrive.section.mountOptions')}</NCEyebrow>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-              <Field theme={theme} label="Drive letter">
+              <Field theme={theme} label={t('addDrive.field.driveLetter')}>
                 <div style={{ position: 'relative' }}>
                   <div style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                    <I.chevD size={13} color={t.textMd} />
+                    <I.chevD size={13} color={tok.textMd} />
                   </div>
                   <select
                     value={letter}
                     onChange={e => setLetter(e.target.value)}
-                    style={{ ...selectStyle, fontSize: 16, fontWeight: 500, color: t.lime }}
+                    style={{ ...selectStyle, fontSize: 16, fontWeight: 500, color: tok.lime }}
                   >
                     {availableLetters.length === 0
-                      ? <option value="">No letters available</option>
+                      ? <option value="">{t('addDrive.noLetters')}</option>
                       : availableLetters.map(l => <option key={l} value={l}>{l}</option>)
                     }
                   </select>
                 </div>
               </Field>
-              <Field theme={theme} label="Cache">
+              <Field theme={theme} label={t('addDrive.field.cache')}>
                 <div style={{ position: 'relative' }}>
                   <div style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                    <I.chevD size={13} color={t.textMd} />
+                    <I.chevD size={13} color={tok.textMd} />
                   </div>
                   <select
                     value={cacheSizeGb}
@@ -419,7 +420,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                     style={selectStyle}
                   >
                     {[1, 2, 5, 10, 20, 50].map(gb => (
-                      <option key={gb} value={gb}>{gb} GB · Smart</option>
+                      <option key={gb} value={gb}>{t('addDrive.cacheOption', { gb })}</option>
                     ))}
                   </select>
                 </div>
@@ -428,15 +429,15 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 18 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Mount automatically at Windows sign-in</div>
-                  <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>Reconnect the drive when you log in.</div>
+                  <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{t('addDrive.autoMount.label')}</div>
+                  <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>{t('addDrive.autoMount.sub')}</div>
                 </div>
                 <NCToggle on={autoMount} onChange={setAutoMount} theme={theme} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 13, color: t.textHi, fontWeight: 500 }}>Read-only mode</div>
-                  <div style={{ fontSize: 11, color: t.textMd, marginTop: 2 }}>Prevent modifications. Useful for archives.</div>
+                  <div style={{ fontSize: 13, color: tok.textHi, fontWeight: 500 }}>{t('addDrive.readonly.label')}</div>
+                  <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>{t('addDrive.readonly.sub')}</div>
                 </div>
                 <NCToggle on={readonly} onChange={setReadonly} theme={theme} />
               </div>
@@ -446,35 +447,35 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
           {testOk === true && (
             <div style={{
               padding: '10px 14px',
-              background: `${t.lime}18`, border: `1px solid ${t.lime}50`,
-              borderRadius: 3, fontSize: 12, color: t.lime,
+              background: `${tok.lime}18`, border: `1px solid ${tok.lime}50`,
+              borderRadius: 3, fontSize: 12, color: tok.lime,
               display: 'flex', gap: 8, alignItems: 'center',
             }}>
-              <I.shield size={13} color={t.lime} style={{ flexShrink: 0 }} />
-              Connection successful — bucket is reachable.
+              <I.shield size={13} color={tok.lime} style={{ flexShrink: 0 }} />
+              {t('addDrive.connectionSuccess')}
             </div>
           )}
 
           {error && (
             <div style={{
               padding: '10px 14px',
-              background: `${t.danger}18`, border: `1px solid ${t.danger}50`,
-              borderRadius: 3, fontSize: 12, color: t.danger,
+              background: `${tok.danger}18`, border: `1px solid ${tok.danger}50`,
+              borderRadius: 3, fontSize: 12, color: tok.danger,
               display: 'flex', gap: 8, alignItems: 'center',
             }}>
-              <I.warn size={13} color={t.danger} style={{ flexShrink: 0 }} />
+              <I.warn size={13} color={tok.danger} style={{ flexShrink: 0 }} />
               {error}
             </div>
           )}
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-            <NCBtn theme={theme} ghost iconLeft={<I.chevL size={14} />} onClick={onBack}>Back</NCBtn>
+            <NCBtn theme={theme} ghost iconLeft={<I.chevL size={14} />} onClick={onBack}>{t('addDrive.back')}</NCBtn>
             <div style={{ display: 'flex', gap: 8 }}>
               <NCBtn theme={theme} disabled={testing} onClick={handleTest}>
-                {testing ? 'Testing…' : testOk === true ? 'Test passed' : 'Test connection'}
+                {testing ? t('addDrive.testing') : testOk === true ? t('addDrive.testPassed') : t('addDrive.testConnection')}
               </NCBtn>
               <NCBtn theme={theme} primary icon={<I.arrow size={13} />} disabled={saving} onClick={handleMount}>
-                {saving ? 'Adding…' : 'Mount drive'}
+                {saving ? t('addDrive.adding') : t('addDrive.mountDrive')}
               </NCBtn>
             </div>
           </div>

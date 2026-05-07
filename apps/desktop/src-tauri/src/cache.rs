@@ -117,6 +117,87 @@ impl DiskCache {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Current configured maximum on-disk footprint in bytes.
+    pub fn get_max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Sum of all cached block file sizes for this drive on disk (in bytes).
+    pub fn used_bytes(&self) -> u64 {
+        let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_entries WHERE drive_id = ?1",
+            rusqlite::params![self.drive_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .max(0) as u64
+    }
+
+    /// Update the in-memory cap. The eviction sweeper will respect this on its
+    /// next wake. Does not immediately evict — callers should call
+    /// `evict_if_needed` if they want synchronous enforcement.
+    pub fn set_max_bytes(&self, bytes: u64) {
+        self.max_bytes.store(bytes, Ordering::Relaxed);
+        let should_enable = bytes > 0;
+        self.enabled.store(should_enable, Ordering::Relaxed);
+    }
+
+    /// Enable or disable the cache. When disabled, `get_block` always misses
+    /// and `put_block` is a no-op. Does not delete on-disk data.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Delete every cached block for this drive from disk and clear the index.
+    pub fn clear_all(&self) {
+        let blocks: Vec<(i64, i64)> = {
+            let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt = match conn.prepare(
+                "SELECT offset, len FROM cache_entries WHERE drive_id = ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let rows: Result<Vec<_>, _> = stmt
+                .query_map(rusqlite::params![self.drive_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .and_then(|it| it.collect());
+            let list = rows.unwrap_or_default();
+            // We need all keys too — refetch with keys for path_for calls below.
+            list
+        };
+        // Re-query with keys for file deletion.
+        let keyed: Vec<(String, i64, i64)> = {
+            let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt = match conn.prepare(
+                "SELECT key, offset, len FROM cache_entries WHERE drive_id = ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let rows: Result<Vec<_>, _> = stmt
+                .query_map(rusqlite::params![self.drive_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
+                .and_then(|it| it.collect());
+            rows.unwrap_or_default()
+        };
+        {
+            let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = conn.execute(
+                "DELETE FROM cache_entries WHERE drive_id = ?1",
+                rusqlite::params![self.drive_id],
+            );
+        }
+        let _ = blocks; // already fetched above for count only
+        for (key, off, len) in keyed {
+            let p = self.path_for(&key, off as u64, len as u64);
+            let _ = fs::remove_file(&p);
+        }
+    }
+
     /// Cache path: `<root>/<hex[0..2]>/<hex[2..]>/<offset>-<len>.bin`. The
     /// two-char fanout keeps any individual directory under ~4k entries even
     /// at cache sizes in the hundreds of thousands of blocks.

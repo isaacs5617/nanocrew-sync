@@ -1,6 +1,6 @@
 [package]
 name = "nanocrew-sync"
-version = "0.1.14"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -56,10 +56,28 @@ url = "2"
 winfsp       = { version = "0.12.4", features = ["system"] }
 winfsp-sys   = { version = "0.12", features = ["system"] }
 
+# CloudProvider trait abstraction (Track C1)
+async-trait  = "0.1"
+
+# SFTP provider (Track C2)
+russh        = "0.60"
+russh-sftp   = "2"
+
+# FTP/FTPS provider (Track C2) — native-tls uses Windows Schannel, avoids
+# rustls version conflicts with other deps in the tree.
+suppaftp = { version = "8", features = ["tokio"] }
+
+# WebDAV provider (Track C3) — XML parsing for PROPFIND responses
+quick-xml    = { version = "0.37", features = ["async-tokio"] }
+
+# Google Drive provider (Track C4) — OAuth2 PKCE loopback flow
+open         = "5"
+urlencoding  = "2"
+
 # Pipelined S3 range GETs during hydration
 futures-util = "0.3"
 bytes        = "1"
-reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 # Wide-string types
 widestring = "1"
@@ -86,6 +104,11 @@ jsonwebtoken = "9"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "std"] }
 tracing-appender    = "0.2"
+
+# Crash reporting (Track E2). DSN injected via SENTRY_DSN env var at build
+# time; disabled at runtime when the user opts out via telemetry_enabled pref.
+sentry          = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "tracing"] }
+sentry-tracing  = "0.34"
 
 [profile.release]
 panic = "abort"

@@ -99,5 +99,34 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
         "ALTER TABLE drives ADD COLUMN bucket_prefix TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Migration: per-drive cache quota (Track A1). 10 GiB default.
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN cache_max_bytes INTEGER NOT NULL DEFAULT 10737418240",
+        [],
+    );
+    // Migration: per-drive cache enable toggle (Track A1).
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Migration: per-drive bandwidth overrides (Track E4). 0 = inherit global pref.
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN upload_rate_mbps REAL NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN download_rate_mbps REAL NOT NULL DEFAULT 0",
+        [],
+    );
+    // Migration: provider type tag for non-S3 providers (Track C2).
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN provider_type TEXT NOT NULL DEFAULT 's3'",
+        [],
+    );
+    // Migration: JSON blob for SFTP / FTP config (Track C2).
+    let _ = conn.execute(
+        "ALTER TABLE drives ADD COLUMN provider_config TEXT",
+        [],
+    );
     Ok(conn)
 }

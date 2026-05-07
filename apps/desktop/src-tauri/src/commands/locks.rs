@@ -20,6 +20,7 @@ use crate::{
     error::AppError,
     file_lock::{self, LOCK_PREFIX},
     http_client,
+    license,
     state::AppState,
 };
 
@@ -160,6 +161,7 @@ pub async fn break_file_lock(
     key: String,
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
+    license::require_pro(&state.db)?;
     let actor = state
         .sessions
         .lock()

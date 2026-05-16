@@ -47,13 +47,13 @@ const DAY_SECS: u64 = 86_400;
 /// without phoning home; the tradeoff is that key rotation requires a
 /// NanoCrew Sync app update.
 const ISSUER_PUBKEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1SU1LfVLPHCozMxH2Mo
-4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u
-+qKhbwKfBstIs+bMY2Zkp18gnTxKLxoS2tFczGkPLPgizskuemMghRniWaoLcyeh
-kd3qqGElvW/VDL5AaWTg0nLVkjRo9z+40RQzuVaE8AkAFmxZzow3x+VJYKdjykkJ
-0iT9wCS0DRTXu269V264Vf/3jvredZiKRkgwlL9xNAwxXFg0x/XFw005UWVRIkdg
-cKWTjpBP2dPwVZ4WWC+9aGVd+Gyn1o0CLelf4rEjGoXbAAEgAqeGUxrcIlbjXfbc
-mwIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwAfaWul/r1BK5a8kDc26
+n3xOqr8GS/haEUeHlGcN/zVgK7UJasnkl9kuwTOIpEtkGvLTrjWcjuLHNFXkfOHl
+TKF6jdO9CKOBzIIO5xrIQJWUCbkaoAwPtiFb2jUivgMiLw94mxEjdtMZc2+DJdtZ
+tyOtDqQryyO0mKXGQXFQ6iePUmgoqzSWGUImxbnUfOsj4y2P1A9abSIL06rSLa1b
+bMwjoTFpzfIhGdcnCi0dM2BL6gRNCvDaNaxYk0EDUXCS+v9jzdfpFLCqvnoYzEwD
+OYP/Eak/RBV+xBzp8MwefC2ND/WEtpYGfB3HoJKNtOPA7kUC7fQrFHX/n1UQMDlP
+9QIDAQAB
 -----END PUBLIC KEY-----";
 
 /// Top-level claims we extract from the JWT. The issuer is free to add

@@ -9,6 +9,7 @@ mod cache;
 mod commands;
 mod credentials;
 mod db;
+mod dir_listing_cache;
 mod dpapi;
 mod error;
 mod file_lock;
@@ -170,6 +171,10 @@ pub fn run() {
                 }
             }
 
+            // Sync drive display names to bucket/folder before mounting, so
+            // the UI label matches what users actually see in the S3 path.
+            sync_drive_names_to_folder(app.handle());
+
             // Kick off auto-mounts asynchronously so setup() returns immediately
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -273,6 +278,74 @@ pub fn run() {
 }
 
 /// Mount every drive that has `auto_mount = 1` and is not already live.
+/// On every app start, sync every drive's display `name` to either the last
+/// path segment of its `bucket_prefix` (if set) or the bucket name. Keeps the
+/// label in the Dashboard matching the folder the user is actually browsing,
+/// even if the drive was added before the auto-name behavior shipped.
+fn sync_drive_names_to_folder(app: &tauri::AppHandle) {
+    let state: tauri::State<AppState> = app.state();
+    let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut stmt = match db.prepare(
+            "SELECT id, name, bucket, COALESCE(bucket_prefix, '') FROM drives",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "nanocrew::drive_names", "prepare: {e}");
+                return;
+            }
+        };
+        match stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "nanocrew::drive_names", "query: {e}");
+                return;
+            }
+        }
+    };
+
+    let mut changed = false;
+    for (id, current_name, bucket, prefix) in rows {
+        let target = if prefix.trim_matches('/').is_empty() {
+            bucket
+        } else {
+            prefix
+                .trim_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        if target.is_empty() || target == current_name {
+            continue;
+        }
+        if let Err(e) = db.execute(
+            "UPDATE drives SET name = ?1 WHERE id = ?2",
+            rusqlite::params![target, id],
+        ) {
+            tracing::warn!(target: "nanocrew::drive_names",
+                "rename drive {id} -> {target:?}: {e}");
+        } else {
+            tracing::info!(target: "nanocrew::drive_names",
+                "renamed drive {id}: {current_name:?} -> {target:?}");
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = app.emit("drives_changed", ());
+    }
+}
+
 async fn auto_mount_drives(app: tauri::AppHandle) {
     // ── Pull drive rows from DB ───────────────────────────────────────────────
     #[allow(clippy::type_complexity)]

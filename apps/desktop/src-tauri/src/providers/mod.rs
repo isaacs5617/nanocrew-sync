@@ -66,6 +66,22 @@ pub trait CloudProvider: Send + Sync {
     /// relative parent key ("" for root, "foo/bar" for a subdir).
     async fn list_dir(&self, prefix: &str) -> Result<ListDirResult, ProviderError>;
 
+    /// Stream a directory listing, invoking `on_page` for each provider page
+    /// as it arrives. The default implementation calls `list_dir` once (good
+    /// enough for providers where listing isn't paginated). Providers that DO
+    /// paginate (S3, Google Drive, OneDrive) override this for progressive
+    /// delivery — this is what lets Explorer render entries for huge folders
+    /// before the full pagination completes.
+    async fn list_dir_stream(
+        &self,
+        prefix: &str,
+        on_page: &mut (dyn FnMut(ListDirResult) + Send),
+    ) -> Result<(), ProviderError> {
+        let result = self.list_dir(prefix).await?;
+        on_page(result);
+        Ok(())
+    }
+
     /// Fetch metadata for a single object key. Returns `Ok(None)` when the
     /// object does not exist.
     async fn stat(&self, key: &str) -> Result<Option<FileStat>, ProviderError>;

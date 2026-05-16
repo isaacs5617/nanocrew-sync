@@ -50,6 +50,14 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
   const preset: S3ProviderPreset | undefined = S3_PROVIDER_PRESETS[providerId];
 
   const [name, setName] = React.useState('');
+  // Until the user manually types into the name field, it auto-mirrors the
+  // bucket name so most users get a sensible default for free.
+  const [nameTouched, setNameTouched] = React.useState(false);
+  const handleNameChange = (v: string) => { setNameTouched(true); setName(v); };
+  const handleBucketChange = (v: string) => {
+    setBucket(v);
+    if (!nameTouched) setName(v);
+  };
   // Region dropdown index (only used when preset has regions[] and !customEndpoint).
   const [regionIdx, setRegionIdx] = React.useState(0);
   // Custom-endpoint fields (used by MinIO, R2, Oracle).
@@ -178,7 +186,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
         secretAccessKey: secretKey,
       });
       setAvailableBuckets(buckets);
-      if (buckets.length > 0 && !bucket) setBucket(buckets[0]!);
+      if (buckets.length > 0 && !bucket) handleBucketChange(buckets[0]!);
     } catch (e) {
       const msg = String(e);
       const isForbidden = msg.includes('403') || msg.includes('Forbidden') || msg.includes('service error') || msg.includes('AccessDenied');
@@ -271,7 +279,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
               ))}
             </div>
             <Field theme={theme} label={t('addDrive.field.displayName')}>
-              <NCInput theme={theme} value={name} onChange={setName} placeholder={`e.g. ${preset.name} · Main`} />
+              <NCInput theme={theme} value={name} onChange={handleNameChange} placeholder={`e.g. ${preset.name} · Main`} />
             </Field>
 
             {preset.customEndpoint ? (
@@ -324,7 +332,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                     </div>
                     <select
                       value={bucket}
-                      onChange={e => setBucket(e.target.value)}
+                      onChange={e => handleBucketChange(e.target.value)}
                       style={{ ...selectStyle, fontFamily: NC_FONT_MONO, fontSize: 12 }}
                     >
                       {availableBuckets.map(b => <option key={b} value={b}>{b}</option>)}
@@ -332,7 +340,7 @@ export const AddDriveS3Screen: React.FC<AddDriveS3ScreenProps> = ({
                   </div>
                 ) : (
                   <div style={{ flex: 1 }}>
-                    <NCInput theme={theme} mono value={bucket} onChange={setBucket} placeholder="my-bucket-name" prefix={<I.serverDb size={13} />} />
+                    <NCInput theme={theme} mono value={bucket} onChange={handleBucketChange} placeholder="my-bucket-name" prefix={<I.serverDb size={13} />} />
                   </div>
                 )}
                 <NCBtn theme={theme} small ghost disabled={browsing} onClick={handleBrowse}>

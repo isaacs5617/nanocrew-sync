@@ -70,14 +70,26 @@ impl S3Provider {
 #[async_trait]
 impl CloudProvider for S3Provider {
     async fn list_dir(&self, prefix: &str) -> Result<ListDirResult, ProviderError> {
+        let mut acc = ListDirResult { dirs: vec![], files: vec![] };
+        let mut callback = |p: ListDirResult| {
+            acc.dirs.extend(p.dirs);
+            acc.files.extend(p.files);
+        };
+        self.list_dir_stream(prefix, &mut callback).await?;
+        Ok(acc)
+    }
+
+    async fn list_dir_stream(
+        &self,
+        prefix: &str,
+        on_page: &mut (dyn FnMut(ListDirResult) + Send),
+    ) -> Result<(), ProviderError> {
         let s3_prefix = if prefix.is_empty() {
             self.bucket_prefix.clone()
         } else {
             format!("{}{}/", self.bucket_prefix, prefix)
         };
 
-        let mut dirs = Vec::<String>::new();
-        let mut files = Vec::<(String, FileStat)>::new();
         let mut cont: Option<String> = None;
 
         loop {
@@ -104,12 +116,15 @@ impl CloudProvider for S3Provider {
                 ))
             })?;
 
+            let mut page_dirs = Vec::<String>::new();
+            let mut page_files = Vec::<(String, FileStat)>::new();
+
             for cp in resp.common_prefixes() {
                 if let Some(full) = cp.prefix() {
                     let name =
                         full.trim_end_matches('/').rsplit('/').next().unwrap_or("");
                     if !name.is_empty() {
-                        dirs.push(name.to_string());
+                        page_dirs.push(name.to_string());
                     }
                 }
             }
@@ -127,8 +142,10 @@ impl CloudProvider for S3Provider {
                     .last_modified()
                     .map(|d| unix_secs_to_filetime(d.secs()))
                     .unwrap_or(0);
-                files.push((name.to_string(), FileStat { size, mtime_filetime }));
+                page_files.push((name.to_string(), FileStat { size, mtime_filetime }));
             }
+
+            on_page(ListDirResult { dirs: page_dirs, files: page_files });
 
             match resp.next_continuation_token() {
                 Some(t) => cont = Some(t.to_string()),
@@ -136,7 +153,7 @@ impl CloudProvider for S3Provider {
             }
         }
 
-        Ok(ListDirResult { dirs, files })
+        Ok(())
     }
 
     async fn stat(&self, key: &str) -> Result<Option<FileStat>, ProviderError> {

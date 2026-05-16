@@ -75,8 +75,11 @@ use crate::types::{FileLockEvent, TransferPayload};
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
 
-const LIST_TTL: Duration = Duration::from_secs(5);
-const META_TTL: Duration = Duration::from_secs(5);
+// 60s matches Mountain Duck's default — long enough that Explorer scrolling
+// doesn't thrash the cache, short enough that out-of-band changes show up
+// within a minute.
+const LIST_TTL: Duration = Duration::from_secs(60);
+const META_TTL: Duration = Duration::from_secs(60);
 /// S3 multipart minimum is 5 MiB except for the last part. We target 8 MiB to
 /// amortise request overhead but still emit progress events frequently.
 const PART_TARGET: usize = 16 * 1024 * 1024;
@@ -84,6 +87,10 @@ const PART_TARGET: usize = 16 * 1024 * 1024;
 /// default and saturates most home uplinks without exhausting connection
 /// pools.
 const UPLOAD_CONCURRENCY: usize = 8;
+/// How many cache blocks we fetch in parallel when materializing a file on
+/// open. Same rationale as `UPLOAD_CONCURRENCY` — saturates uplinks without
+/// exhausting connection pools.
+const MATERIALIZE_CONCURRENCY: usize = 8;
 /// Only emit transfer_progress for files at or above this size. Smaller files
 /// don't need the UI noise.
 const MIN_TRANSFER_BYTES: u64 = 256 * 1024;
@@ -100,13 +107,31 @@ pub struct Meta {
     mtime_filetime: u64,
 }
 
+impl Meta {
+    /// Construct a non-directory `Meta` from on-disk cache data.
+    pub fn new_file(size: u64, mtime_filetime: u64) -> Self {
+        Self { is_dir: false, size, mtime_filetime }
+    }
+    pub fn size(&self) -> u64 { self.size }
+    pub fn mtime_filetime(&self) -> u64 { self.mtime_filetime }
+}
+
 /// Cached directory listing. Keyed by the directory's S3 prefix.
 #[derive(Clone)]
-struct CachedList {
+pub struct CachedList {
     /// Subdirectory names (just the last path component, no trailing slash).
-    dirs: Vec<String>,
+    pub(crate) dirs: Vec<String>,
     /// (filename, meta) pairs — filename is the last path component only.
-    files: Vec<(String, Meta)>,
+    pub(crate) files: Vec<(String, Meta)>,
+}
+
+impl CachedList {
+    /// Build a listing from already-decoded parts (used by the disk cache loader).
+    pub fn from_parts(dirs: Vec<String>, files: Vec<(String, Meta)>) -> Self {
+        Self { dirs, files }
+    }
+    pub fn dirs(&self) -> &[String] { &self.dirs }
+    pub fn files(&self) -> &[(String, Meta)] { &self.files }
 }
 
 /// Per-open-handle state. WinFsp stores these behind `Box<OpenFile>` and
@@ -115,7 +140,19 @@ struct CachedList {
 pub enum OpenFile {
     Dir {
         key: String, // "" for root
-        dir_buffer: DirBuffer,
+        /// Shared so the streaming enumeration background thread can write
+        /// pages into the same buffer that subsequent `read_directory` calls
+        /// will read from.
+        dir_buffer: Arc<DirBuffer>,
+        /// Set once the full S3 enumeration has completed (either streamed
+        /// or returned from cache as a single shot). When true, subsequent
+        /// `read_directory` calls skip the streaming kickoff and just
+        /// paginate the existing DirBuffer by marker.
+        enum_complete: Arc<AtomicBool>,
+        /// Set once the first streaming kickoff has been scheduled, so we
+        /// don't spawn duplicate worker threads if Explorer pounds
+        /// `read_directory` with marker=None during the warm-up window.
+        enum_started: Arc<AtomicBool>,
     },
     File {
         key: String,
@@ -131,6 +168,12 @@ pub enum OpenFile {
         /// sentinel during `open`/`create`. Consulted on `close` so we only
         /// release what we acquired.
         holds_writer_lock: AtomicBool,
+        /// Last `offset + len` seen by `read()` on this handle. Used to
+        /// detect sequential access patterns for read-ahead prefetch.
+        last_read_offset: Arc<Mutex<Option<u64>>>,
+        /// Count of consecutive sequential reads. Reset to 0 on a non-
+        /// sequential jump. Prefetch kicks in at >= 2.
+        sequential_streak: Arc<AtomicU64>,
     },
 }
 
@@ -262,8 +305,8 @@ pub struct S3Fs {
     /// transfers panel.
     emit_lock: Box<dyn Fn(FileLockEvent) + Send + Sync>,
 
-    list_cache: Mutex<HashMap<String, (Instant, CachedList)>>,
-    meta_cache: Mutex<HashMap<String, (Instant, Option<Meta>)>>,
+    list_cache: Arc<Mutex<HashMap<String, (Instant, CachedList)>>>,
+    meta_cache: Arc<Mutex<HashMap<String, (Instant, Option<Meta>)>>>,
 
     /// Single DACL blob returned for every file/directory. Everyone gets full
     /// access — we don't enforce ACLs on S3.
@@ -294,6 +337,12 @@ pub struct S3Fs {
     /// S3 and `invalidate_key` is a no-op.
     cache: Option<Arc<DiskCache>>,
 
+    /// Persistent disk-backed directory-listing cache. Lets large folders
+    /// (~hundreds of thousands of files) skip the 30-second S3 LIST
+    /// pagination on app restart. `None` when the block cache is disabled —
+    /// users who turn caching off expect no disk persistence at all.
+    disk_list_cache: Option<Arc<crate::dir_listing_cache::DirListingCache>>,
+
     /// Network reachability. Flipped to `false` on connection-class S3 errors
     /// and back to `true` on success. Read by `get_drive_connectivity`.
     pub connectivity: Arc<AtomicBool>,
@@ -320,9 +369,12 @@ impl S3Fs {
         cache: Option<Arc<DiskCache>>,
         emit_status: Box<dyn Fn(bool) + Send + Sync>,
         connectivity: Arc<AtomicBool>,
+        disk_list_cache_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
+        let disk_list_cache = disk_list_cache_dir
+            .map(|p| Arc::new(crate::dir_listing_cache::DirListingCache::new(p)));
 
         Ok(Self {
             rt,
@@ -335,8 +387,8 @@ impl S3Fs {
             next_xfer: AtomicU64::new(2_000_000),
             emit,
             emit_lock,
-            list_cache: Mutex::new(HashMap::new()),
-            meta_cache: Mutex::new(HashMap::new()),
+            list_cache: Arc::new(Mutex::new(HashMap::new())),
+            meta_cache: Arc::new(Mutex::new(HashMap::new())),
             security,
             local_writers: Mutex::new(HashSet::new()),
             machine_id,
@@ -346,6 +398,7 @@ impl S3Fs {
             cache,
             connectivity,
             emit_status,
+            disk_list_cache,
         })
     }
 
@@ -385,6 +438,38 @@ impl S3Fs {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(parent);
+        // Persistent disk listing: drop the entry so the next list_dir for
+        // this prefix re-fetches from S3 instead of replaying stale state
+        // after the app restarts.
+        if let Some(disk) = &self.disk_list_cache {
+            disk.invalidate(parent);
+        }
+    }
+
+    /// Seed the in-memory meta_cache for every entry in a freshly-acquired
+    /// listing. Shared between the S3-fetch path and the disk-hit path so
+    /// both populate stat() lookups identically.
+    fn seed_meta_from_listing(&self, prefix: &str, listing: &CachedList, now: Instant) {
+        let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let parent = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        for d in &listing.dirs {
+            let full = format!("{parent}{d}");
+            mc.insert(
+                full,
+                (
+                    now,
+                    Some(Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() }),
+                ),
+            );
+        }
+        for (name, meta) in &listing.files {
+            let full = format!("{parent}{name}");
+            mc.insert(full, (now, Some(meta.clone())));
+        }
     }
 
     fn invalidate_meta(&self, key: &str) {
@@ -414,6 +499,22 @@ impl S3Fs {
                 if at.elapsed() < LIST_TTL {
                     return Ok(cached.clone());
                 }
+            }
+        }
+
+        // Disk-backed listing cache. A fresh hit (<24h) is treated as the
+        // moral equivalent of a successful S3 fetch: we populate the
+        // in-memory list cache and seed meta_cache, then return without
+        // touching the network.
+        if let Some(disk) = &self.disk_list_cache {
+            if let Some(cached) = disk.load(prefix) {
+                let now = Instant::now();
+                self.list_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(prefix.to_string(), (now, cached.clone()));
+                self.seed_meta_from_listing(prefix, &cached, now);
+                return Ok(cached);
             }
         }
 
@@ -447,11 +548,289 @@ impl S3Fs {
         });
 
         let listing = result?;
+        let now = Instant::now();
         self.list_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(prefix.to_string(), (Instant::now(), listing.clone()));
+            .insert(prefix.to_string(), (now, listing.clone()));
+
+        // Persist to disk so the next app launch can skip the S3 LIST
+        // pagination for this prefix entirely.
+        if let Some(disk) = &self.disk_list_cache {
+            disk.save(prefix, &listing);
+        }
+
+        // Seed the meta_cache for every entry we just learned about. This
+        // turns subsequent stat() calls during folder scrolling into cache
+        // hits instead of re-walking the path from the root.
+        self.seed_meta_from_listing(prefix, &listing, now);
         Ok(listing)
+    }
+
+    /// Kick off a streaming directory enumeration for `key`. The first page
+    /// is awaited inline (with a 5-second hard cap) so the caller can return
+    /// SOMETHING to Explorer immediately even for million-entry folders. All
+    /// remaining S3 pages stream into `dir_buffer` from a background thread.
+    ///
+    /// Caches (in-memory list cache, on-disk listing cache, meta cache) are
+    /// populated atomically once the full enumeration completes — partial
+    /// enumerations are discarded so a network failure halfway through doesn't
+    /// poison the next open.
+    fn kick_off_streaming_enum(
+        &self,
+        key: String,
+        dir_buffer: Arc<DirBuffer>,
+        enum_complete: Arc<AtomicBool>,
+    ) {
+        // Fast path: in-memory cache hit. Drain the cached listing into the
+        // DirBuffer in one shot and mark complete. No background thread.
+        {
+            let cache = self.list_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((at, cached)) = cache.get(&key) {
+                if at.elapsed() < LIST_TTL {
+                    let cached = cached.clone();
+                    drop(cache);
+                    Self::write_full_listing(&dir_buffer, &key, &cached);
+                    enum_complete.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+
+        // Disk-backed listing cache hit. Same one-shot fill, plus seed the
+        // in-memory cache and meta_cache so subsequent stat()/list ops are
+        // fast.
+        if let Some(disk) = &self.disk_list_cache {
+            if let Some(cached) = disk.load(&key) {
+                let now = Instant::now();
+                self.list_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key.clone(), (now, cached.clone()));
+                self.seed_meta_from_listing(&key, &cached, now);
+                Self::write_full_listing(&dir_buffer, &key, &cached);
+                enum_complete.store(true, Ordering::Release);
+                return;
+            }
+        }
+
+        // Cold path: stream from the provider. We block the calling thread on
+        // the first page (with a 5s hard cap) and let the rest of the pages
+        // continue streaming in the background.
+        let provider = self.provider.clone();
+        let handle = self.rt.handle().clone();
+        let list_cache = self.list_cache.clone();
+        let meta_cache = self.meta_cache.clone();
+        let disk_list_cache = self.disk_list_cache.clone();
+        let dir_buffer_for_thread = dir_buffer.clone();
+        let enum_complete_for_thread = enum_complete.clone();
+        let key_for_thread = key.clone();
+
+        let (first_page_tx, first_page_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let signaled = Arc::new(AtomicBool::new(false));
+        let signaled_for_thread = signaled.clone();
+
+        std::thread::spawn(move || {
+            // Aggregated entries that have been written to the DirBuffer so
+            // far. Each new page is concat'd onto the appropriate vec and the
+            // buffer is re-filled. WinFsp's DirBuffer keeps entries sorted by
+            // name internally, so we don't need to sort here.
+            let agg_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let agg_files: Arc<Mutex<Vec<(String, Meta)>>> =
+                Arc::new(Mutex::new(Vec::new()));
+
+            let key_inner = key_for_thread.clone();
+            let dirbuf_inner = dir_buffer_for_thread.clone();
+            let signaled_inner = signaled_for_thread.clone();
+            let agg_dirs_inner = agg_dirs.clone();
+            let agg_files_inner = agg_files.clone();
+            let meta_cache_inner = meta_cache.clone();
+            let key_for_meta_seed = key_for_thread.clone();
+            let first_page_tx_inner = first_page_tx.clone();
+            let key_inner_for_call = key_for_thread.clone();
+
+            let stream_result: Result<(), String> = handle.block_on(async move {
+                let mut on_page = move |page: crate::providers::ListDirResult| {
+                    // Convert provider Meta → VFS Meta and accumulate.
+                    let mut new_dirs = page.dirs;
+                    let mut new_files: Vec<(String, Meta)> = page
+                        .files
+                        .into_iter()
+                        .map(|(n, s)| {
+                            (
+                                n,
+                                Meta {
+                                    is_dir: false,
+                                    size: s.size,
+                                    mtime_filetime: s.mtime_filetime,
+                                },
+                            )
+                        })
+                        .collect();
+
+                    // Seed meta_cache as pages arrive so concurrent stat()
+                    // lookups don't have to wait for the full enumeration.
+                    {
+                        let now = Instant::now();
+                        let parent = if key_for_meta_seed.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{key_for_meta_seed}/")
+                        };
+                        let mut mc =
+                            meta_cache_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        for d in &new_dirs {
+                            let full = format!("{parent}{d}");
+                            mc.insert(
+                                full,
+                                (
+                                    now,
+                                    Some(Meta {
+                                        is_dir: true,
+                                        size: 0,
+                                        mtime_filetime: now_filetime(),
+                                    }),
+                                ),
+                            );
+                        }
+                        for (name, meta) in &new_files {
+                            let full = format!("{parent}{name}");
+                            mc.insert(full, (now, Some(meta.clone())));
+                        }
+                    }
+
+                    {
+                        let mut d = agg_dirs_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        d.append(&mut new_dirs);
+                    }
+                    {
+                        let mut f = agg_files_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        f.append(&mut new_files);
+                    }
+
+                    // Re-fill the DirBuffer with everything we have so far.
+                    // reset=true wipes the previous fill; the buffer will
+                    // re-sort and re-index the entries internally. This is
+                    // O(n) per page (so O(n*pages) total) but each entry is
+                    // ~600 bytes and pages arrive on S3 timescales, so the
+                    // CPU cost is negligible compared to the network wait.
+                    let dirs_snap = agg_dirs_inner
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    let files_snap = agg_files_inner
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    let listing = CachedList { dirs: dirs_snap, files: files_snap };
+                    Self::write_full_listing(&dirbuf_inner, &key_inner, &listing);
+
+                    // Unblock the foreground read_directory call once the
+                    // first page has been written. Subsequent pages keep
+                    // streaming into the same DirBuffer.
+                    if !signaled_inner.swap(true, Ordering::SeqCst) {
+                        let _ = first_page_tx_inner.try_send(());
+                    }
+                };
+
+                provider
+                    .list_dir_stream(&key_inner_for_call, &mut on_page)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+
+            match stream_result {
+                Ok(()) => {
+                    // Successful full enumeration — commit to caches.
+                    let dirs = agg_dirs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let files = agg_files.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let listing = CachedList { dirs, files };
+                    let now = Instant::now();
+                    list_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(key_for_thread.clone(), (now, listing.clone()));
+                    if let Some(disk) = disk_list_cache.as_ref() {
+                        disk.save(&key_for_thread, &listing);
+                    }
+                    tracing::info!(
+                        target: "nanocrew::vfs",
+                        "list_dir_stream key={:?} complete dirs={} files={}",
+                        key_for_thread,
+                        listing.dirs.len(),
+                        listing.files.len(),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "nanocrew::vfs",
+                        "list_dir_stream key={:?} failed: {e}",
+                        key_for_thread,
+                    );
+                }
+            }
+
+            enum_complete_for_thread.store(true, Ordering::Release);
+            // Make sure foreground is unblocked even if zero pages arrived
+            // (empty dir or immediate error).
+            if !signaled_for_thread.swap(true, Ordering::SeqCst) {
+                // sync_channel(1) — try_send is best-effort.
+                let _ = first_page_tx.try_send(());
+            }
+        });
+
+        // Block the foreground for up to 5 seconds. Returning here with no
+        // entries is fine — Explorer will keep polling read_directory by
+        // marker and pick up entries the background thread is still writing.
+        let _ = first_page_rx.recv_timeout(Duration::from_secs(5));
+    }
+
+    /// Re-fill `dir_buffer` from scratch with the supplied listing. Adds
+    /// "."/".." for non-root directories. Called both from the streaming
+    /// background thread on each page and from the cache-hit fast path.
+    fn write_full_listing(dir_buffer: &DirBuffer, key: &str, listing: &CachedList) {
+        let lock = match dir_buffer.acquire(true, None) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    target: "nanocrew::vfs",
+                    "dir_buffer.acquire key={key:?}: {e:?}"
+                );
+                return;
+            }
+        };
+
+        if !key.is_empty() {
+            let m = Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() };
+            let mut dot = DirInfo::<255>::new();
+            if dot.set_name(".").is_ok() {
+                fill_file_info(dot.file_info_mut(), &m);
+                let _ = lock.write(&mut dot);
+            }
+            let mut dd = DirInfo::<255>::new();
+            if dd.set_name("..").is_ok() {
+                fill_file_info(dd.file_info_mut(), &m);
+                let _ = lock.write(&mut dd);
+            }
+        }
+
+        for d in &listing.dirs {
+            let mut info = DirInfo::<255>::new();
+            if info.set_name(d.as_str()).is_err() {
+                continue;
+            }
+            let m = Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() };
+            fill_file_info(info.file_info_mut(), &m);
+            let _ = lock.write(&mut info);
+        }
+        for (name, meta) in &listing.files {
+            let mut info = DirInfo::<255>::new();
+            if info.set_name(name.as_str()).is_err() {
+                continue;
+            }
+            fill_file_info(info.file_info_mut(), meta);
+            let _ = lock.write(&mut info);
+        }
     }
 
     /// Resolve a path (which may have arbitrary case from Windows) to its
@@ -667,6 +1046,117 @@ impl S3Fs {
             pos = block_limit;
         }
         Ok(out)
+    }
+
+    /// Materialize an entire file into the block cache by fetching all missing
+    /// blocks in parallel. Called synchronously from `open()` for Office docs,
+    /// PDFs, and other small files — apps that issue many scattered small
+    /// reads (Excel, Word, PowerPoint, PDF viewers) see the file as instantly
+    /// available once `open()` returns instead of stuttering through dozens
+    /// of 1 MiB block-miss round-trips.
+    fn materialize_file(&self, key: &str, size: u64) -> Result<(), String> {
+        let Some(cache) = self.cache.as_ref().filter(|c| c.is_enabled()) else {
+            return Ok(());
+        };
+        if size == 0 {
+            return Ok(());
+        }
+
+        let mut missing: Vec<u64> = Vec::new();
+        let mut block_start = 0u64;
+        while block_start < size {
+            if cache.get_block(key, block_start).is_none() {
+                missing.push(block_start);
+            }
+            block_start += CACHE_BLOCK;
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let key_owned = key.to_string();
+        let provider = self.provider.clone();
+        let cache_cloned = cache.clone();
+        let limiter = self.download_limiter.clone();
+
+        self.rt.block_on(async move {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            use std::future::Future;
+            use std::pin::Pin;
+            type BlockFut = Pin<Box<dyn Future<Output = (u64, Result<bytes::Bytes, crate::providers::ProviderError>)> + Send>>;
+            let mut tasks: FuturesUnordered<BlockFut> = FuturesUnordered::new();
+            let mut next = 0;
+
+            let spawn_one = |start: u64| -> BlockFut {
+                let p = provider.clone();
+                let k = key_owned.clone();
+                let lim = limiter.clone();
+                Box::pin(async move {
+                    lim.acquire(CACHE_BLOCK).await;
+                    let res = p.get_range(&k, start, CACHE_BLOCK).await;
+                    (start, res)
+                })
+            };
+
+            while next < missing.len() && tasks.len() < MATERIALIZE_CONCURRENCY {
+                tasks.push(spawn_one(missing[next]));
+                next += 1;
+            }
+
+            while let Some((start, res)) = tasks.next().await {
+                match res {
+                    Ok(bytes) => cache_cloned.put_block(&key_owned, start, bytes.as_ref()),
+                    Err(e) => {
+                        tracing::warn!(target: "nanocrew::vfs",
+                            "materialize block {start}: {e}");
+                    }
+                }
+                if next < missing.len() {
+                    tasks.push(spawn_one(missing[next]));
+                    next += 1;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Fire-and-forget background prefetch of the next N blocks starting from
+    /// `from_offset`. Called from `read()` once a sequential access pattern is
+    /// detected. Silently no-ops when the cache is disabled.
+    fn prefetch_ahead(&self, key: &str, from_offset: u64, file_size: u64, block_count: usize) {
+        let Some(cache) = self.cache.as_ref().filter(|c| c.is_enabled()) else { return; };
+        let key_owned = key.to_string();
+        let provider = self.provider.clone();
+        let cache_cloned = cache.clone();
+        let limiter = self.download_limiter.clone();
+        let aligned = from_offset - (from_offset % CACHE_BLOCK);
+
+        self.rt.spawn(async move {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            let mut tasks = FuturesUnordered::new();
+            for i in 0..block_count {
+                let start = aligned + (i as u64) * CACHE_BLOCK;
+                if start >= file_size { break; }
+                if cache_cloned.get_block(&key_owned, start).is_some() { continue; }
+                let p = provider.clone();
+                let k = key_owned.clone();
+                let lim = limiter.clone();
+                tasks.push(async move {
+                    lim.acquire(CACHE_BLOCK).await;
+                    let res = p.get_range(&k, start, CACHE_BLOCK).await;
+                    (start, res)
+                });
+            }
+            while let Some((start, res)) = tasks.next().await {
+                match res {
+                    Ok(bytes) => cache_cloned.put_block(&key_owned, start, bytes.as_ref()),
+                    Err(e) => {
+                        tracing::warn!(target: "nanocrew::vfs",
+                            "prefetch block {start}: {e}");
+                    }
+                }
+            }
+        });
     }
 
     // ── Upload path ──────────────────────────────────────────────────────────
@@ -1192,6 +1682,25 @@ fn is_internal_key(key: &str) -> bool {
         || key.starts_with(".nanocrew/")
 }
 
+/// Decide whether to materialize an entire file into the block cache at
+/// `open()` time. Office documents and PDFs always qualify (up to 50 MB)
+/// because they issue many small scattered reads; other small files
+/// (<= 4 MiB) qualify because the round-trip count savings outweigh the
+/// brief `open()` blocking cost.
+fn should_materialize(key: &str, size: u64) -> bool {
+    const SMALL_FILE_BYTES: u64 = 50 * 1024 * 1024;
+    if size > SMALL_FILE_BYTES { return false; }
+    let lower = key.to_ascii_lowercase();
+    if lower.ends_with(".xlsx") || lower.ends_with(".xlsm") || lower.ends_with(".xlsb")
+        || lower.ends_with(".docx") || lower.ends_with(".docm")
+        || lower.ends_with(".pptx") || lower.ends_with(".pptm")
+        || lower.ends_with(".pdf")
+        || lower.ends_with(".xls") || lower.ends_with(".doc") || lower.ends_with(".ppt") {
+        return true;
+    }
+    size <= 4 * 1024 * 1024
+}
+
 impl S3Fs {
     /// Emit a file-lock event. Non-fatal if the frontend isn't listening.
     fn emit_lock(&self, ev: FileLockEvent) {
@@ -1330,9 +1839,14 @@ impl FileSystemContext for S3Fs {
         let handle = if meta.is_dir {
             OpenFile::Dir {
                 key: real_key,
-                dir_buffer: DirBuffer::new(),
+                dir_buffer: Arc::new(DirBuffer::new()),
+                enum_complete: Arc::new(AtomicBool::new(false)),
+                enum_started: Arc::new(AtomicBool::new(false)),
             }
         } else {
+            if should_materialize(&real_key, meta.size) {
+                let _ = self.materialize_file(&real_key, meta.size);
+            }
             OpenFile::File {
                 key: real_key,
                 meta: Mutex::new(meta),
@@ -1340,6 +1854,8 @@ impl FileSystemContext for S3Fs {
                 download: Mutex::new(None),
                 pending_delete: AtomicBool::new(false),
                 holds_writer_lock: AtomicBool::new(took_local),
+                last_read_offset: Arc::new(Mutex::new(None)),
+                sequential_streak: Arc::new(AtomicU64::new(0)),
             }
         };
         Ok(Box::new(handle))
@@ -1482,7 +1998,9 @@ impl FileSystemContext for S3Fs {
             fill_file_info(file_info.as_mut(), &meta);
             return Ok(Box::new(OpenFile::Dir {
                 key,
-                dir_buffer: DirBuffer::new(),
+                dir_buffer: Arc::new(DirBuffer::new()),
+                enum_complete: Arc::new(AtomicBool::new(false)),
+                enum_started: Arc::new(AtomicBool::new(false)),
             }));
         }
 
@@ -1571,6 +2089,8 @@ impl FileSystemContext for S3Fs {
             download: Mutex::new(None),
             pending_delete: AtomicBool::new(false),
             holds_writer_lock: AtomicBool::new(took_local),
+            last_read_offset: Arc::new(Mutex::new(None)),
+            sequential_streak: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -1680,72 +2200,36 @@ impl FileSystemContext for S3Fs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let (key, dir_buffer) = match context.as_ref() {
-            OpenFile::Dir { key, dir_buffer } => (key, dir_buffer),
+        let (key, dir_buffer, enum_complete, enum_started) = match context.as_ref() {
+            OpenFile::Dir { key, dir_buffer, enum_complete, enum_started } => {
+                (key.clone(), dir_buffer.clone(), enum_complete.clone(), enum_started.clone())
+            }
             _ => return Err(nt(STATUS_NOT_A_DIRECTORY)),
         };
 
-        // Populate the dir buffer on first call (marker is None). Reuse on
-        // subsequent calls via marker-based pagination.
-        if marker.is_none() {
-            let listing = self
-                .list_dir(key)
-                .map_err(|e| {
-                    tracing::error!(target: "nanocrew::vfs",
-                        "read_directory key={key:?} failed: {e}");
-                    nt(STATUS_ACCESS_DENIED)
-                })?;
-            let lock = dir_buffer.acquire(true, None)?;
-
-            // "." and ".." for subdirectories (not for root).
-            if !key.is_empty() {
-                let mut dot = DirInfo::<255>::new();
-                dot.set_name(".").ok();
-                let m = Meta {
-                    is_dir: true,
-                    size: 0,
-                    mtime_filetime: now_filetime(),
-                };
-                fill_file_info(dot.file_info_mut(), &m);
-                let _ = lock.write(&mut dot);
-
-                let mut dd = DirInfo::<255>::new();
-                dd.set_name("..").ok();
-                fill_file_info(dd.file_info_mut(), &m);
-                let _ = lock.write(&mut dd);
-            }
-
-            for d in &listing.dirs {
-                let mut info = DirInfo::<255>::new();
-                if info.set_name(d.as_str()).is_err() {
-                    continue;
-                }
-                let m = Meta {
-                    is_dir: true,
-                    size: 0,
-                    mtime_filetime: now_filetime(),
-                };
-                fill_file_info(info.file_info_mut(), &m);
-                let _ = lock.write(&mut info);
-            }
-            for (name, meta) in &listing.files {
-                let mut info = DirInfo::<255>::new();
-                if info.set_name(name.as_str()).is_err() {
-                    continue;
-                }
-                fill_file_info(info.file_info_mut(), meta);
-                let _ = lock.write(&mut info);
-            }
+        // First call into this directory handle (marker=None) AND the
+        // enumeration hasn't been kicked off yet. Spawn a background thread
+        // to walk S3 pages, then block up to 5 seconds waiting for the first
+        // page so Explorer has something to render before we return.
+        if marker.is_none()
+            && !enum_complete.load(Ordering::Relaxed)
+            && !enum_started.swap(true, Ordering::SeqCst)
+        {
+            self.kick_off_streaming_enum(
+                key.clone(),
+                dir_buffer.clone(),
+                enum_complete.clone(),
+            );
         }
 
         Ok(dir_buffer.read(marker, buffer))
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
-        let (key, size, download) = match context.as_ref() {
-            OpenFile::File { key, meta, download, .. } => {
+        let (key, size, download, last_read_offset, sequential_streak) = match context.as_ref() {
+            OpenFile::File { key, meta, download, last_read_offset, sequential_streak, .. } => {
                 let m = meta.lock().unwrap_or_else(|p| p.into_inner());
-                (key.clone(), m.size, download)
+                (key.clone(), m.size, download, last_read_offset.clone(), sequential_streak.clone())
             }
             _ => return Err(nt(STATUS_INVALID_PARAMETER)),
         };
@@ -1753,6 +2237,21 @@ impl FileSystemContext for S3Fs {
             return Err(nt(STATUS_END_OF_FILE));
         }
         let avail = (size - offset).min(buffer.len() as u64);
+
+        let last_off = {
+            let mut g = last_read_offset.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = *g;
+            *g = Some(offset + avail);
+            prev
+        };
+        let is_sequential = matches!(last_off, Some(prev) if prev == offset || prev + CACHE_BLOCK >= offset);
+        let streak = if is_sequential {
+            sequential_streak.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            sequential_streak.store(0, Ordering::Relaxed);
+            0
+        };
+
         let bytes = self
             .get_range(&key, offset, avail)
             .map_err(|e| {
@@ -1762,6 +2261,10 @@ impl FileSystemContext for S3Fs {
         let n = bytes.len().min(buffer.len());
         buffer[..n].copy_from_slice(&bytes[..n]);
         self.emit_download_progress(download, &key, size, n as u64);
+
+        if streak >= 2 && self.cache.as_ref().is_some_and(|c| c.is_enabled()) {
+            self.prefetch_ahead(&key, offset + avail, size, 4);
+        }
         Ok(n as u32)
     }
 

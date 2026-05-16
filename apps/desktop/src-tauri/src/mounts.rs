@@ -168,6 +168,21 @@ pub fn spawn_mount(
     let connectivity = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let connectivity_for_thread = std::sync::Arc::clone(&connectivity);
 
+    // Persistent dir-listing cache root. Tied to the same enable/quota flag
+    // as the block cache so the two are managed together — disabling the
+    // cache also stops writing dir-listing JSON to disk.
+    let disk_list_cache_dir: Option<std::path::PathBuf> =
+        if config.cache_enabled && config.cache_max_bytes > 0 {
+            Some(
+                config
+                    .cache_root
+                    .join(format!("drive-{}", config.drive_id))
+                    .join("dir-listings"),
+            )
+        } else {
+            None
+        };
+
     let thread = std::thread::Builder::new()
         .name(format!("winfsp-{}", config.letter))
         .spawn(move || {
@@ -284,6 +299,7 @@ pub fn spawn_mount(
                     );
                 }),
                 connectivity_for_thread,
+                disk_list_cache_dir,
             ) {
                 Ok(c) => c,
                 Err(e) => {

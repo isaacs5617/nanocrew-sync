@@ -82,6 +82,15 @@ const LIST_TTL: Duration = Duration::from_secs(60);
 const META_TTL: Duration = Duration::from_secs(60);
 /// S3 multipart minimum is 5 MiB except for the last part. We target 8 MiB to
 /// amortise request overhead but still emit progress events frequently.
+/// Maximum directory entries enumerated for a single folder. Windows Explorer
+/// becomes unresponsive well before millions of items regardless of backend,
+/// and WinFsp's DirBuffer holds every entry in memory. Capping bounds memory
+/// (~60 MB) and first-load time (~100 S3 calls). Folders larger than this are
+/// truncated with a sentinel entry; users should use Search or subfolders.
+const MAX_DIR_ENTRIES: usize = 100_000;
+/// Filename shown at the end of a truncated listing so the truncation is
+/// visible rather than silent.
+const TRUNCATION_SENTINEL: &str = "⚠ FOLDER TOO LARGE — listing truncated, use Search.txt";
 const PART_TARGET: usize = 16 * 1024 * 1024;
 /// How many multipart part uploads we run in parallel. 8 matches the AWS CLI
 /// default and saturates most home uplinks without exhausting connection
@@ -614,9 +623,16 @@ impl S3Fs {
             }
         }
 
-        // Cold path: stream from the provider. We block the calling thread on
-        // the first page (with a 5s hard cap) and let the rest of the pages
-        // continue streaming in the background.
+        // Cold path: fully enumerate the directory (up to MAX_DIR_ENTRIES),
+        // then fill the WinFsp DirBuffer exactly once.
+        //
+        // WinFsp's DirBuffer is fill-once by design: once released, Explorer
+        // reads it to completion by marker and the buffer can't be appended
+        // to. The previous approach re-filled (acquire reset=true) on every
+        // S3 page, which is O(pages * entries) — pathological for folders with
+        // millions of items (it pegged CPU and ballooned memory, freezing
+        // Explorer). A single fill is O(n), and the cap bounds both memory
+        // (~60 MB at 100k entries) and first-load time (~100 S3 calls).
         let provider = self.provider.clone();
         let handle = self.rt.handle().clone();
         let list_cache = self.list_cache.clone();
@@ -626,33 +642,20 @@ impl S3Fs {
         let enum_complete_for_thread = enum_complete.clone();
         let key_for_thread = key.clone();
 
-        let (first_page_tx, first_page_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let signaled = Arc::new(AtomicBool::new(false));
-        let signaled_for_thread = signaled.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
         std::thread::spawn(move || {
-            // Aggregated entries that have been written to the DirBuffer so
-            // far. Each new page is concat'd onto the appropriate vec and the
-            // buffer is re-filled. WinFsp's DirBuffer keeps entries sorted by
-            // name internally, so we don't need to sort here.
-            let agg_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-            let agg_files: Arc<Mutex<Vec<(String, Meta)>>> =
-                Arc::new(Mutex::new(Vec::new()));
+            let key_for_call = key_for_thread.clone();
+            let key_for_meta = key_for_thread.clone();
+            let mut all_dirs: Vec<String> = Vec::new();
+            let mut all_files: Vec<(String, Meta)> = Vec::new();
+            let mut capped = false;
 
-            let key_inner = key_for_thread.clone();
-            let dirbuf_inner = dir_buffer_for_thread.clone();
-            let signaled_inner = signaled_for_thread.clone();
-            let agg_dirs_inner = agg_dirs.clone();
-            let agg_files_inner = agg_files.clone();
-            let meta_cache_inner = meta_cache.clone();
-            let key_for_meta_seed = key_for_thread.clone();
-            let first_page_tx_inner = first_page_tx.clone();
-            let key_inner_for_call = key_for_thread.clone();
-
-            let stream_result: Result<(), String> = handle.block_on(async move {
-                let mut on_page = move |page: crate::providers::ListDirResult| {
-                    // Convert provider Meta → VFS Meta and accumulate.
-                    let mut new_dirs = page.dirs;
+            let stream_result: Result<(), String> = handle.block_on(async {
+                let dirs_ref = &mut all_dirs;
+                let files_ref = &mut all_files;
+                let capped_ref = &mut capped;
+                let mut on_page = |page: crate::providers::ListDirResult| -> bool {
                     let mut new_files: Vec<(String, Meta)> = page
                         .files
                         .into_iter()
@@ -669,20 +672,19 @@ impl S3Fs {
                         .collect();
 
                     // Seed meta_cache as pages arrive so concurrent stat()
-                    // lookups don't have to wait for the full enumeration.
+                    // lookups don't wait for the full enumeration.
                     {
                         let now = Instant::now();
-                        let parent = if key_for_meta_seed.is_empty() {
+                        let parent = if key_for_meta.is_empty() {
                             String::new()
                         } else {
-                            format!("{key_for_meta_seed}/")
+                            format!("{key_for_meta}/")
                         };
                         let mut mc =
-                            meta_cache_inner.lock().unwrap_or_else(|p| p.into_inner());
-                        for d in &new_dirs {
-                            let full = format!("{parent}{d}");
+                            meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+                        for d in &page.dirs {
                             mc.insert(
-                                full,
+                                format!("{parent}{d}"),
                                 (
                                     now,
                                     Some(Meta {
@@ -694,95 +696,82 @@ impl S3Fs {
                             );
                         }
                         for (name, meta) in &new_files {
-                            let full = format!("{parent}{name}");
-                            mc.insert(full, (now, Some(meta.clone())));
+                            mc.insert(format!("{parent}{name}"), (now, Some(meta.clone())));
                         }
                     }
 
-                    {
-                        let mut d = agg_dirs_inner.lock().unwrap_or_else(|p| p.into_inner());
-                        d.append(&mut new_dirs);
-                    }
-                    {
-                        let mut f = agg_files_inner.lock().unwrap_or_else(|p| p.into_inner());
-                        f.append(&mut new_files);
-                    }
+                    dirs_ref.extend(page.dirs);
+                    files_ref.append(&mut new_files);
 
-                    // Re-fill the DirBuffer with everything we have so far.
-                    // reset=true wipes the previous fill; the buffer will
-                    // re-sort and re-index the entries internally. This is
-                    // O(n) per page (so O(n*pages) total) but each entry is
-                    // ~600 bytes and pages arrive on S3 timescales, so the
-                    // CPU cost is negligible compared to the network wait.
-                    let dirs_snap = agg_dirs_inner
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    let files_snap = agg_files_inner
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    let listing = CachedList { dirs: dirs_snap, files: files_snap };
-                    Self::write_full_listing(&dirbuf_inner, &key_inner, &listing);
-
-                    // Unblock the foreground read_directory call once the
-                    // first page has been written. Subsequent pages keep
-                    // streaming into the same DirBuffer.
-                    if !signaled_inner.swap(true, Ordering::SeqCst) {
-                        let _ = first_page_tx_inner.try_send(());
+                    // Stop paginating once we hit the cap — bounds time+memory
+                    // on pathologically large folders.
+                    if dirs_ref.len() + files_ref.len() >= MAX_DIR_ENTRIES {
+                        *capped_ref = true;
+                        return false;
                     }
+                    true
                 };
 
                 provider
-                    .list_dir_stream(&key_inner_for_call, &mut on_page)
+                    .list_dir_stream(&key_for_call, &mut on_page)
                     .await
                     .map_err(|e| e.to_string())
             });
 
             match stream_result {
                 Ok(()) => {
-                    // Successful full enumeration — commit to caches.
-                    let dirs = agg_dirs.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let files = agg_files.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let listing = CachedList { dirs, files };
+                    if capped {
+                        // Surface a clear, harmless sentinel so users know the
+                        // listing was truncated rather than silently partial.
+                        all_files.push((
+                            TRUNCATION_SENTINEL.to_string(),
+                            Meta { is_dir: false, size: 0, mtime_filetime: now_filetime() },
+                        ));
+                    }
+                    let listing = CachedList { dirs: all_dirs, files: all_files };
+                    // Single fill — O(n), one acquire/release.
+                    Self::write_full_listing(&dir_buffer_for_thread, &key_for_thread, &listing);
+
                     let now = Instant::now();
                     list_cache
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(key_for_thread.clone(), (now, listing.clone()));
-                    if let Some(disk) = disk_list_cache.as_ref() {
-                        disk.save(&key_for_thread, &listing);
+                    // Only persist complete enumerations to disk — a truncated
+                    // listing shouldn't masquerade as the whole folder across
+                    // restarts.
+                    if !capped {
+                        if let Some(disk) = disk_list_cache.as_ref() {
+                            disk.save(&key_for_thread, &listing);
+                        }
                     }
                     tracing::info!(
                         target: "nanocrew::vfs",
-                        "list_dir_stream key={:?} complete dirs={} files={}",
+                        "enum key={:?} dirs={} files={} capped={}",
                         key_for_thread,
                         listing.dirs.len(),
                         listing.files.len(),
+                        capped,
                     );
                 }
                 Err(e) => {
                     tracing::error!(
                         target: "nanocrew::vfs",
-                        "list_dir_stream key={:?} failed: {e}",
+                        "enum key={:?} failed: {e}",
                         key_for_thread,
                     );
                 }
             }
 
             enum_complete_for_thread.store(true, Ordering::Release);
-            // Make sure foreground is unblocked even if zero pages arrived
-            // (empty dir or immediate error).
-            if !signaled_for_thread.swap(true, Ordering::SeqCst) {
-                // sync_channel(1) — try_send is best-effort.
-                let _ = first_page_tx.try_send(());
-            }
+            let _ = done_tx.try_send(());
         });
 
-        // Block the foreground for up to 5 seconds. Returning here with no
-        // entries is fine — Explorer will keep polling read_directory by
-        // marker and pick up entries the background thread is still writing.
-        let _ = first_page_rx.recv_timeout(Duration::from_secs(5));
+        // Block the foreground until the enumeration + single fill completes.
+        // Bounded by the entry cap (~100 S3 calls) in the normal case; the
+        // 120s safety timeout means a hung backend can't freeze Explorer
+        // indefinitely.
+        let _ = done_rx.recv_timeout(Duration::from_secs(120));
     }
 
     /// Re-fill `dir_buffer` from scratch with the supplied listing. Adds

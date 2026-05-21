@@ -74,6 +74,7 @@ impl CloudProvider for S3Provider {
         let mut callback = |p: ListDirResult| {
             acc.dirs.extend(p.dirs);
             acc.files.extend(p.files);
+            true
         };
         self.list_dir_stream(prefix, &mut callback).await?;
         Ok(acc)
@@ -82,7 +83,7 @@ impl CloudProvider for S3Provider {
     async fn list_dir_stream(
         &self,
         prefix: &str,
-        on_page: &mut (dyn FnMut(ListDirResult) + Send),
+        on_page: &mut (dyn FnMut(ListDirResult) -> bool + Send),
     ) -> Result<(), ProviderError> {
         let s3_prefix = if prefix.is_empty() {
             self.bucket_prefix.clone()
@@ -145,7 +146,10 @@ impl CloudProvider for S3Provider {
                 page_files.push((name.to_string(), FileStat { size, mtime_filetime }));
             }
 
-            on_page(ListDirResult { dirs: page_dirs, files: page_files });
+            let keep_going = on_page(ListDirResult { dirs: page_dirs, files: page_files });
+            if !keep_going {
+                break;
+            }
 
             match resp.next_continuation_token() {
                 Some(t) => cont = Some(t.to_string()),

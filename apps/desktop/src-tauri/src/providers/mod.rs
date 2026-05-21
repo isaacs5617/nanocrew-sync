@@ -67,18 +67,19 @@ pub trait CloudProvider: Send + Sync {
     async fn list_dir(&self, prefix: &str) -> Result<ListDirResult, ProviderError>;
 
     /// Stream a directory listing, invoking `on_page` for each provider page
-    /// as it arrives. The default implementation calls `list_dir` once (good
+    /// as it arrives. `on_page` returns `false` to request that pagination
+    /// stop early (used to enforce an entry cap on pathologically large
+    /// folders). The default implementation calls `list_dir` once (good
     /// enough for providers where listing isn't paginated). Providers that DO
-    /// paginate (S3, Google Drive, OneDrive) override this for progressive
-    /// delivery — this is what lets Explorer render entries for huge folders
-    /// before the full pagination completes.
+    /// paginate (S3, Google Drive, OneDrive) override this so the caller can
+    /// bound how much it pulls.
     async fn list_dir_stream(
         &self,
         prefix: &str,
-        on_page: &mut (dyn FnMut(ListDirResult) + Send),
+        on_page: &mut (dyn FnMut(ListDirResult) -> bool + Send),
     ) -> Result<(), ProviderError> {
         let result = self.list_dir(prefix).await?;
-        on_page(result);
+        let _ = on_page(result);
         Ok(())
     }
 

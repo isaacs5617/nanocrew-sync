@@ -149,19 +149,10 @@ impl CachedList {
 pub enum OpenFile {
     Dir {
         key: String, // "" for root
-        /// Shared so the streaming enumeration background thread can write
-        /// pages into the same buffer that subsequent `read_directory` calls
-        /// will read from.
+        /// Per-handle WinFsp directory buffer. The fill happens inside the
+        /// `acquire` lock in `read_directory`, which WinFsp uses to serialize
+        /// concurrent enumeration of this handle.
         dir_buffer: Arc<DirBuffer>,
-        /// Set once the full S3 enumeration has completed (either streamed
-        /// or returned from cache as a single shot). When true, subsequent
-        /// `read_directory` calls skip the streaming kickoff and just
-        /// paginate the existing DirBuffer by marker.
-        enum_complete: Arc<AtomicBool>,
-        /// Set once the first streaming kickoff has been scheduled, so we
-        /// don't spawn duplicate worker threads if Explorer pounds
-        /// `read_directory` with marker=None during the warm-up window.
-        enum_started: Arc<AtomicBool>,
     },
     File {
         key: String,
@@ -315,7 +306,12 @@ pub struct S3Fs {
     emit_lock: Box<dyn Fn(FileLockEvent) + Send + Sync>,
 
     list_cache: Arc<Mutex<HashMap<String, (Instant, CachedList)>>>,
-    meta_cache: Arc<Mutex<HashMap<String, (Instant, Option<Meta>)>>>,
+    /// Keyed by LOWERCASE input key (S3 is case-sensitive but Windows is
+    /// not). The value stores the real-case key alongside the meta so the
+    /// fast path can return the canonical S3 key regardless of the case the
+    /// caller used — critical because materialize/get_range hit S3 with this
+    /// key and a wrong case 404s. `None` is a negative (not-found) cache entry.
+    meta_cache: Arc<Mutex<HashMap<String, (Instant, Option<(String, Meta)>)>>>,
 
     /// Single DACL blob returned for every file/directory. Everyone gets full
     /// access — we don't enforce ACLs on S3.
@@ -468,16 +464,16 @@ impl S3Fs {
         for d in &listing.dirs {
             let full = format!("{parent}{d}");
             mc.insert(
-                full,
+                full.to_ascii_lowercase(),
                 (
                     now,
-                    Some(Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() }),
+                    Some((full, Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() })),
                 ),
             );
         }
         for (name, meta) in &listing.files {
             let full = format!("{parent}{name}");
-            mc.insert(full, (now, Some(meta.clone())));
+            mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
         }
     }
 
@@ -485,7 +481,7 @@ impl S3Fs {
         self.meta_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(key);
+            .remove(&key.to_ascii_lowercase());
     }
 
     /// Drop all on-disk cached blocks for `key`. Called after uploads,
@@ -576,250 +572,175 @@ impl S3Fs {
         Ok(listing)
     }
 
-    /// Kick off a streaming directory enumeration for `key`. The first page
-    /// is awaited inline (with a 5-second hard cap) so the caller can return
-    /// SOMETHING to Explorer immediately even for million-entry folders. All
-    /// remaining S3 pages stream into `dir_buffer` from a background thread.
-    ///
-    /// Caches (in-memory list cache, on-disk listing cache, meta cache) are
-    /// populated atomically once the full enumeration completes — partial
-    /// enumerations are discarded so a network failure halfway through doesn't
-    /// poison the next open.
-    fn kick_off_streaming_enum(
-        &self,
-        key: String,
-        dir_buffer: Arc<DirBuffer>,
-        enum_complete: Arc<AtomicBool>,
-    ) {
-        // Fast path: in-memory cache hit. Drain the cached listing into the
-        // DirBuffer in one shot and mark complete. No background thread.
+    /// Resolve the full listing for a directory `key`, consulting (in order)
+    /// the in-memory cache, the on-disk listing cache, then the provider
+    /// (capped at `MAX_DIR_ENTRIES`). Successful results are written back to
+    /// both caches and the meta cache is seeded. This does NOT touch any
+    /// WinFsp DirBuffer — the caller fills the buffer while holding the
+    /// WinFsp acquire lock (see `read_directory`), which is what serializes
+    /// concurrent enumeration of the same handle.
+    fn listing_for(&self, key: &str) -> Result<CachedList, String> {
+        // In-memory cache.
         {
             let cache = self.list_cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((at, cached)) = cache.get(&key) {
+            if let Some((at, cached)) = cache.get(key) {
                 if at.elapsed() < LIST_TTL {
-                    let cached = cached.clone();
-                    drop(cache);
-                    Self::write_full_listing(&dir_buffer, &key, &cached);
-                    enum_complete.store(true, Ordering::Release);
-                    return;
+                    return Ok(cached.clone());
                 }
             }
         }
 
-        // Disk-backed listing cache hit. Same one-shot fill, plus seed the
-        // in-memory cache and meta_cache so subsequent stat()/list ops are
-        // fast.
+        // On-disk listing cache.
         if let Some(disk) = &self.disk_list_cache {
-            if let Some(cached) = disk.load(&key) {
+            if let Some(cached) = disk.load(key) {
                 let now = Instant::now();
                 self.list_cache
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .insert(key.clone(), (now, cached.clone()));
-                self.seed_meta_from_listing(&key, &cached, now);
-                Self::write_full_listing(&dir_buffer, &key, &cached);
-                enum_complete.store(true, Ordering::Release);
-                return;
+                    .insert(key.to_string(), (now, cached.clone()));
+                self.seed_meta_from_listing(key, &cached, now);
+                return Ok(cached);
             }
         }
 
-        // Cold path: fully enumerate the directory (up to MAX_DIR_ENTRIES),
-        // then fill the WinFsp DirBuffer exactly once.
-        //
-        // WinFsp's DirBuffer is fill-once by design: once released, Explorer
-        // reads it to completion by marker and the buffer can't be appended
-        // to. The previous approach re-filled (acquire reset=true) on every
-        // S3 page, which is O(pages * entries) — pathological for folders with
-        // millions of items (it pegged CPU and ballooned memory, freezing
-        // Explorer). A single fill is O(n), and the cap bounds both memory
-        // (~60 MB at 100k entries) and first-load time (~100 S3 calls).
-        let provider = self.provider.clone();
-        let handle = self.rt.handle().clone();
-        let list_cache = self.list_cache.clone();
-        let meta_cache = self.meta_cache.clone();
-        let disk_list_cache = self.disk_list_cache.clone();
-        let dir_buffer_for_thread = dir_buffer.clone();
-        let enum_complete_for_thread = enum_complete.clone();
-        let key_for_thread = key.clone();
+        // Provider enumeration, capped at MAX_DIR_ENTRIES to bound memory and
+        // time on pathologically large folders.
+        let mut all_dirs: Vec<String> = Vec::new();
+        let mut all_files: Vec<(String, Meta)> = Vec::new();
+        let mut capped = false;
+        let key_for_meta = key.to_string();
 
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let stream_result: Result<(), String> = self.rt.block_on(async {
+            let dirs_ref = &mut all_dirs;
+            let files_ref = &mut all_files;
+            let capped_ref = &mut capped;
+            let mut on_page = |page: crate::providers::ListDirResult| -> bool {
+                let mut new_files: Vec<(String, Meta)> = page
+                    .files
+                    .into_iter()
+                    .map(|(n, s)| {
+                        (
+                            n,
+                            Meta {
+                                is_dir: false,
+                                size: s.size,
+                                mtime_filetime: s.mtime_filetime,
+                            },
+                        )
+                    })
+                    .collect();
 
-        std::thread::spawn(move || {
-            let key_for_call = key_for_thread.clone();
-            let key_for_meta = key_for_thread.clone();
-            let mut all_dirs: Vec<String> = Vec::new();
-            let mut all_files: Vec<(String, Meta)> = Vec::new();
-            let mut capped = false;
-
-            let stream_result: Result<(), String> = handle.block_on(async {
-                let dirs_ref = &mut all_dirs;
-                let files_ref = &mut all_files;
-                let capped_ref = &mut capped;
-                let mut on_page = |page: crate::providers::ListDirResult| -> bool {
-                    let mut new_files: Vec<(String, Meta)> = page
-                        .files
-                        .into_iter()
-                        .map(|(n, s)| {
+                {
+                    let now = Instant::now();
+                    let parent = if key_for_meta.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{key_for_meta}/")
+                    };
+                    let mut mc =
+                        self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+                    for d in &page.dirs {
+                        let full = format!("{parent}{d}");
+                        mc.insert(
+                            full.to_ascii_lowercase(),
                             (
-                                n,
-                                Meta {
-                                    is_dir: false,
-                                    size: s.size,
-                                    mtime_filetime: s.mtime_filetime,
-                                },
-                            )
-                        })
-                        .collect();
-
-                    // Seed meta_cache as pages arrive so concurrent stat()
-                    // lookups don't wait for the full enumeration.
-                    {
-                        let now = Instant::now();
-                        let parent = if key_for_meta.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{key_for_meta}/")
-                        };
-                        let mut mc =
-                            meta_cache.lock().unwrap_or_else(|p| p.into_inner());
-                        for d in &page.dirs {
-                            mc.insert(
-                                format!("{parent}{d}"),
-                                (
-                                    now,
-                                    Some(Meta {
+                                now,
+                                Some((
+                                    full,
+                                    Meta {
                                         is_dir: true,
                                         size: 0,
                                         mtime_filetime: now_filetime(),
-                                    }),
-                                ),
-                            );
-                        }
-                        for (name, meta) in &new_files {
-                            mc.insert(format!("{parent}{name}"), (now, Some(meta.clone())));
-                        }
+                                    },
+                                )),
+                            ),
+                        );
                     }
-
-                    dirs_ref.extend(page.dirs);
-                    files_ref.append(&mut new_files);
-
-                    // Stop paginating once we hit the cap — bounds time+memory
-                    // on pathologically large folders.
-                    if dirs_ref.len() + files_ref.len() >= MAX_DIR_ENTRIES {
-                        *capped_ref = true;
-                        return false;
+                    for (name, meta) in &new_files {
+                        let full = format!("{parent}{name}");
+                        mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
                     }
-                    true
-                };
-
-                provider
-                    .list_dir_stream(&key_for_call, &mut on_page)
-                    .await
-                    .map_err(|e| e.to_string())
-            });
-
-            match stream_result {
-                Ok(()) => {
-                    if capped {
-                        // Surface a clear, harmless sentinel so users know the
-                        // listing was truncated rather than silently partial.
-                        all_files.push((
-                            TRUNCATION_SENTINEL.to_string(),
-                            Meta { is_dir: false, size: 0, mtime_filetime: now_filetime() },
-                        ));
-                    }
-                    let listing = CachedList { dirs: all_dirs, files: all_files };
-                    // Single fill — O(n), one acquire/release.
-                    Self::write_full_listing(&dir_buffer_for_thread, &key_for_thread, &listing);
-
-                    let now = Instant::now();
-                    list_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(key_for_thread.clone(), (now, listing.clone()));
-                    // Only persist complete enumerations to disk — a truncated
-                    // listing shouldn't masquerade as the whole folder across
-                    // restarts.
-                    if !capped {
-                        if let Some(disk) = disk_list_cache.as_ref() {
-                            disk.save(&key_for_thread, &listing);
-                        }
-                    }
-                    tracing::info!(
-                        target: "nanocrew::vfs",
-                        "enum key={:?} dirs={} files={} capped={}",
-                        key_for_thread,
-                        listing.dirs.len(),
-                        listing.files.len(),
-                        capped,
-                    );
                 }
-                Err(e) => {
-                    tracing::error!(
-                        target: "nanocrew::vfs",
-                        "enum key={:?} failed: {e}",
-                        key_for_thread,
-                    );
-                }
-            }
 
-            enum_complete_for_thread.store(true, Ordering::Release);
-            let _ = done_tx.try_send(());
+                dirs_ref.extend(page.dirs);
+                files_ref.append(&mut new_files);
+
+                if dirs_ref.len() + files_ref.len() >= MAX_DIR_ENTRIES {
+                    *capped_ref = true;
+                    return false;
+                }
+                true
+            };
+
+            self.provider
+                .list_dir_stream(key, &mut on_page)
+                .await
+                .map_err(|e| e.to_string())
         });
 
-        // Block the foreground until the enumeration + single fill completes.
-        // Bounded by the entry cap (~100 S3 calls) in the normal case; the
-        // 120s safety timeout means a hung backend can't freeze Explorer
-        // indefinitely.
-        let _ = done_rx.recv_timeout(Duration::from_secs(120));
+        stream_result?;
+
+        if capped {
+            all_files.push((
+                TRUNCATION_SENTINEL.to_string(),
+                Meta { is_dir: false, size: 0, mtime_filetime: now_filetime() },
+            ));
+        }
+        let listing = CachedList { dirs: all_dirs, files: all_files };
+
+        let now = Instant::now();
+        self.list_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string(), (now, listing.clone()));
+        if !capped {
+            if let Some(disk) = self.disk_list_cache.as_ref() {
+                disk.save(key, &listing);
+            }
+        }
+        tracing::info!(
+            target: "nanocrew::vfs",
+            "enum key={:?} dirs={} files={} capped={}",
+            key,
+            listing.dirs.len(),
+            listing.files.len(),
+            capped,
+        );
+        Ok(listing)
     }
 
-    /// Re-fill `dir_buffer` from scratch with the supplied listing. Adds
-    /// "."/".." for non-root directories. Called both from the streaming
-    /// background thread on each page and from the cache-hit fast path.
-    fn write_full_listing(dir_buffer: &DirBuffer, key: &str, listing: &CachedList) {
-        let lock = match dir_buffer.acquire(true, None) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(
-                    target: "nanocrew::vfs",
-                    "dir_buffer.acquire key={key:?}: {e:?}"
-                );
-                return;
-            }
-        };
+    /// Write a complete listing into an already-acquired WinFsp DirBuffer
+    /// lock. Adds "."/".." for non-root directories. The caller must hold the
+    /// lock returned by `dir_buffer.acquire(...)` — WinFsp serializes the
+    /// acquire so concurrent `read_directory` calls block until release.
+    /// Build the full directory listing as a single vector sorted by WinFsp's
+    /// case-insensitive (uppercase-fold) order, with "."/".." prepended for
+    /// non-root directories and any case-folding collisions removed. This is
+    /// the canonical order used by `read_directory`'s own marker pagination.
+    fn sorted_dir_entries(&self, key: &str) -> Result<Vec<(String, Meta)>, String> {
+        let listing = self.listing_for(key)?;
+        let dir_meta = Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() };
+        let mut entries: Vec<(String, Meta)> =
+            Vec::with_capacity(listing.dirs.len() + listing.files.len() + 2);
 
         if !key.is_empty() {
-            let m = Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() };
-            let mut dot = DirInfo::<255>::new();
-            if dot.set_name(".").is_ok() {
-                fill_file_info(dot.file_info_mut(), &m);
-                let _ = lock.write(&mut dot);
-            }
-            let mut dd = DirInfo::<255>::new();
-            if dd.set_name("..").is_ok() {
-                fill_file_info(dd.file_info_mut(), &m);
-                let _ = lock.write(&mut dd);
-            }
+            entries.push((".".to_string(), dir_meta.clone()));
+            entries.push(("..".to_string(), dir_meta.clone()));
         }
-
         for d in &listing.dirs {
-            let mut info = DirInfo::<255>::new();
-            if info.set_name(d.as_str()).is_err() {
-                continue;
-            }
-            let m = Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() };
-            fill_file_info(info.file_info_mut(), &m);
-            let _ = lock.write(&mut info);
+            entries.push((d.clone(), dir_meta.clone()));
         }
         for (name, meta) in &listing.files {
-            let mut info = DirInfo::<255>::new();
-            if info.set_name(name.as_str()).is_err() {
-                continue;
-            }
-            fill_file_info(info.file_info_mut(), meta);
-            let _ = lock.write(&mut info);
+            entries.push((name.clone(), meta.clone()));
         }
+
+        entries.sort_by(|a, b| {
+            let ka = a.0.to_uppercase();
+            let kb = b.0.to_uppercase();
+            ka.cmp(&kb).then_with(|| a.0.cmp(&b.0))
+        });
+        entries.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+        Ok(entries)
     }
 
     /// Resolve a path (which may have arbitrary case from Windows) to its
@@ -838,22 +759,16 @@ impl S3Fs {
                 },
             )));
         }
-        // Meta cache — keyed by the INPUT (possibly mis-cased) key so repeated
-        // lookups with the same casing hit the cache.
+        // Meta cache — keyed by the LOWERCASE input key (case-insensitive).
+        // The value carries the real-case S3 key, so we always return the
+        // canonical case no matter how the caller cased the request. This is
+        // essential: the returned key is used for materialize/get_range, and
+        // S3 is case-sensitive — returning the request's case 404s.
         {
             let cache = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((at, v)) = cache.get(key) {
+            if let Some((at, v)) = cache.get(&key.to_ascii_lowercase()) {
                 if at.elapsed() < META_TTL {
-                    // We stored the resolved key alongside meta — but the
-                    // current cache only holds Option<Meta>. Return the input
-                    // key as a best-effort (case will match if the caller used
-                    // the canonical case). For mis-cased misses we'll fall
-                    // through to re-resolve and repopulate.
-                    if let Some(m) = v {
-                        return Ok(Some((key.to_string(), m.clone())));
-                    } else {
-                        return Ok(None);
-                    }
+                    return Ok(v.clone());
                 }
             }
         }
@@ -899,7 +814,7 @@ impl S3Fs {
                     self.meta_cache
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .insert(key.to_string(), (Instant::now(), None));
+                        .insert(key.to_ascii_lowercase(), (Instant::now(), None));
                     return Ok(None);
                 }
                 parent_real = if parent_real.is_empty() {
@@ -915,19 +830,16 @@ impl S3Fs {
             self.meta_cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(key.to_string(), (Instant::now(), None));
+                .insert(key.to_ascii_lowercase(), (Instant::now(), None));
             return Ok(None);
         }
 
         let found = last_meta.map(|m| (parent_real, m));
-        // Cache the meta under the input key for fast re-hits.
+        // Cache the (real-case key, meta) under the lowercase input key.
         self.meta_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                key.to_string(),
-                (Instant::now(), found.as_ref().map(|(_, m)| m.clone())),
-            );
+            .insert(key.to_ascii_lowercase(), (Instant::now(), found.clone()));
         Ok(found)
     }
 
@@ -1829,8 +1741,6 @@ impl FileSystemContext for S3Fs {
             OpenFile::Dir {
                 key: real_key,
                 dir_buffer: Arc::new(DirBuffer::new()),
-                enum_complete: Arc::new(AtomicBool::new(false)),
-                enum_started: Arc::new(AtomicBool::new(false)),
             }
         } else {
             if should_materialize(&real_key, meta.size) {
@@ -1988,8 +1898,6 @@ impl FileSystemContext for S3Fs {
             return Ok(Box::new(OpenFile::Dir {
                 key,
                 dir_buffer: Arc::new(DirBuffer::new()),
-                enum_complete: Arc::new(AtomicBool::new(false)),
-                enum_started: Arc::new(AtomicBool::new(false)),
             }));
         }
 
@@ -2189,29 +2097,53 @@ impl FileSystemContext for S3Fs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let (key, dir_buffer, enum_complete, enum_started) = match context.as_ref() {
-            OpenFile::Dir { key, dir_buffer, enum_complete, enum_started } => {
-                (key.clone(), dir_buffer.clone(), enum_complete.clone(), enum_started.clone())
-            }
+        let key = match context.as_ref() {
+            OpenFile::Dir { key, .. } => key.clone(),
             _ => return Err(nt(STATUS_NOT_A_DIRECTORY)),
         };
 
-        // First call into this directory handle (marker=None) AND the
-        // enumeration hasn't been kicked off yet. Spawn a background thread
-        // to walk S3 pages, then block up to 5 seconds waiting for the first
-        // page so Explorer has something to render before we return.
-        if marker.is_none()
-            && !enum_complete.load(Ordering::Relaxed)
-            && !enum_started.swap(true, Ordering::SeqCst)
-        {
-            self.kick_off_streaming_enum(
-                key.clone(),
-                dir_buffer.clone(),
-                enum_complete.clone(),
-            );
-        }
+        // We bypass WinFsp's DirBuffer entirely. Its marker-based pagination
+        // re-emits entries at every kernel read-buffer boundary (~338 entries)
+        // and never reaches EOF for directories larger than one buffer —
+        // sending Explorer into an unbounded loop. Instead we keep our own
+        // case-insensitively sorted listing and fill the response buffer
+        // directly: a strict `> marker` comparison for continuation, and an
+        // explicit EOF marker (finalize_buffer) once the final entry fits.
+        let entries = self.sorted_dir_entries(&key).map_err(|e| {
+            tracing::error!(target: "nanocrew::vfs", "read_directory enum key={key:?}: {e}");
+            nt(STATUS_ACCESS_DENIED)
+        })?;
 
-        Ok(dir_buffer.read(marker, buffer))
+        // Find the continuation point: first entry whose folded name sorts
+        // strictly after the marker (exclusive). Entries are sorted by the
+        // same fold, so a binary search is correct and O(log n).
+        let start = match marker.inner_as_cstr() {
+            None => 0,
+            Some(m) => {
+                let mk = m.to_string_lossy().to_uppercase();
+                entries.partition_point(|(name, _)| name.to_uppercase() <= mk)
+            }
+        };
+
+        let mut cursor: u32 = 0;
+        let mut all_fit = true;
+        for (name, meta) in &entries[start..] {
+            let mut info = DirInfo::<255>::new();
+            if info.set_name(name.as_str()).is_err() {
+                continue;
+            }
+            fill_file_info(info.file_info_mut(), meta);
+            if !info.append_to_buffer(buffer, &mut cursor) {
+                all_fit = false;
+                break;
+            }
+        }
+        if all_fit {
+            // All remaining entries fit — write the NULL EOF marker so the
+            // kernel knows the enumeration is complete and stops asking.
+            DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+        }
+        Ok(cursor)
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {

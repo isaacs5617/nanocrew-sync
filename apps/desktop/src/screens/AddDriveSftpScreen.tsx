@@ -81,7 +81,7 @@ export const AddDriveSftpScreen: React.FC<AddDriveSftpScreenProps> = ({
 
     setTesting(true);
     try {
-      await invoke('test_sftp_connection', { config: buildConfig() });
+      await invoke('test_sftp_connection', { token, config: buildConfig() });
       setTestOk(true);
     } catch (e) {
       setTestOk(false);

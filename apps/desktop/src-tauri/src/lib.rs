@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "android"))]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -7,25 +8,82 @@ use tauri::{
 mod auth;
 mod cache;
 mod commands;
+#[cfg(target_os = "windows")]
 mod credentials;
 mod db;
 mod dir_listing_cache;
+#[cfg(target_os = "windows")]
 mod dpapi;
 mod error;
 mod file_lock;
 mod http_client;
 mod license;
 mod logging;
+#[cfg(not(target_os = "android"))]
 mod mounts;
 mod providers;
 mod state;
 mod throttle;
 mod types;
+#[cfg(target_os = "windows")]
 mod winfsp_vfs;
 
+// ── macOS-only modules (Track v0.3.0 macOS beta) ────────────────────────────
+#[cfg(target_os = "macos")]
+mod fuse_t_vfs;
+#[cfg(target_os = "macos")]
+mod keychain;
+
+// ── Android-only modules (Track v0.4.0 Android beta) ────────────────────────
+// JNI bridge that the Kotlin DocumentsProvider calls into. The Rust side
+// owns the CloudProvider trait + on-disk cache the same way the WinFsp /
+// FUSE-T dispatchers do on desktop. See docs/android-port-design.md.
+#[cfg(target_os = "android")]
+mod android_provider;
+#[cfg(target_os = "android")]
+mod jni_helpers;
+
+#[cfg(not(target_os = "android"))]
 use state::AppState;
+#[cfg(not(target_os = "android"))]
 use types::DriveStatusPayload;
 
+// ── Android entry point ─────────────────────────────────────────────────────
+// On Android there's no tray, no drive letter, no auto-mount loop. The OS
+// drives IO through the Kotlin DocumentsProvider → JNI; the Tauri webview is
+// only here for drive management UI and license activation.
+#[cfg(target_os = "android")]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("nanocrew"),
+    );
+    tracing::info!(target: "nanocrew", "android mobile_entry_point: starting");
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|_app| {
+            // TODO: DB bootstrap, license check, mobile AppState wiring.
+            // `app.path().app_data_dir()` resolves to the app's private
+            // /data/data/dev.nanocrew.sync/files dir on Android, which is
+            // fine for the SQLite file; the auto_mount loop is meaningless
+            // (no drive letters / mountpoints exist on Android).
+            Ok(())
+        })
+        // TODO: cfg-trimmed mobile invoke_handler. The desktop one references
+        // several Windows-only commands (drive letter helpers, WinFsp check,
+        // autostart). For the scaffold we expose nothing — UI surfaces an
+        // "Android build, drive management TBD" placeholder until the mobile
+        // command surface lands.
+        .invoke_handler(tauri::generate_handler![])
+        .run(tauri::generate_context!())
+        .expect("error building nanocrew sync (android)");
+}
+
+#[cfg(not(target_os = "android"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _sentry = sentry::init((
@@ -213,6 +271,7 @@ pub fn run() {
             commands::drives::set_drive_credentials,
             commands::drives::create_folder,
             commands::drives::rename_object,
+            commands::drives::refresh_dir_listing,
             commands::drives::open_path,
             commands::drives::check_winfsp,
             commands::drives::get_drive_cache_stats,

@@ -123,6 +123,15 @@ pub struct ActivityEntry {
     pub message: Option<String>,
 }
 
+/// Emitted as `dir_listing_refreshed` after a manual refresh or a
+/// background-refresh task detects an out-of-band change in a folder.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirListingRefreshedPayload {
+    pub drive_id: i64,
+    /// VFS-relative prefix that was refreshed. Empty string = root.
+    pub prefix: String,
+}
+
 /// Emitted as `transfer_progress` whenever a file transfer starts, makes
 /// progress, completes, or errors.  `state` is one of "start" | "progress" |
 /// "done" | "error".

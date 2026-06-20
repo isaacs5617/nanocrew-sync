@@ -409,6 +409,60 @@ const LicenseCard: React.FC<{ theme: Theme; token: string }> = ({ theme, token }
   );
 };
 
+/// "Contact Support" card. Builds a mailto: URL pre-filled with app version,
+/// OS string, and the path to today's log file, then hands it to the shell
+/// plugin which routes it to the user's default mail client.
+const SupportCard: React.FC<{ theme: Theme; token: string; appVersion: string }> = ({ theme, token, appVersion }) => {
+  const { t } = useTranslation();
+  const tok = getTokens(theme);
+
+  const handleClick = async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const osHint = (navigator.userAgent.match(/Windows NT [\d.]+/) ?? ['Windows'])[0];
+    const body =
+      `App: NanoCrew Sync v${appVersion || 'unknown'}\n` +
+      `OS: ${osHint}\n` +
+      `Drive ID: <none unless selected>\n\n` +
+      `--- describe your issue below ---\n\n` +
+      `--- log file path: %APPDATA%\\dev.nanocrew.sync\\logs\\nanocrew-sync.log.${today} ---`;
+    const url =
+      `mailto:nanosync@nanocrew.ai` +
+      `?subject=${encodeURIComponent(`Support: NanoCrew Sync v${appVersion || 'unknown'}`)}` +
+      `&body=${encodeURIComponent(body)}`;
+    try {
+      await invoke('open_path', { token, path: url });
+    } catch (e) {
+      console.error('open mailto failed', e);
+    }
+  };
+
+  return (
+    <NCCard theme={theme} pad={20}>
+      <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>{t('settings.about.support')}</NCEyebrow>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 3, background: tok.surface2,
+          border: `1px solid ${tok.border}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <I.cloud size={14} color={tok.textMd} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 500, color: tok.textHi }}>
+            {t('settings.about.contactSupport.label')}
+          </div>
+          <div style={{ fontSize: 11, color: tok.textMd, marginTop: 2 }}>
+            {t('settings.about.contactSupport.sub')}
+          </div>
+        </div>
+        <NCBtn theme={theme} small ghost onClick={handleClick}>
+          {t('settings.about.contactSupport.button')}
+        </NCBtn>
+      </div>
+    </NCCard>
+  );
+};
+
 const PlaceholderSection: React.FC<{ title: string; body: string; theme: Theme }> = ({ title, body, theme }) => {
   const { t } = useTranslation();
   const tok = getTokens(theme);
@@ -827,6 +881,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
               </div>
             ))}
           </NCCard>
+          <SupportCard theme={theme} token={token} appVersion={appVersion} />
         </>;
 
       default:

@@ -1,0 +1,150 @@
+name: Release (macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# This is the macOS sibling of release.yml. Builds a universal .dmg via the
+# FUSE-T-backed mount path (target_os = "macos"). Notarization is left as a
+# TODO — uncomment the relevant block and add APPLE_* secrets once the user
+# has an Apple Developer ID.
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon — primary target.
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: arm64
+          # Intel fallback for older Macs.
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.target }}
+
+      # FUSE-T install. The cask lives in the macos-fuse-t/cask tap.
+      # We install at build time so the fuser crate's link step can find
+      # the FUSE-T pkg-config files. End users will need to install FUSE-T
+      # themselves on first launch (TODO: in-app prompt).
+      - name: Install FUSE-T
+        run: |
+          set -euxo pipefail
+          brew tap macos-fuse-t/cask
+          brew install --cask fuse-t
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      # TODO(Apple Developer): add code signing before the build step. Needs
+      # secrets APPLE_CERTIFICATE (base64-encoded p12), APPLE_CERTIFICATE_PASSWORD,
+      # APPLE_SIGNING_IDENTITY, KEYCHAIN_PASSWORD. Example:
+      #
+      # - name: Import Apple signing certificate
+      #   env:
+      #     APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      #     APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      #     KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      #   run: |
+      #     echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+      #     security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+      #     security default-keychain -s build.keychain
+      #     security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+      #     security import /tmp/cert.p12 -k build.keychain \
+      #       -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+      #     security set-key-partition-list -S apple-tool:,apple: \
+      #       -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+      - name: Build Tauri bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # When signing is enabled, uncomment:
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: pnpm tauri build --target ${{ matrix.target }}
+
+      # TODO(notarization): after signing is wired up, notarize the .dmg.
+      # Requires APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID.
+      #
+      # - name: Notarize DMG
+      #   env:
+      #     APPLE_ID: ${{ secrets.APPLE_ID }}
+      #     APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      #     APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      #   run: |
+      #     DMG=$(find apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
+      #     xcrun notarytool submit "$DMG" \
+      #       --apple-id "$APPLE_ID" \
+      #       --password "$APPLE_PASSWORD" \
+      #       --team-id "$APPLE_TEAM_ID" \
+      #       --wait
+      #     xcrun stapler staple "$DMG"
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          BUNDLE_DIR="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p artifacts
+          # .dmg + updater signature
+          find "$BUNDLE_DIR/dmg" -name "*.dmg" -exec cp {} artifacts/ \; || true
+          find "$BUNDLE_DIR" -name "*.tar.gz" -exec cp {} artifacts/ \; || true
+          find "$BUNDLE_DIR" -name "*.tar.gz.sig" -exec cp {} artifacts/ \; || true
+
+          # Rename to include arch so the two matrix entries don't clobber.
+          for f in artifacts/*; do
+            base=$(basename "$f")
+            mv "$f" "artifacts/${{ matrix.arch }}-$base"
+          done
+          ls -la artifacts/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-macos-${{ matrix.arch }}-${{ github.ref_name }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: Create / update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/*.dmg
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sig
+          generate_release_notes: false

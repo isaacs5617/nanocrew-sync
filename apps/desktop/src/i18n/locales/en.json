@@ -144,6 +144,10 @@
 
   "settings.about.title": "NanoCrew Sync",
   "settings.about.builtWith": "Built with",
+  "settings.about.support": "Support",
+  "settings.about.contactSupport.label": "Contact Support",
+  "settings.about.contactSupport.sub": "Opens a pre-filled email to nanosync@nanocrew.ai with your app and log details.",
+  "settings.about.contactSupport.button": "Email support",
   "settings.about.appUpdates": "Application updates",
   "settings.about.appUpdates.idle": "Check if a newer signed build is available.",
   "settings.about.appUpdates.checking": "Contacting update server…",

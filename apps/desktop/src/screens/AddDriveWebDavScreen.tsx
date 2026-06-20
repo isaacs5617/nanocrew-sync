@@ -93,7 +93,7 @@ export const AddDriveWebDavScreen: React.FC<AddDriveWebDavScreenProps> = ({
 
     setTesting(true);
     try {
-      await invoke('test_webdav_connection', { config: buildConfig() });
+      await invoke('test_webdav_connection', { token, config: buildConfig() });
       setTestOk(true);
     } catch (e) {
       setTestOk(false);

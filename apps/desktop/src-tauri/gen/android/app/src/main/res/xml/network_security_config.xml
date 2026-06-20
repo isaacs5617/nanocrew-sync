@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network security config. Production builds reject cleartext HTTP entirely
+  (HTTPS only). For local MinIO / dev testing, uncomment the <domain-config>
+  block below and add your dev host.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <!-- TODO: re-enable user CA trust if corporate networks need it
+                 (mirrors the desktop Phase 7.3 extra-root-CA support). -->
+        </trust-anchors>
+    </base-config>
+
+    <!--
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <domain includeSubdomains="true">localhost</domain>
+    </domain-config>
+    -->
+</network-security-config>

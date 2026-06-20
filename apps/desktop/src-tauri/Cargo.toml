@@ -1,6 +1,6 @@
 [package]
 name = "nanocrew-sync"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -10,12 +10,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build  = { version = "2", features = [] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
 winfsp_build = "0.1.1"
 
+# ── Cross-platform dependencies ──────────────────────────────────────────────
+# Everything in this block must compile for both Windows and Android.
 [dependencies]
 tauri       = { version = "2", features = ["tray-icon"] }
-tauri-plugin-single-instance = "2"
-tauri-plugin-updater         = "2"
 tauri-plugin-process         = "2"
 tauri-plugin-notification    = "2"
 serde       = { version = "1", features = ["derive"] }
@@ -47,15 +49,6 @@ aws-smithy-http-client = { version = "1", features = ["default-client", "rustls-
 aws-smithy-runtime-api = { version = "1" }
 url = "2"
 
-# WinFsp — user-mode Windows filesystem driver. Replaces cloud-filter
-# (see src-tauri.cloudfilter-backup-* for the previous implementation).
-# Version pinned to match WinFsp 2.1.x installed alongside the app.
-# `system` feature makes winfsp_init read HKLM\SOFTWARE\WOW6432Node\WinFsp
-# InstallDir to locate winfsp-x64.dll, so users don't need the WinFsp bin
-# directory on PATH.
-winfsp       = { version = "0.12.4", features = ["system"] }
-winfsp-sys   = { version = "0.12", features = ["system"] }
-
 # CloudProvider trait abstraction (Track C1)
 async-trait  = "0.1"
 
@@ -63,8 +56,9 @@ async-trait  = "0.1"
 russh        = "0.60"
 russh-sftp   = "2"
 
-# FTP/FTPS provider (Track C2) — native-tls uses Windows Schannel, avoids
-# rustls version conflicts with other deps in the tree.
+# FTP/FTPS provider (Track C2) — native-tls uses Windows Schannel on Windows.
+# On Android we will need to switch to the `rustls` feature; tracked in
+# docs/android-port-design.md.
 suppaftp = { version = "8", features = ["tokio"] }
 
 # WebDAV provider (Track C3) — XML parsing for PROPFIND responses
@@ -79,14 +73,12 @@ futures-util = "0.3"
 bytes        = "1"
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
-# Wide-string types
-widestring = "1"
-
-# Windows API shims (security IDs, file handles, etc.)
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Registry"] }
-
 # SHA-256 for deriving sentinel-lock object names
 sha2 = "0.10"
+
+# LRU cache for tracking recently-visited directories (used by the
+# background refresh task in winfsp_vfs).
+lru = "0.12"
 
 # AES-256-GCM for on-disk cache encryption (Phase 3.1). Derived key +
 # random 12-byte nonce per block; 16-byte auth tag detects tampering.
@@ -109,6 +101,56 @@ tracing-appender    = "0.2"
 # time; disabled at runtime when the user opts out via telemetry_enabled pref.
 sentry          = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "tracing"] }
 sentry-tracing  = "0.34"
+
+# ── Windows-only dependencies ────────────────────────────────────────────────
+[target.'cfg(target_os = "windows")'.dependencies]
+# Desktop-only Tauri plugins. Single-instance is a desktop window concept;
+# updater is a desktop installer concept (Android uses the Play Store).
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater         = "2"
+
+# WinFsp — user-mode Windows filesystem driver. Replaces cloud-filter
+# (see src-tauri.cloudfilter-backup-* for the previous implementation).
+# Version pinned to match WinFsp 2.1.x installed alongside the app.
+# `system` feature makes winfsp_init read HKLM\SOFTWARE\WOW6432Node\WinFsp
+# InstallDir to locate winfsp-x64.dll, so users don't need the WinFsp bin
+# directory on PATH.
+winfsp       = { version = "0.12.4", features = ["system"] }
+winfsp-sys   = { version = "0.12", features = ["system"] }
+
+# Wide-string types (only used by the WinFsp/Win32 surface)
+widestring = "1"
+
+# Windows API shims (security IDs, file handles, DPAPI, etc.)
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Registry"] }
+
+# ── macOS-only dependencies ──────────────────────────────────────────────────
+[target.'cfg(target_os = "macos")'.dependencies]
+# Desktop-only Tauri plugins also need to compile on macOS.
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater         = "2"
+
+# FUSE-T host. fuser exposes a userspace Filesystem trait and negotiates with
+# the installed FUSE implementation; on macOS this is FUSE-T
+# (https://github.com/macos-fuse-t/fuse-t), which runs entirely outside the
+# kernel via an NFS loopback and so needs no kernel extension or SIP changes.
+fuser = "0.14"
+
+# macOS Keychain bindings — DPAPI equivalent for credential-at-rest storage.
+security-framework = "2.11"
+
+# libc for Unix error codes (ENOENT, EROFS, …) returned to FUSE.
+libc = "0.2"
+
+# ── Android-only dependencies ────────────────────────────────────────────────
+[target.'cfg(target_os = "android")'.dependencies]
+# JNI for the DocumentsProvider bridge
+jni            = "0.21"
+# Pull AAssetManager / NativeActivity context handed to us by Tauri's mobile
+# runtime
+ndk-context    = "0.1"
+# Pipe `tracing` logs into logcat
+android_logger = "0.14"
 
 [profile.release]
 panic = "abort"

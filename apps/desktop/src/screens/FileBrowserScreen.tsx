@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import {
   getTokens, NC_FONT_MONO, NC_FONT_UI,
   NCBtn, FileIcon, TopBar,
@@ -84,6 +85,33 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
   const [showNewFolder, setShowNewFolder] = React.useState(false);
   const [creatingFolder, setCreatingFolder] = React.useState(false);
   const [renaming, setRenaming] = React.useState<{ entry: S3Entry; value: string } | null>(null);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [toast, setToast] = React.useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+
+  const showToast = React.useCallback((kind: 'ok' | 'err', msg: string) => {
+    setToast({ kind, msg });
+    window.setTimeout(() => setToast(null), 1800);
+  }, []);
+
+  // Manual cache-busting refresh: clear the VFS/disk listing caches for the
+  // current prefix, then re-fetch. Used by the toolbar button + F5.
+  const refreshCurrent = React.useCallback(async () => {
+    if (!selectedDrive || refreshing) return;
+    setRefreshing(true);
+    try {
+      await invoke('refresh_dir_listing', {
+        token,
+        driveId: selectedDrive.id,
+        prefix: prefix.replace(/\/$/, ''),
+      });
+      setRefreshKey(k => k + 1);
+      showToast('ok', '✓ Refreshed');
+    } catch (e) {
+      showToast('err', String(e));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [selectedDrive, prefix, token, refreshing, showToast]);
 
   // Load mounted drives
   React.useEffect(() => {
@@ -251,6 +279,42 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
     setMenu(null);
   };
 
+  // F5 → refresh the current folder. Bound on document so it fires whenever
+  // the File Browser screen is the visible route.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'F5') {
+        e.preventDefault();
+        refreshCurrent();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [refreshCurrent]);
+
+  // Background refresh task in the VFS emits `dir_listing_refreshed` when it
+  // detects an out-of-band change in a folder this user has visited. If it's
+  // for our current drive+prefix, silently re-fetch — no toast.
+  React.useEffect(() => {
+    if (!selectedDrive) return;
+    const driveId = selectedDrive.id;
+    const curPrefix = prefix.replace(/\/$/, '');
+    const unlisten = listen<{ drive_id: number; prefix: string }>(
+      'dir_listing_refreshed',
+      ev => {
+        if (
+          ev.payload.drive_id === driveId &&
+          ev.payload.prefix === curPrefix
+        ) {
+          setRefreshKey(k => k + 1);
+        }
+      },
+    );
+    return () => {
+      unlisten.then(fn => fn()).catch(() => {});
+    };
+  }, [selectedDrive, prefix]);
+
   // Dismiss the context menu on any click outside or on Escape.
   React.useEffect(() => {
     if (!menu) return;
@@ -302,7 +366,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           )}
           <NCBtn
             theme={theme} small iconLeft={<I.refresh size={13} />}
-            onClick={() => setRefreshKey(k => k + 1)}
+            onClick={refreshCurrent}
+            disabled={refreshing || !selectedDrive}
           >{t('fileBrowser.refresh')}</NCBtn>
         </>}
       />
@@ -338,7 +403,8 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
           <NCBtn theme={theme} small ghost iconLeft={<I.chevL size={14} />} onClick={navigateUp} />
           <NCBtn
             theme={theme} small ghost iconLeft={<I.refresh size={13} />}
-            onClick={() => setRefreshKey(k => k + 1)}
+            onClick={refreshCurrent}
+            disabled={refreshing || !selectedDrive}
           />
 
           {/* Breadcrumb path bar */}
@@ -632,6 +698,23 @@ export const FileBrowserScreen: React.FC<FileBrowserScreenProps> = ({ theme }) =
               ? menu.entry.name.slice(0, 26) + '…'
               : menu.entry.name}
           </div>
+        </div>
+      )}
+
+      {/* Transient refresh toast. Auto-dismissed in showToast(). */}
+      {toast && (
+        <div
+          style={{
+            position: 'fixed', bottom: 20, right: 20, zIndex: 200,
+            padding: '8px 14px', borderRadius: 3,
+            fontFamily: NC_FONT_MONO, fontSize: 11, letterSpacing: 0.5,
+            background: toast.kind === 'ok' ? `${tok.lime}22` : `${tok.danger}22`,
+            border: `1px solid ${toast.kind === 'ok' ? tok.lime : tok.danger}80`,
+            color: toast.kind === 'ok' ? tok.lime : tok.danger,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+          }}
+        >
+          {toast.msg}
         </div>
       )}
     </>

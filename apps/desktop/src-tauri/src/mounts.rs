@@ -1,53 +1,22 @@
-//! Mount lifecycle for an S3-backed drive.
+//! Mount lifecycle for a cloud-storage-backed drive.
 //!
-//! Each mount boots a [`winfsp::host::FileSystemHost`] which:
+//! On **Windows** each mount boots a [`winfsp::host::FileSystemHost`] which:
 //!   1. Creates the virtual volume (user-mode WinFsp driver)
 //!   2. Mounts it directly at a Windows drive letter (no `subst`)
-//!   3. Dispatches IO to our [`S3Fs`] implementation
+//!   3. Dispatches IO to our [`crate::winfsp_vfs::S3Fs`] implementation
 //!
-//! Teardown: stop the dispatcher, unmount the drive letter, drop the host.
-//! Cloud-filter-specific state (sync root registration, placeholder folders,
-//! upload watcher, `subst`) is gone — WinFsp owns the volume end-to-end.
+//! On **macOS** each mount boots a [`fuser`] session backed by FUSE-T (the
+//! kernel-extension-free userspace FUSE for macOS — see
+//! `crate::fuse_t_vfs`). Mounts land at `/Volumes/NanoCrew-<bucket>`.
+//!
+//! Teardown is symmetric: stop the dispatcher, unmount, drop the host.
+//!
+//! `MountConfig` and `MountHandle` are platform-agnostic; the heavy lifting
+//! is in the `#[cfg]`-gated `spawn_mount` impls below.
 
-use std::{
-    sync::{mpsc, OnceLock},
-    time::Duration,
-};
+use crate::{cache::DiskCache, error::AppError};
 
-use tauri::{Emitter, Manager};
-use winfsp::{
-    host::{FileSystemHost, VolumeParams},
-    FspInit,
-};
-
-use crate::{
-    cache::DiskCache,
-    error::AppError,
-    http_client,
-    providers::{s3::S3Provider, CloudProvider},
-    state::AppState,
-    types::{DriveStatusPayload, FileLockEvent, TransferPayload},
-    winfsp_vfs::S3Fs,
-};
-
-// ── Global WinFsp init ───────────────────────────────────────────────────────
-
-/// WinFsp must be initialised exactly once per process. `winfsp_init` loads the
-/// DLL lazily (we delay-link it in `build.rs`) and returns an `FspInit` token.
-/// Cached so subsequent mounts are free.
-static WINFSP_INIT: OnceLock<Result<FspInit, String>> = OnceLock::new();
-
-fn ensure_winfsp() -> Result<(), String> {
-    let res = WINFSP_INIT.get_or_init(|| {
-        winfsp::winfsp_init().map_err(|e| format!("winfsp_init: {e:?}"))
-    });
-    match res {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.clone()),
-    }
-}
-
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types (platform-agnostic) ────────────────────────────────────────────────
 
 /// All the S3 / mount parameters the host needs.
 #[allow(dead_code)]
@@ -89,6 +58,59 @@ pub struct MountConfig {
     pub cache_root: std::path::PathBuf,
 }
 
+/// Shared handles into the live VFS so commands running on the main app
+/// thread (e.g. `refresh_dir_listing`) can invalidate caches without
+/// needing access to the WinFsp-owned `S3Fs` instance.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub struct RefreshHandle {
+    pub list_cache: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                (std::time::Instant, crate::winfsp_vfs::CachedList),
+            >,
+        >,
+    >,
+    pub meta_cache: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                (std::time::Instant, Option<(String, crate::winfsp_vfs::Meta)>),
+            >,
+        >,
+    >,
+    pub disk_list_cache:
+        Option<std::sync::Arc<crate::dir_listing_cache::DirListingCache>>,
+}
+
+#[cfg(target_os = "windows")]
+impl RefreshHandle {
+    /// Same invalidation semantics as `S3Fs::refresh_dir` — drop the
+    /// in-memory listing for `prefix`, every meta-cache entry beneath it,
+    /// and the on-disk JSON.
+    pub fn refresh(&self, prefix: &str) {
+        self.list_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(prefix);
+
+        let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if prefix.is_empty() {
+            mc.clear();
+        } else {
+            let lc_prefix = format!("{}/", prefix.to_ascii_lowercase());
+            let lc_self = prefix.to_ascii_lowercase();
+            mc.retain(|k, _| !(k.starts_with(&lc_prefix) || k == &lc_self));
+        }
+        drop(mc);
+
+        if let Some(disk) = &self.disk_list_cache {
+            disk.invalidate(prefix);
+        }
+    }
+}
+
 /// A live mounted drive. Dropping `stop_tx` unblocks the host thread.
 #[allow(dead_code)]
 pub struct MountHandle {
@@ -102,6 +124,11 @@ pub struct MountHandle {
     pub cache: Option<std::sync::Arc<DiskCache>>,
     /// Shared connectivity flag from the VFS layer. `true` = last S3 op succeeded.
     pub connectivity: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Windows-only handles into the VFS caches so commands like
+    /// `refresh_dir_listing` can invalidate the in-memory + on-disk listing
+    /// caches from outside the WinFsp thread.
+    #[cfg(target_os = "windows")]
+    pub refresh: Option<RefreshHandle>,
 }
 
 impl MountHandle {
@@ -118,18 +145,57 @@ impl MountHandle {
     }
 }
 
-// ── spawn_mount ──────────────────────────────────────────────────────────────
+// ── Windows: WinFsp-backed mount ─────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+use std::{
+    sync::{mpsc, OnceLock},
+    time::Duration,
+};
+#[cfg(target_os = "windows")]
+use tauri::{Emitter, Manager};
+#[cfg(target_os = "windows")]
+use winfsp::{
+    host::{FileSystemHost, VolumeParams},
+    FspInit,
+};
+#[cfg(target_os = "windows")]
+use crate::{
+    http_client,
+    providers::{s3::S3Provider, CloudProvider},
+    state::AppState,
+    types::{DriveStatusPayload, FileLockEvent, TransferPayload},
+    winfsp_vfs::S3Fs,
+};
+
+/// WinFsp must be initialised exactly once per process. `winfsp_init` loads the
+/// DLL lazily (we delay-link it in `build.rs`) and returns an `FspInit` token.
+/// Cached so subsequent mounts are free.
+#[cfg(target_os = "windows")]
+static WINFSP_INIT: OnceLock<Result<FspInit, String>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn ensure_winfsp() -> Result<(), String> {
+    let res = WINFSP_INIT.get_or_init(|| {
+        winfsp::winfsp_init().map_err(|e| format!("winfsp_init: {e:?}"))
+    });
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.clone()),
+    }
+}
 
 /// Boot a WinFsp-backed S3 volume, mount it at the target drive letter, and
 /// block until the dispatcher is ready. Returns a handle whose `stop()`
 /// unmounts cleanly.
+#[cfg(target_os = "windows")]
 pub fn spawn_mount(
     config: MountConfig,
     app_handle: tauri::AppHandle,
 ) -> Result<MountHandle, AppError> {
     ensure_winfsp().map_err(AppError::Mount)?;
 
-    let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+    let (init_tx, init_rx) = mpsc::channel::<Result<Option<RefreshHandle>, String>>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
     let drive_id = config.drive_id;
@@ -268,7 +334,9 @@ pub fn spawn_mount(
             let emit_app = app_handle.clone();
             let emit_app_lock = app_handle.clone();
             let emit_app_status = app_handle.clone();
+            let emit_app_refresh = app_handle.clone();
             let status_drive_id = config.drive_id;
+            let refresh_drive_id = config.drive_id;
             let label = format!("NanoCrew-{}", config.bucket);
             let ctx = match S3Fs::new(
                 rt,
@@ -300,6 +368,15 @@ pub fn spawn_mount(
                 }),
                 connectivity_for_thread,
                 disk_list_cache_dir,
+                std::sync::Arc::new(move |prefix: String| {
+                    let _ = emit_app_refresh.emit(
+                        "dir_listing_refreshed",
+                        crate::types::DirListingRefreshedPayload {
+                            drive_id: refresh_drive_id,
+                            prefix,
+                        },
+                    );
+                }),
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -307,6 +384,17 @@ pub fn spawn_mount(
                     return;
                 }
             };
+
+            // Extract cache Arcs BEFORE the ctx moves into the host, then
+            // kick off the background refresh task on the S3Fs runtime. The
+            // RefreshHandle is sent back to the spawning thread via init_tx
+            // and stored on the MountHandle for `refresh_dir_listing` to use.
+            let refresh_handle = RefreshHandle {
+                list_cache: ctx.list_cache_arc(),
+                meta_cache: ctx.meta_cache_arc(),
+                disk_list_cache: ctx.disk_list_cache_arc(),
+            };
+            ctx.start_background_refresh();
 
             // 3. Volume parameters. These are NTFS-ish defaults tuned for an
             //    object-storage-backed volume: case-preserved but not
@@ -373,7 +461,7 @@ pub fn spawn_mount(
             }
 
             // 7. Ready.
-            let _ = init_tx.send(Ok(()));
+            let _ = init_tx.send(Ok(Some(refresh_handle)));
             let _ = app_handle.emit(
                 "drive_status_changed",
                 DriveStatusPayload {
@@ -405,13 +493,14 @@ pub fn spawn_mount(
         .map_err(|e| AppError::Mount(e.to_string()))?;
 
     match init_rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(Ok(())) => Ok(MountHandle {
+        Ok(Ok(refresh)) => Ok(MountHandle {
             drive_id,
             letter,
             stop_tx,
             thread: Some(thread),
             cache,
             connectivity,
+            refresh,
         }),
         Ok(Err(msg)) => {
             if let Some(c) = &cache {
@@ -433,8 +522,25 @@ pub fn spawn_mount(
 
 /// Normalize user input like "Z" / "Z:" / "z:\" to the canonical WinFsp form
 /// `"Z:"`.
+#[cfg(target_os = "windows")]
 fn normalize_letter(raw: &str) -> String {
     let mut s = raw.trim().trim_end_matches('\\').trim_end_matches(':').to_string();
     s.make_ascii_uppercase();
     format!("{s}:")
+}
+
+// ── macOS: FUSE-T-backed mount ───────────────────────────────────────────────
+//
+// On macOS the WinFsp host is replaced with a FUSE-T session. Drive letters
+// don't exist; `MountConfig.letter` is reused as a slug under
+// `/Volumes/NanoCrew-<letter>`. The fuser crate negotiates with the installed
+// FUSE implementation (FUSE-T on macOS) via `mount_fuse-t`, which runs
+// entirely in userspace over an NFS loopback — no kext, no SIP override.
+
+#[cfg(target_os = "macos")]
+pub fn spawn_mount(
+    config: MountConfig,
+    app_handle: tauri::AppHandle,
+) -> Result<MountHandle, AppError> {
+    crate::fuse_t_vfs::spawn_mount(config, app_handle)
 }

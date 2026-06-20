@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Scaffold AndroidManifest for the NanoCrew Sync Android beta.
+
+  This file is created manually because `pnpm tauri android init` requires
+  the Android SDK/NDK on the dev machine; once `init` runs successfully it
+  will regenerate this file. Re-apply the <provider> + <uses-permission>
+  blocks below into the generated manifest at that point.
+
+  Identifier matches `tauri.conf.json` -> "identifier": "dev.nanocrew.sync".
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.nanocrew.sync">
+
+    <!-- Network access for the CloudProvider implementations. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Optional: forge ahead even when on metered connections; users can
+         tighten via per-drive bandwidth caps in Settings. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <!-- Notifications (Android 13+) for upload/sync status. Mirrors the
+         tauri-plugin-notification permission expectation. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Biometric prompt as a future replacement for the desktop lock-screen
+         password flow. See docs/android-port-design.md "Auth flow on Android". -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!-- Foreground service for long-running uploads / prefetch. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application
+        android:label="NanoCrew Sync"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.NanoCrew"
+        android:allowBackup="false"
+        android:requestLegacyExternalStorage="false"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config">
+
+        <!-- ── Main Tauri activity ──────────────────────────────────────── -->
+        <!--
+          `pnpm tauri android init` populates the real <activity> entry here
+          (TauriActivity subclass + MAIN/LAUNCHER intent filter). Re-add it
+          after running init.
+        -->
+
+        <!-- ── Storage Access Framework provider ────────────────────────── -->
+        <!--
+          This is THE central declaration that turns NanoCrew Sync into a
+          system-wide storage backend. Android registers the authority and
+          starts surfacing our roots in Files / pickers / share sheets the
+          first time the user installs the app.
+        -->
+        <provider
+            android:name="dev.nanocrew.sync.NanoCrewDocumentsProvider"
+            android:authorities="dev.nanocrew.sync.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <!-- TODO: ACTION_SEND target so users can share photos/files INTO a
+             NanoCrew drive from anywhere. Out of scope for v0.4.0 scaffold;
+             tracked in docs/android-port-design.md "File picker / share-target". -->
+
+    </application>
+</manifest>

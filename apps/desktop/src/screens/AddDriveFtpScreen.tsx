@@ -72,7 +72,7 @@ export const AddDriveFtpScreen: React.FC<AddDriveFtpScreenProps> = ({
 
     setTesting(true);
     try {
-      await invoke('test_ftp_connection', { config: buildConfig() });
+      await invoke('test_ftp_connection', { token, config: buildConfig() });
       setTestOk(true);
     } catch (e) {
       setTestOk(false);

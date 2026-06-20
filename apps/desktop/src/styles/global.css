@@ -22,3 +22,36 @@ input::placeholder { opacity: 0.4; }
 @keyframes ncSpin {
   to { transform: rotate(360deg); }
 }
+
+/*
+ * Mobile / touch tap-target sizing.
+ *
+ * `pointer: coarse` matches finger input — phones and tablets. We bump
+ * interactive elements to the Material/Apple recommended 44x44px minimum
+ * without redesigning the desktop UI. Components that already exceed this
+ * are unaffected. Full mobile responsive sweep is tracked in
+ * docs/android-port-design.md.
+ */
+@media (pointer: coarse) {
+  button,
+  [role="button"],
+  input[type="button"],
+  input[type="submit"],
+  input[type="checkbox"],
+  input[type="radio"],
+  a {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="email"],
+  input[type="number"],
+  input[type="search"],
+  select,
+  textarea {
+    min-height: 44px;
+    font-size: 16px; /* Avoids iOS Safari zoom-on-focus; harmless elsewhere. */
+  }
+}

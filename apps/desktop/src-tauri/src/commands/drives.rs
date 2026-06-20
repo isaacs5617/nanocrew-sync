@@ -691,6 +691,16 @@ pub async fn open_path(
     path: String,
 ) -> Result<(), String> {
     require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    // Validate the path before handing it to explorer.exe. explorer accepts
+    // `shell:`, `ms-settings:`, and other protocol URIs that can launch
+    // arbitrary registered handlers, so we only allow:
+    //   (a) https:// URLs on our own domains, OR
+    //   (b) absolute Windows filesystem paths (e.g. `C:\foo\bar`).
+    if !is_safe_open_path(&path) {
+        return Err("invalid path scheme".to_string());
+    }
+
     // explorer.exe handles both file paths and https:// URLs reliably.
     // cmd /c start "" <url> is fragile when the empty-string arg is passed as a
     // separate argument via the Rust Command API on some Windows versions.
@@ -699,6 +709,46 @@ pub async fn open_path(
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Returns true if `path` is one of: (a) an https:// URL on a known NanoCrew
+/// domain, or (b) an absolute Windows filesystem path (`X:\...`). Rejects
+/// `shell:`, `ms-settings:`, `file://`, and every other protocol scheme.
+fn is_safe_open_path(path: &str) -> bool {
+    const ALLOWED_HOSTS: &[&str] = &[
+        "nanocrew.dev",
+        "www.nanocrew.dev",
+        "licenses.nanocrew.dev",
+        "releases.nanocrew.dev",
+    ];
+    const ALLOWED_GITHUB_PREFIX: &str = "https://github.com/isaacs5617/nanocrew-sync";
+
+    // (a) https URL on an allowed host (or the github.com/<repo> prefix).
+    if let Some(rest) = path.strip_prefix("https://") {
+        if path.starts_with(ALLOWED_GITHUB_PREFIX) {
+            return true;
+        }
+        // Host is everything up to the first '/' or end-of-string.
+        let host = rest.split('/').next().unwrap_or("");
+        if ALLOWED_HOSTS.contains(&host) {
+            return true;
+        }
+        return false;
+    }
+
+    // (b) Windows filesystem path: drive-letter, colon, backslash, e.g. `C:\foo`.
+    // We require the explicit `<letter>:\` form. UNC paths and bare drive
+    // letters are intentionally rejected.
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+
+    false
 }
 
 // ── Folder operations ────────────────────────────────────────────────────────
@@ -866,6 +916,56 @@ pub async fn rename_object(
     }
 
     Ok(())
+}
+
+// ── Cache freshness ───────────────────────────────────────────────────────────
+
+/// Drop every cached listing/metadata entry for `prefix` (in-memory and
+/// on-disk) so the next Explorer enumeration round-trips to S3. Also emits
+/// `dir_listing_refreshed` so the in-app File Browser re-fetches.
+///
+/// Windows-only — the macOS/Android backends don't expose a refresh handle
+/// (and don't need one yet — Wave 1 cache-freshness is Windows-only).
+#[tauri::command]
+#[cfg(target_os = "windows")]
+pub async fn refresh_dir_listing(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    token: String,
+    drive_id: i64,
+    prefix: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+    let handle = mounts.get(&drive_id).ok_or_else(|| "drive not mounted".to_string())?;
+    let refresh = handle
+        .refresh
+        .as_ref()
+        .ok_or_else(|| "drive has no refresh handle".to_string())?;
+    refresh.refresh(&prefix);
+    drop(mounts);
+
+    let _ = app.emit(
+        "dir_listing_refreshed",
+        crate::types::DirListingRefreshedPayload { drive_id, prefix },
+    );
+    Ok(())
+}
+
+/// macOS/Android stub — refresh isn't wired through the FUSE/Android
+/// backends yet, but the command must exist so the frontend can call it.
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+pub async fn refresh_dir_listing(
+    state: State<'_, AppState>,
+    _app: AppHandle,
+    token: String,
+    _drive_id: i64,
+    _prefix: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+    Err("refresh_dir_listing is only available on Windows in this build".into())
 }
 
 // ── Cache & bandwidth commands ────────────────────────────────────────────────
@@ -1215,7 +1315,12 @@ async fn build_s3_client(
 // ── SFTP commands ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn test_sftp_connection(config: SftpConfig) -> Result<(), String> {
+pub async fn test_sftp_connection(
+    state: State<'_, AppState>,
+    token: String,
+    config: SftpConfig,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
     SftpProvider::new(config)
         .await
         .map_err(|e| e.to_string())?;
@@ -1245,8 +1350,37 @@ pub async fn add_sftp_drive(
     }
 
     let letter = drive_letter.to_uppercase();
+
+    // Extract the secret material out of the config before serialising it to
+    // JSON, and DPAPI-wrap it into `drives.secret_key` via `credentials::store`.
+    // The provider_config JSON stores empty placeholders; the real secret is
+    // re-injected on mount via `credentials::retrieve`.
+    use crate::providers::sftp::SftpAuth;
+
+    let (sanitised_config, secret_blob) = match &config.auth {
+        SftpAuth::Password(p) => {
+            let blob = serde_json::json!({ "password": p }).to_string();
+            let mut c = config.clone();
+            c.auth = SftpAuth::Password(String::new());
+            (c, blob)
+        }
+        SftpAuth::PrivateKey { key_pem, passphrase } => {
+            let blob = serde_json::json!({
+                "key_pem": key_pem,
+                "passphrase": passphrase,
+            })
+            .to_string();
+            let mut c = config.clone();
+            c.auth = SftpAuth::PrivateKey {
+                key_pem: String::new(),
+                passphrase: None,
+            };
+            (c, blob)
+        }
+    };
+
     let config_json =
-        serde_json::to_string(&config).map_err(|e| format!("serialize config: {e}"))?;
+        serde_json::to_string(&sanitised_config).map_err(|e| format!("serialize config: {e}"))?;
 
     let id = {
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
@@ -1262,13 +1396,24 @@ pub async fn add_sftp_drive(
         db.last_insert_rowid()
     };
 
+    if let Err(e) = credentials::store(&state.db, id, &secret_blob) {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = db.execute("DELETE FROM drives WHERE id = ?1", rusqlite::params![id]);
+        return Err(e.to_string());
+    }
+
     Ok(id)
 }
 
 // ── FTP commands ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn test_ftp_connection(config: FtpConfig) -> Result<(), String> {
+pub async fn test_ftp_connection(
+    state: State<'_, AppState>,
+    token: String,
+    config: FtpConfig,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
     FtpProvider::new(config)
         .await
         .map_err(|e| e.to_string())?;
@@ -1321,7 +1466,12 @@ pub async fn add_ftp_drive(
 // ── WebDAV commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn test_webdav_connection(config: WebDavConfig) -> Result<(), String> {
+pub async fn test_webdav_connection(
+    state: State<'_, AppState>,
+    token: String,
+    config: WebDavConfig,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
     let provider = WebDavProvider::new(config).map_err(|e| e.to_string())?;
     provider
         .list_dir("")
@@ -1403,9 +1553,12 @@ pub async fn add_onedrive_drive(
     validate_letter(&drive_letter)?;
 
     let letter = drive_letter.to_uppercase();
+    // The refresh token is DPAPI-wrapped in `drives.secret_key` (see below).
+    // Store an empty string in provider_config JSON; the real token is fetched
+    // from `credentials::retrieve` on mount.
     let config = crate::providers::onedrive::OneDriveConfig {
         client_id,
-        refresh_token,
+        refresh_token: String::new(),
         drive_id,
     };
     let config_json =
@@ -1424,6 +1577,12 @@ pub async fn add_onedrive_drive(
         .map_err(|e| AppError::Db(e).to_string())?;
         db.last_insert_rowid()
     };
+
+    if let Err(e) = credentials::store(&state.db, id, &refresh_token) {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = db.execute("DELETE FROM drives WHERE id = ?1", rusqlite::params![id]);
+        return Err(e.to_string());
+    }
 
     Ok(id)
 }
@@ -1542,9 +1701,12 @@ pub async fn add_gdrive_drive(
     validate_letter(&drive_letter)?;
 
     let letter = drive_letter.to_uppercase();
+    // The refresh token is DPAPI-wrapped in `drives.secret_key` (see below).
+    // Store an empty string in provider_config JSON; the real token is fetched
+    // from `credentials::retrieve` on mount.
     let config = crate::providers::gdrive::GDriveConfig {
         client_id: crate::providers::gdrive::GOOGLE_CLIENT_ID.into(),
-        refresh_token,
+        refresh_token: String::new(),
         root_folder_id: if root_folder_id.trim().is_empty() {
             "root".into()
         } else {
@@ -1567,6 +1729,12 @@ pub async fn add_gdrive_drive(
         .map_err(|e| AppError::Db(e).to_string())?;
         db.last_insert_rowid()
     };
+
+    if let Err(e) = credentials::store(&state.db, id, &refresh_token) {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = db.execute("DELETE FROM drives WHERE id = ?1", rusqlite::params![id]);
+        return Err(e.to_string());
+    }
 
     Ok(id)
 }

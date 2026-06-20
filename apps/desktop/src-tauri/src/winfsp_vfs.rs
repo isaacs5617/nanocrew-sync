@@ -92,6 +92,12 @@ const MAX_DIR_ENTRIES: usize = 100_000;
 /// visible rather than silent.
 const TRUNCATION_SENTINEL: &str = "⚠ FOLDER TOO LARGE — listing truncated, use Search.txt";
 const PART_TARGET: usize = 16 * 1024 * 1024;
+/// Background-refresh task interval (Wave 1: cache freshness).
+const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);  // 5 min
+/// Only re-check folders the user has visited within this window.
+const RECENT_VISIT_WINDOW: Duration = Duration::from_secs(60 * 60);          // 1 hour
+/// Capacity of the per-S3Fs visited-directories LRU.
+const VISITED_DIRS_CAPACITY: usize = 64;
 /// How many multipart part uploads we run in parallel. 8 matches the AWS CLI
 /// default and saturates most home uplinks without exhausting connection
 /// pools.
@@ -355,6 +361,15 @@ pub struct S3Fs {
     /// flips. Stored as a boxed closure so we don't need the AppHandle in scope
     /// for every S3 call.
     emit_status: Box<dyn Fn(bool) + Send + Sync>,
+
+    /// Per-S3Fs LRU of recently-visited directory prefixes (Wave 1: cache
+    /// freshness). Populated by `read_directory` on every call; drained by
+    /// the background refresh task.
+    visited_dirs: Arc<Mutex<lru::LruCache<String, Instant>>>,
+    /// Callback to emit `dir_listing_refreshed` Tauri events when the
+    /// background task detects an out-of-band change. Boxed so S3Fs doesn't
+    /// need the AppHandle in scope for every call.
+    emit_dir_refreshed: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 impl S3Fs {
@@ -375,11 +390,15 @@ impl S3Fs {
         emit_status: Box<dyn Fn(bool) + Send + Sync>,
         connectivity: Arc<AtomicBool>,
         disk_list_cache_dir: Option<std::path::PathBuf>,
+        emit_dir_refreshed: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
         let disk_list_cache = disk_list_cache_dir
             .map(|p| Arc::new(crate::dir_listing_cache::DirListingCache::new(p)));
+        let visited_dirs = Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(VISITED_DIRS_CAPACITY).unwrap(),
+        )));
 
         Ok(Self {
             rt,
@@ -404,7 +423,106 @@ impl S3Fs {
             connectivity,
             emit_status,
             disk_list_cache,
+            visited_dirs,
+            emit_dir_refreshed,
         })
+    }
+
+    /// Externally-callable cache invalidation for `refresh_dir_listing`.
+    ///
+    /// Drops the in-memory list-cache entry for `prefix`, every meta-cache
+    /// entry under `prefix/`, and the on-disk listing JSON. Safe to call from
+    /// any thread — all backing maps are behind `Arc<Mutex<_>>`.
+    ///
+    /// Today the mount layer reaches into the same caches via
+    /// `RefreshHandle` instead of going through this method (S3Fs is owned
+    /// by the WinFsp host, so there's no easy `&S3Fs` to reach from a
+    /// Tauri command). Kept around as the canonical in-tree definition of
+    /// what "refresh this prefix" means.
+    #[allow(dead_code)]
+    pub fn refresh_dir(&self, prefix: &str) {
+        // In-memory list cache.
+        self.list_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(prefix);
+
+        // Meta cache: drop every entry whose key starts with "<prefix>/"
+        // (and the prefix itself). Empty prefix = root => clear everything.
+        let lc_prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.to_ascii_lowercase())
+        };
+        let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if prefix.is_empty() {
+            mc.clear();
+        } else {
+            let lc_self = prefix.to_ascii_lowercase();
+            mc.retain(|k, _| !(k.starts_with(&lc_prefix) || k == &lc_self));
+        }
+        drop(mc);
+
+        // On-disk JSON.
+        if let Some(disk) = &self.disk_list_cache {
+            disk.invalidate(prefix);
+        }
+    }
+
+    /// Spawn the background refresh task on `self.rt`. Lifetime tied to the
+    /// runtime — when the WinFsp thread tears the runtime down, the task is
+    /// cancelled automatically.
+    ///
+    /// All state the task touches is reached via cloned Arcs, so we never
+    /// have to hand it a back-reference to `self` (S3Fs is moved into the
+    /// FileSystemHost shortly after `new` returns, so a back-Arc isn't
+    /// available anyway).
+    pub fn start_background_refresh(&self) {
+        let visited_dirs = Arc::clone(&self.visited_dirs);
+        let list_cache = Arc::clone(&self.list_cache);
+        let meta_cache = Arc::clone(&self.meta_cache);
+        let disk_list_cache = self.disk_list_cache.clone();
+        let provider = Arc::clone(&self.provider);
+        let emit = Arc::clone(&self.emit_dir_refreshed);
+
+        self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(BACKGROUND_REFRESH_INTERVAL).await;
+                run_background_refresh_cycle(
+                    &visited_dirs,
+                    &list_cache,
+                    &meta_cache,
+                    disk_list_cache.as_ref(),
+                    provider.as_ref(),
+                    emit.as_ref(),
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Note a visit to `prefix` for the background-refresh LRU.
+    fn note_visit(&self, prefix: &str) {
+        let mut v = self.visited_dirs.lock().unwrap_or_else(|p| p.into_inner());
+        v.put(prefix.to_string(), Instant::now());
+    }
+
+    /// Cheap external accessors so the mount layer can build a
+    /// `RefreshHandle` without holding an `Arc<S3Fs>`.
+    pub fn list_cache_arc(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, (Instant, CachedList)>>> {
+        Arc::clone(&self.list_cache)
+    }
+    pub fn meta_cache_arc(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, (Instant, Option<(String, Meta)>)>>> {
+        Arc::clone(&self.meta_cache)
+    }
+    pub fn disk_list_cache_arc(
+        &self,
+    ) -> Option<Arc<crate::dir_listing_cache::DirListingCache>> {
+        self.disk_list_cache.clone()
     }
 
     // ── Path translation ─────────────────────────────────────────────────────
@@ -1482,6 +1600,167 @@ fn unix_secs_to_filetime(secs: i64) -> u64 {
     s * 10_000_000
 }
 
+/// Body of the background refresh loop, broken out as a free function so it
+/// can be spawned with just the Arcs it needs (no back-reference to S3Fs,
+/// which has been moved into the WinFsp host by the time the task runs).
+async fn run_background_refresh_cycle(
+    visited_dirs: &Arc<Mutex<lru::LruCache<String, Instant>>>,
+    list_cache: &Arc<Mutex<HashMap<String, (Instant, CachedList)>>>,
+    meta_cache: &Arc<Mutex<HashMap<String, (Instant, Option<(String, Meta)>)>>>,
+    disk_list_cache: Option<&Arc<crate::dir_listing_cache::DirListingCache>>,
+    provider: &dyn crate::providers::CloudProvider,
+    emit: &(dyn Fn(String) + Send + Sync),
+) {
+    // Snapshot the recently-visited prefixes, dropping stale entries.
+    let candidates: Vec<String> = {
+        let mut v = visited_dirs.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let stale: Vec<String> = v
+            .iter()
+            .filter_map(|(k, t)| {
+                if now.duration_since(*t) > RECENT_VISIT_WINDOW {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in &stale {
+            v.pop(k);
+        }
+        v.iter().map(|(k, _)| k.clone()).collect()
+    };
+
+    for prefix in candidates {
+        let fresh = match fetch_listing_uncached(provider, &prefix).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(
+                    target: "nanocrew::vfs::bgrefresh",
+                    "fetch {prefix:?} failed: {e}",
+                );
+                continue;
+            }
+        };
+
+        let cached = list_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&prefix)
+            .map(|(_, l)| l.clone());
+
+        let changed = match cached {
+            Some(c) => !listings_equal(&c, &fresh),
+            None => true,
+        };
+        if !changed {
+            continue;
+        }
+
+        let now = Instant::now();
+        list_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(prefix.clone(), (now, fresh.clone()));
+        if let Some(disk) = disk_list_cache {
+            disk.save(&prefix, &fresh);
+        }
+        seed_meta_from_listing_into(meta_cache, &prefix, &fresh, now);
+
+        emit(prefix);
+    }
+}
+
+async fn fetch_listing_uncached(
+    provider: &dyn crate::providers::CloudProvider,
+    prefix: &str,
+) -> Result<CachedList, String> {
+    let mut all_dirs: Vec<String> = Vec::new();
+    let mut all_files: Vec<(String, Meta)> = Vec::new();
+    {
+        let dirs_ref = &mut all_dirs;
+        let files_ref = &mut all_files;
+        let mut on_page = |page: crate::providers::ListDirResult| -> bool {
+            dirs_ref.extend(page.dirs);
+            files_ref.extend(page.files.into_iter().map(|(n, s)| {
+                (
+                    n,
+                    Meta {
+                        is_dir: false,
+                        size: s.size,
+                        mtime_filetime: s.mtime_filetime,
+                    },
+                )
+            }));
+            dirs_ref.len() + files_ref.len() < MAX_DIR_ENTRIES
+        };
+        provider
+            .list_dir_stream(prefix, &mut on_page)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(CachedList { dirs: all_dirs, files: all_files })
+}
+
+/// Free-function variant of `S3Fs::seed_meta_from_listing` so the background
+/// task can populate the meta cache without an `&S3Fs` reference.
+fn seed_meta_from_listing_into(
+    meta_cache: &Arc<Mutex<HashMap<String, (Instant, Option<(String, Meta)>)>>>,
+    prefix: &str,
+    listing: &CachedList,
+    now: Instant,
+) {
+    let mut mc = meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+    let parent = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
+    for d in &listing.dirs {
+        let full = format!("{parent}{d}");
+        mc.insert(
+            full.to_ascii_lowercase(),
+            (
+                now,
+                Some((full, Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() })),
+            ),
+        );
+    }
+    for (name, meta) in &listing.files {
+        let full = format!("{parent}{name}");
+        mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
+    }
+}
+
+/// Structural equality for two CachedList values. Used by the background
+/// refresh task to decide whether to emit a `dir_listing_refreshed` event.
+fn listings_equal(a: &CachedList, b: &CachedList) -> bool {
+    if a.dirs.len() != b.dirs.len() || a.files.len() != b.files.len() {
+        return false;
+    }
+    // Compare as sets — ordering can differ across pages.
+    let mut a_dirs = a.dirs.clone();
+    let mut b_dirs = b.dirs.clone();
+    a_dirs.sort();
+    b_dirs.sort();
+    if a_dirs != b_dirs {
+        return false;
+    }
+    let mut a_files: Vec<(String, u64, u64)> = a
+        .files
+        .iter()
+        .map(|(n, m)| (n.clone(), m.size, m.mtime_filetime))
+        .collect();
+    let mut b_files: Vec<(String, u64, u64)> = b
+        .files
+        .iter()
+        .map(|(n, m)| (n.clone(), m.size, m.mtime_filetime))
+        .collect();
+    a_files.sort();
+    b_files.sort();
+    a_files == b_files
+}
+
 fn now_filetime() -> u64 {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2101,6 +2380,10 @@ impl FileSystemContext for S3Fs {
             OpenFile::Dir { key, .. } => key.clone(),
             _ => return Err(nt(STATUS_NOT_A_DIRECTORY)),
         };
+
+        // Track this directory in the recently-visited LRU so the
+        // background refresh task can keep its listing fresh.
+        self.note_visit(&key);
 
         // We bypass WinFsp's DirBuffer entirely. Its marker-based pagination
         // re-emits entries at every kernel read-buffer boundary (~338 entries)

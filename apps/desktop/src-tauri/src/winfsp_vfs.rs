@@ -66,6 +66,12 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// `FILE_ATTRIBUTE_OFFLINE` — Windows renders files with this bit using the
+/// cloud / offline overlay icon (small ⊘ badge). We set it on every file
+/// that isn't yet fully present in the block cache so users get a free
+/// "cached vs not-cached" visual cue without writing a shell-extension
+/// overlay handler.
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
 
 use crate::cache::{DiskCache, CACHE_BLOCK};
 use crate::file_lock;
@@ -1886,6 +1892,25 @@ impl S3Fs {
     fn emit_lock(&self, ev: FileLockEvent) {
         (self.emit_lock)(ev);
     }
+
+    /// OR `FILE_ATTRIBUTE_OFFLINE` into `info.file_attributes` whenever `key`
+    /// is a file that isn't fully present in the block cache (or the cache
+    /// is disabled). Dirs are left alone — they have no payload to fetch.
+    /// Driven from every code path that fills a `FileInfo` for an existing
+    /// S3 object: `open`, `get_file_info`, `get_security_by_name`, and the
+    /// `read_directory` per-entry loop.
+    fn apply_offline_attr(&self, info: &mut FileInfo, key: &str, meta: &Meta) {
+        if meta.is_dir {
+            return;
+        }
+        let offline = match self.cache.as_ref() {
+            Some(cache) => !cache.is_fully_cached(key, meta.size),
+            None => true,
+        };
+        if offline {
+            info.file_attributes |= FILE_ATTRIBUTE_OFFLINE;
+        }
+    }
 }
 
 // ── FileSystemContext impl ───────────────────────────────────────────────────
@@ -1906,14 +1931,28 @@ impl FileSystemContext for S3Fs {
             .ok_or_else(|| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
         let sz = copy_sd_into(&self.security, security_descriptor);
+        let mut attributes = if meta.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        // Same OFFLINE-overlay logic as `read_directory` — Explorer queries
+        // single-file attributes via this path when it draws an icon for a
+        // file that wasn't in the parent enumeration (e.g. a direct
+        // navigation to a path in the address bar).
+        if !meta.is_dir {
+            let offline = match self.cache.as_ref() {
+                Some(cache) => !cache.is_fully_cached(&key, meta.size),
+                None => true,
+            };
+            if offline {
+                attributes |= FILE_ATTRIBUTE_OFFLINE;
+            }
+        }
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: sz,
-            attributes: if meta.is_dir {
-                FILE_ATTRIBUTE_DIRECTORY
-            } else {
-                FILE_ATTRIBUTE_NORMAL
-            },
+            attributes,
         })
     }
 
@@ -1933,6 +1972,7 @@ impl FileSystemContext for S3Fs {
             .ok_or_else(|| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
         fill_file_info(file_info.as_mut(), &meta);
+        self.apply_offline_attr(file_info.as_mut(), &real_key, &meta);
 
         // Phase 4.1 + 4.3: acquire writer locks BEFORE handing back a handle.
         // We only do the check for files the caller intends to write to, and
@@ -2353,9 +2393,10 @@ impl FileSystemContext for S3Fs {
                 };
                 fill_file_info(file_info, &meta);
             }
-            OpenFile::File { meta, .. } => {
+            OpenFile::File { key, meta, .. } => {
                 let m = meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 fill_file_info(file_info, &m);
+                self.apply_offline_attr(file_info, key, &m);
             }
         }
         Ok(())
@@ -2416,6 +2457,18 @@ impl FileSystemContext for S3Fs {
                 continue;
             }
             fill_file_info(info.file_info_mut(), meta);
+            // Flag not-yet-cached files with FILE_ATTRIBUTE_OFFLINE so
+            // Explorer renders the cloud / offline overlay. Dirs and the
+            // "." / ".." pseudo-entries are skipped by apply_offline_attr
+            // (meta.is_dir == true).
+            if name != "." && name != ".." {
+                let full_key = if key.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", key, name)
+                };
+                self.apply_offline_attr(info.file_info_mut(), &full_key, meta);
+            }
             if !info.append_to_buffer(buffer, &mut cursor) {
                 all_fit = false;
                 break;

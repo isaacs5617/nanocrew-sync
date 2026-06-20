@@ -276,6 +276,41 @@ impl DiskCache {
         Some(buf)
     }
 
+    /// Cheap check: is every `CACHE_BLOCK`-aligned window covering
+    /// `[0, file_size)` already present in the SQLite index for this key?
+    /// Used by `read_directory` to flag not-yet-materialized files with
+    /// `FILE_ATTRIBUTE_OFFLINE` so Explorer renders the cloud-overlay icon.
+    ///
+    /// Index-only — does NOT touch disk or decrypt, so it's safe to call
+    /// from the per-entry hot path. Returns `false` when the cache is
+    /// disabled (everything is effectively offline in that case).
+    pub fn is_fully_cached(&self, key: &str, file_size: u64) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        if file_size == 0 {
+            // Zero-byte files have no blocks to fetch — treat as cached so
+            // they don't sport an offline badge forever.
+            return true;
+        }
+        let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut covered: u64 = 0;
+        while covered < file_size {
+            let expected_len = (file_size - covered).min(CACHE_BLOCK) as i64;
+            let row: Result<i64, _> = conn.query_row(
+                "SELECT len FROM cache_entries
+                 WHERE drive_id = ?1 AND key = ?2 AND offset = ?3",
+                params![self.drive_id, key, covered as i64],
+                |r| r.get(0),
+            );
+            match row {
+                Ok(len) if len >= expected_len => covered += CACHE_BLOCK,
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Store a freshly fetched block on disk and index it. The length of
     /// `bytes` may be shorter than `CACHE_BLOCK` at EOF; record whatever it
     /// actually is.
@@ -285,12 +320,19 @@ impl DiskCache {
         }
         let len = bytes.len() as u64;
         let path = self.path_for(key, block_start, len);
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                tracing::warn!(target: "nanocrew::cache",
-                    drive_id = self.drive_id, "mkdir {}: {e}", parent.display());
-                return;
-            }
+        // Belt-and-braces: ensure the two-level hashed parent directory
+        // (`<hex[0..2]>/<hex[2..]>/`) exists before we open the tmp file.
+        // Without this, a fresh key whose parent dir has never been created
+        // (or has been garbage-collected) trips ENOENT on `File::create` and
+        // every read for that key silently re-fetches from S3.
+        let parent = match path.parent() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(target: "nanocrew::cache",
+                drive_id = self.drive_id, "mkdir {}: {e}", parent.display());
+            return;
         }
 
         // Encrypt if a cipher is configured. Each block gets its own fresh
@@ -322,13 +364,25 @@ impl DiskCache {
         // Write to a tmp file and rename so a partial write can't be
         // resurfaced as a bogus cache hit.
         let tmp = path.with_extension("tmp");
-        let write_result = (|| -> std::io::Result<()> {
+        let do_write = || -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&disk_bytes)?;
             f.sync_data()?;
             fs::rename(&tmp, &path)?;
             Ok(())
-        })();
+        };
+        let mut write_result = do_write();
+        // If the parent dir disappeared between mkdir and create (concurrent
+        // clear_all, antivirus, user-initiated cache wipe), retry once after
+        // re-creating it. Cheap insurance against the recurring ENOENT we
+        // were seeing in production.
+        if let Err(ref e) = write_result {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if fs::create_dir_all(parent).is_ok() {
+                    write_result = do_write();
+                }
+            }
+        }
         if let Err(e) = write_result {
             tracing::warn!(target: "nanocrew::cache",
                 drive_id = self.drive_id, "put_block {}: {e}", path.display());
@@ -682,6 +736,39 @@ mod tests {
         c.invalidate_key("k");
         assert!(c.get_block("k", 0).is_none());
         assert!(c.get_block("k", CACHE_BLOCK).is_none());
+    }
+
+    #[test]
+    fn put_block_creates_missing_parent_dirs() {
+        // Regression for the recurring ENOENT we were seeing in production:
+        // `put_block` for a brand-new key whose hashed two-level parent
+        // directory hasn't been created yet must mkdir on the fly, not bail
+        // out and silently disable caching for that key.
+        let (c, _t) = new_cache("mkdir-on-put", 10 * 1024 * 1024);
+        let key = "never/seen/before.bin";
+        // Sanity check: the parent dir does NOT exist yet.
+        let path = c.path_for(key, 0, 1024);
+        assert!(!path.parent().unwrap().exists(), "parent should be absent pre-put");
+        let bytes = vec![42u8; 1024];
+        c.put_block(key, 0, &bytes);
+        let got = c.get_block(key, 0).expect("put_block should have written through");
+        assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn is_fully_cached_tracks_block_population() {
+        let (c, _t) = new_cache("fully-cached", 10 * 1024 * 1024);
+        let key = "doc.bin";
+        let size = CACHE_BLOCK * 2 + 512; // 3 blocks (last is short)
+        assert!(!c.is_fully_cached(key, size), "fresh key shouldn't be cached");
+        c.put_block(key, 0, &vec![1u8; CACHE_BLOCK as usize]);
+        assert!(!c.is_fully_cached(key, size), "1/3 blocks shouldn't be cached");
+        c.put_block(key, CACHE_BLOCK, &vec![2u8; CACHE_BLOCK as usize]);
+        assert!(!c.is_fully_cached(key, size), "2/3 blocks shouldn't be cached");
+        c.put_block(key, CACHE_BLOCK * 2, &vec![3u8; 512]);
+        assert!(c.is_fully_cached(key, size), "all 3 blocks should be cached");
+        // Zero-byte files are trivially cached.
+        assert!(c.is_fully_cached("empty", 0));
     }
 
     #[test]

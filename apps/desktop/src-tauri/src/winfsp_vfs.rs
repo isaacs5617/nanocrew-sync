@@ -1836,7 +1836,10 @@ fn fill_file_info(info: &mut FileInfo, meta: &Meta) {
         FILE_ATTRIBUTE_NORMAL
     };
     info.reparse_tag = 0;
-    info.allocation_size = (meta.size + 4095) & !4095;
+    // Round allocation size up to 4 KiB. saturating_add so a bogus size
+    // near u64::MAX can't overflow to 0 and then confuse Windows into
+    // "file has no allocation" semantics.
+    info.allocation_size = meta.size.saturating_add(4095) & !4095;
     info.file_size = meta.size;
     info.creation_time = meta.mtime_filetime;
     info.last_access_time = meta.mtime_filetime;
@@ -2782,12 +2785,16 @@ impl FileSystemContext for S3Fs {
     }
 
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
-        // S3 is effectively unlimited — report 1 TiB total with 1 TiB free so
-        // Explorer is happy. Real size could be computed via a bucket-level
-        // LIST with usage summation but that'd slow mount.
-        const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
-        out.total_size = ONE_TIB;
-        out.free_size = ONE_TIB;
+        // S3 is effectively unlimited. Report a very large volume total so
+        // Explorer never refuses a Copy From with "file too large for
+        // destination" when the source total exceeds our reported TotalSize.
+        // Bug seen at 1 TiB: copying a folder totalling ~847 GB of .lrv
+        // files failed with STATUS_FILE_TOO_LARGE because Explorer's
+        // pre-flight check compared the aggregate source size to our
+        // volume TotalSize. Report 128 TiB — plenty for any single bucket.
+        const VFS_VOLUME_SIZE: u64 = 128 * 1024 * 1024 * 1024 * 1024; // 128 TiB
+        out.total_size = VFS_VOLUME_SIZE;
+        out.free_size = VFS_VOLUME_SIZE;
         out.set_volume_label(&self.volume_label);
         Ok(())
     }

@@ -88,7 +88,7 @@ pub struct LicenseClaims {
 /// restart.
 #[derive(Debug, Clone, Serialize)]
 pub struct LicenseStatus {
-    /// `"trial"` / `"free"` / `"personal"` / `"pro"` / `"team"` / `"expired"`.
+    /// `"trial"` / `"free"` / `"personal"` / `"pro"` / `"team"` / `"lifetime"` / `"expired"`.
     pub tier: String,
     /// Is the tier granting Pro-level features right now?
     pub is_pro: bool,
@@ -180,7 +180,7 @@ pub fn compute_status(db: &Mutex<rusqlite::Connection>) -> LicenseStatus {
         match verify_jwt(&jwt) {
             Ok(claims) => {
                 let tier = claims.tier.to_lowercase();
-                let is_pro = matches!(tier.as_str(), "pro" | "team" | "personal");
+                let is_pro = matches!(tier.as_str(), "pro" | "team" | "personal" | "lifetime");
                 let days_remaining = claims.exp.saturating_sub(now) / DAY_SECS;
                 return LicenseStatus {
                     tier,

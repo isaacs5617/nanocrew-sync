@@ -684,9 +684,15 @@ impl S3Fs {
             .insert(prefix.to_string(), (now, listing.clone()));
 
         // Persist to disk so the next app launch can skip the S3 LIST
-        // pagination for this prefix entirely.
+        // pagination for this prefix entirely. Skip empty listings — an
+        // empty result is either a genuinely empty folder (cheap to re-list)
+        // or a silent failure (e.g. credential migration race on first mount
+        // returning zero rows instead of an error). Persisting empty would
+        // poison the cache and lock the user into a stale "empty" view.
         if let Some(disk) = &self.disk_list_cache {
-            disk.save(prefix, &listing);
+            if !listing.dirs.is_empty() || !listing.files.is_empty() {
+                disk.save(prefix, &listing);
+            }
         }
 
         // Seed the meta_cache for every entry we just learned about. This
@@ -817,7 +823,11 @@ impl S3Fs {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(key.to_string(), (now, listing.clone()));
-        if !capped {
+        // Skip disk cache when capped (truncated listing) OR when empty. An
+        // empty result is either a genuinely empty folder (cheap to re-list)
+        // or a silent failure that poisoned an empty result — persisting
+        // would lock the user into a stale "empty" view.
+        if !capped && (!listing.dirs.is_empty() || !listing.files.is_empty()) {
             if let Some(disk) = self.disk_list_cache.as_ref() {
                 disk.save(key, &listing);
             }
@@ -1668,8 +1678,12 @@ async fn run_background_refresh_cycle(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(prefix.clone(), (now, fresh.clone()));
+        // Skip disk persistence for empty listings — see rationale in
+        // listing_for above (avoid poisoning the cache on silent failures).
         if let Some(disk) = disk_list_cache {
-            disk.save(&prefix, &fresh);
+            if !fresh.dirs.is_empty() || !fresh.files.is_empty() {
+                disk.save(&prefix, &fresh);
+            }
         }
         seed_meta_from_listing_into(meta_cache, &prefix, &fresh, now);
 

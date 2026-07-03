@@ -253,6 +253,7 @@ pub fn run() {
             commands::auth::create_admin,
             commands::auth::sign_in,
             commands::auth::sign_out,
+            commands::auth::try_restore_session,
             commands::auth::get_account,
             commands::auth::change_password,
             commands::auth::verify_password,

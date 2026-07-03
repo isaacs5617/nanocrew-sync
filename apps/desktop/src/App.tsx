@@ -159,11 +159,31 @@ export function App() {
 
   React.useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
 
-  // On mount: check whether an admin account exists yet.
+  // On mount: check whether an admin account exists yet. If it does, try
+  // to auto-restore a "remember me" session so the user isn't prompted for
+  // their password every launch. Falls through to the sign-in screen if no
+  // persisted session is present or it's expired/corrupt.
   React.useEffect(() => {
-    invoke<boolean>('has_account')
-      .then(exists => setAppState(exists ? 'signin' : 'setup'))
-      .catch(() => setAppState('signin'));
+    (async () => {
+      let hasAcc = false;
+      try { hasAcc = await invoke<boolean>('has_account'); } catch { /* signin */ }
+      if (!hasAcc) { setAppState('setup'); return; }
+
+      try {
+        const restored = await invoke<string | null>('try_restore_session');
+        if (restored) {
+          setToken(restored);
+          try {
+            const acc = await invoke<{ username: string }>('get_account', { token: restored });
+            setUsername(acc.username);
+          } catch { /* non-fatal */ }
+          setAppState('authed');
+          return;
+        }
+      } catch { /* fall through to sign-in */ }
+
+      setAppState('signin');
+    })();
   }, []);
 
   // Session lock — listen for the Tauri window's "resize" (minimize fires

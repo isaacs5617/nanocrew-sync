@@ -19,6 +19,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
   const [username, setUsername] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [showPw, setShowPw] = React.useState(false);
+  const [remember, setRemember] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
 
@@ -28,7 +29,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
 
     setBusy(true);
     try {
-      const token = await invoke<string>('sign_in', { username: username.trim(), password });
+      const token = await invoke<string>('sign_in', { username: username.trim(), password, remember });
       onSignIn(token);
     } catch (e) {
       setError(tr('onboarding.errorInvalid'));
@@ -110,6 +111,20 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ theme, onSig
               />
             </div>
           </div>
+
+          <label style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            marginBottom: 16, cursor: 'pointer', userSelect: 'none',
+            fontSize: 12, color: t.textMd,
+          }}>
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={e => setRemember(e.target.checked)}
+              style={{ accentColor: t.lime, width: 14, height: 14, margin: 0 }}
+            />
+            <span>Keep me signed in on this PC</span>
+          </label>
 
           {error && (
             <div style={{

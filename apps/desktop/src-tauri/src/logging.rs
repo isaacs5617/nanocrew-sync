@@ -47,6 +47,12 @@ pub fn init(log_dir: &Path, verbose: bool) -> Option<WorkerGuard> {
         .with_ansi(false)
         .with_target(true);
 
+    // Ensure the log directory exists — rolling::daily is supposed to
+    // create it, but on some Windows setups (roaming profile edge cases,
+    // OneDrive-backed AppData) the first write silently fails if the
+    // parent isn't there yet, producing a 0-byte log file.
+    let _ = std::fs::create_dir_all(log_dir);
+
     // `try_init` instead of `init` so a second call (e.g. from tests) returns
     // Err rather than panicking.
     let res = tracing_subscriber::registry()
@@ -56,11 +62,13 @@ pub fn init(log_dir: &Path, verbose: bool) -> Option<WorkerGuard> {
         .with(sentry_tracing::layer())
         .try_init();
 
-    match res {
-        Ok(()) => Some(guard),
-        Err(e) => {
-            eprintln!("logging: subscriber already set ({e}); keeping original");
-            None
-        }
+    // ALWAYS return the guard — even if the subscriber was already set by
+    // another init call, the file-writer thread it owns is still valid and
+    // dropping it here would abandon any buffered lines without flushing.
+    // (Previous behaviour dropped the guard on Err, which is likely why
+    // some machines produced a 0-byte log file.)
+    if let Err(e) = res {
+        eprintln!("logging: subscriber already set ({e}); keeping our file-writer guard alive anyway");
     }
+    Some(guard)
 }

@@ -643,16 +643,26 @@ impl S3Fs {
         // Disk-backed listing cache. A fresh hit (<24h) is treated as the
         // moral equivalent of a successful S3 fetch: we populate the
         // in-memory list cache and seed meta_cache, then return without
-        // touching the network.
+        // touching the network. Reject empty on-disk entries — leftover
+        // from a pre-0.2.11 install that persisted a silent-failure empty
+        // would otherwise lock the user into "empty folder" forever.
         if let Some(disk) = &self.disk_list_cache {
             if let Some(cached) = disk.load(prefix) {
-                let now = Instant::now();
-                self.list_cache
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(prefix.to_string(), (now, cached.clone()));
-                self.seed_meta_from_listing(prefix, &cached, now);
-                return Ok(cached);
+                if cached.dirs.is_empty() && cached.files.is_empty() {
+                    tracing::warn!(
+                        target: "nanocrew::vfs",
+                        "list_dir disk cache EMPTY for prefix={:?} — ignoring, refetching from provider",
+                        prefix,
+                    );
+                } else {
+                    let now = Instant::now();
+                    self.list_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(prefix.to_string(), (now, cached.clone()));
+                    self.seed_meta_from_listing(prefix, &cached, now);
+                    return Ok(cached);
+                }
             }
         }
 
@@ -687,19 +697,27 @@ impl S3Fs {
 
         let listing = result?;
         let now = Instant::now();
-        self.list_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(prefix.to_string(), (now, listing.clone()));
+        // Only cache non-empty results in memory. An empty result is either
+        // a genuinely empty folder (cheap to re-list on next request) or a
+        // silent failure / transient network hiccup (v0.2.11: was previously
+        // being cached for LIST_TTL, leaving Explorer showing "empty" until
+        // the TTL expired even after S3 recovered). Warn-log so we can
+        // diagnose next time.
+        if listing.dirs.is_empty() && listing.files.is_empty() {
+            tracing::warn!(
+                target: "nanocrew::vfs",
+                "list_dir prefix={:?} returned EMPTY — skipping cache write, will retry on next request",
+                prefix,
+            );
+        } else {
+            self.list_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(prefix.to_string(), (now, listing.clone()));
 
-        // Persist to disk so the next app launch can skip the S3 LIST
-        // pagination for this prefix entirely. Skip empty listings — an
-        // empty result is either a genuinely empty folder (cheap to re-list)
-        // or a silent failure (e.g. credential migration race on first mount
-        // returning zero rows instead of an error). Persisting empty would
-        // poison the cache and lock the user into a stale "empty" view.
-        if let Some(disk) = &self.disk_list_cache {
-            if !listing.dirs.is_empty() || !listing.files.is_empty() {
+            // Persist to disk so the next app launch can skip the S3 LIST
+            // pagination for this prefix entirely.
+            if let Some(disk) = &self.disk_list_cache {
                 disk.save(prefix, &listing);
             }
         }
@@ -729,16 +747,26 @@ impl S3Fs {
             }
         }
 
-        // On-disk listing cache.
+        // On-disk listing cache. Reject empty on-disk entries — leftover
+        // from a pre-0.2.11 install that persisted a silent-failure empty
+        // would otherwise lock the user into "empty folder" forever.
         if let Some(disk) = &self.disk_list_cache {
             if let Some(cached) = disk.load(key) {
-                let now = Instant::now();
-                self.list_cache
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(key.to_string(), (now, cached.clone()));
-                self.seed_meta_from_listing(key, &cached, now);
-                return Ok(cached);
+                if cached.dirs.is_empty() && cached.files.is_empty() {
+                    tracing::warn!(
+                        target: "nanocrew::vfs",
+                        "listing_for disk cache EMPTY for key={:?} — ignoring, refetching from provider",
+                        key,
+                    );
+                } else {
+                    let now = Instant::now();
+                    self.list_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(key.to_string(), (now, cached.clone()));
+                    self.seed_meta_from_listing(key, &cached, now);
+                    return Ok(cached);
+                }
             }
         }
 
@@ -828,17 +856,26 @@ impl S3Fs {
         let listing = CachedList { dirs: all_dirs, files: all_files };
 
         let now = Instant::now();
-        self.list_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key.to_string(), (now, listing.clone()));
-        // Skip disk cache when capped (truncated listing) OR when empty. An
-        // empty result is either a genuinely empty folder (cheap to re-list)
-        // or a silent failure that poisoned an empty result — persisting
-        // would lock the user into a stale "empty" view.
-        if !capped && (!listing.dirs.is_empty() || !listing.files.is_empty()) {
-            if let Some(disk) = self.disk_list_cache.as_ref() {
-                disk.save(key, &listing);
+        // Only cache non-empty results in memory. Empty results are either
+        // a genuinely empty folder (cheap to re-list) or a silent failure —
+        // caching for LIST_TTL would leave Explorer showing "empty folder"
+        // for a full minute even after the underlying issue clears.
+        if listing.dirs.is_empty() && listing.files.is_empty() {
+            tracing::warn!(
+                target: "nanocrew::vfs",
+                "listing_for key={:?} returned EMPTY — skipping cache write, will retry on next request",
+                key,
+            );
+        } else {
+            self.list_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key.to_string(), (now, listing.clone()));
+            // Skip disk cache when capped (truncated listing).
+            if !capped {
+                if let Some(disk) = self.disk_list_cache.as_ref() {
+                    disk.save(key, &listing);
+                }
             }
         }
         tracing::info!(
@@ -1683,16 +1720,23 @@ async fn run_background_refresh_cycle(
         }
 
         let now = Instant::now();
+        // Only cache non-empty background-refresh results — see rationale
+        // in listing_for above (empty is either genuinely empty and cheap
+        // to re-list, or a silent failure we don't want to persist).
+        if fresh.dirs.is_empty() && fresh.files.is_empty() {
+            tracing::warn!(
+                target: "nanocrew::vfs",
+                "refresh prefix={:?} returned EMPTY — skipping cache write",
+                prefix,
+            );
+            continue;
+        }
         list_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(prefix.clone(), (now, fresh.clone()));
-        // Skip disk persistence for empty listings — see rationale in
-        // listing_for above (avoid poisoning the cache on silent failures).
         if let Some(disk) = disk_list_cache {
-            if !fresh.dirs.is_empty() || !fresh.files.is_empty() {
-                disk.save(&prefix, &fresh);
-            }
+            disk.save(&prefix, &fresh);
         }
         seed_meta_from_listing_into(meta_cache, &prefix, &fresh, now);
 

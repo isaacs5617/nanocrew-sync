@@ -66,6 +66,15 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// Files at or above this size do NOT get the `FILE_ATTRIBUTE_OFFLINE`
+/// badge even when uncached. Windows Explorer refuses to Copy offline
+/// files above a hardcoded threshold (around 1-2 GB observed) with the
+/// misleading "The file is too large for the destination file system"
+/// dialog. 256 MB is a safe headroom well below that limit while still
+/// showing the not-cached badge on the common cases users care about
+/// (docs, photos, small videos).
+const OFFLINE_ATTR_MAX_SIZE: u64 = 256 * 1024 * 1024;
+
 /// `FILE_ATTRIBUTE_OFFLINE` — Windows renders files with this bit using the
 /// cloud / offline overlay icon (small ⊘ badge). We set it on every file
 /// that isn't yet fully present in the block cache so users get a free
@@ -1917,7 +1926,7 @@ impl S3Fs {
     /// S3 object: `open`, `get_file_info`, `get_security_by_name`, and the
     /// `read_directory` per-entry loop.
     fn apply_offline_attr(&self, info: &mut FileInfo, key: &str, meta: &Meta) {
-        if meta.is_dir {
+        if meta.is_dir || meta.size >= OFFLINE_ATTR_MAX_SIZE {
             return;
         }
         let offline = match self.cache.as_ref() {
@@ -1956,8 +1965,9 @@ impl FileSystemContext for S3Fs {
         // Same OFFLINE-overlay logic as `read_directory` — Explorer queries
         // single-file attributes via this path when it draws an icon for a
         // file that wasn't in the parent enumeration (e.g. a direct
-        // navigation to a path in the address bar).
-        if !meta.is_dir {
+        // navigation to a path in the address bar). Skip large files to
+        // avoid tripping Explorer's Copy refusal (see OFFLINE_ATTR_MAX_SIZE).
+        if !meta.is_dir && meta.size < OFFLINE_ATTR_MAX_SIZE {
             let offline = match self.cache.as_ref() {
                 Some(cache) => !cache.is_fully_cached(&key, meta.size),
                 None => true,

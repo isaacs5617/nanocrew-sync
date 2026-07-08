@@ -559,6 +559,27 @@ impl S3Fs {
         }
     }
 
+    /// Ask S3 whether `rel_key` currently has a foreign (unexpired,
+    /// not-owned-by-us) sentinel. Returns `None` on Free / owned-by-us /
+    /// network hiccups — a check we can't complete never causes a divert.
+    /// This is the conflict-detection primitive for `rename()`.
+    fn foreign_lock_for(&self, rel_key: &str) -> Option<file_lock::Sentinel> {
+        if is_internal_key(rel_key) {
+            return None;
+        }
+        let client = self.file_lock_client.clone();
+        let bucket = self.file_lock_bucket.clone();
+        let mid = self.machine_id.clone();
+        let abs = self.file_lock_abs_key(rel_key);
+        let state = self.rt.block_on(async move {
+            file_lock::check(&client, &bucket, &abs, &mid).await
+        });
+        match state {
+            Ok(file_lock::LockState::Foreign(s)) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Split a key into `(parent_prefix, basename)`. Parent prefix has no
     /// trailing slash; root returns `("", name)`.
     fn split_key(key: &str) -> (&str, &str) {
@@ -1938,6 +1959,79 @@ fn is_internal_key(key: &str) -> bool {
         || key.starts_with(".nanocrew/")
 }
 
+// ── Conflict-copy helpers ────────────────────────────────────────────────────
+//
+// When a rename would overwrite a file that another user is actively editing
+// (foreign sentinel present), we redirect the copy to a suffixed key so the
+// remote user's changes are NEVER silently overwritten. The name we produce
+// looks like: `foo (conflict-<us>-YYYYMMDD-HHMMSS).xlsx`.
+
+/// Howard Hinnant's `civil_from_days` — converts days-since-1970-01-01 to
+/// (year, month, day). Ported verbatim; well-tested across the industry.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+fn conflict_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let h = tod / 3600;
+    let m = (tod / 60) % 60;
+    let s = tod % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
+/// Split a basename into `(stem, ".ext")`. Leading dots are treated as part
+/// of the stem so `.gitignore` stays intact.
+fn split_ext(basename: &str) -> (&str, &str) {
+    let leading_dots = basename.len() - basename.trim_start_matches('.').len();
+    let after_dots = &basename[leading_dots..];
+    match after_dots.rfind('.') {
+        Some(i) if i > 0 => (
+            &basename[..leading_dots + i],
+            &basename[leading_dots + i..],
+        ),
+        _ => (basename, ""),
+    }
+}
+
+/// Build a conflict-suffixed key from a target key + our own display name.
+/// Non-alphanumeric characters in `our_name` are collapsed to `_` for
+/// filesystem safety across all providers.
+fn make_conflict_key(target_key: &str, our_name: &str) -> String {
+    let (parent, base) = match target_key.rfind('/') {
+        Some(i) => (&target_key[..i], &target_key[i + 1..]),
+        None => ("", target_key),
+    };
+    let (stem, ext) = split_ext(base);
+    let safe_name: String = our_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let ts = conflict_stamp();
+    let new_base = format!("{stem} (conflict-{safe_name}-{ts}){ext}");
+    if parent.is_empty() {
+        new_base
+    } else {
+        format!("{parent}/{new_base}")
+    }
+}
+
 /// Decide whether to materialize an entire file into the block cache at
 /// `open()` time. Office documents and PDFs always qualify (up to 50 MB)
 /// because they issue many small scattered reads; other small files
@@ -2113,17 +2207,42 @@ impl FileSystemContext for S3Fs {
 
         // Phase 4.2: emit lockfile-detection events for Office/LibreOffice/vim
         // sidecar files so the UI can light up "being edited" badges.
+        //
+        // AND (v0.2.13): proactively drop a sentinel for the target file when
+        // we see a lockfile appear. Excel/Word open the target read-only and
+        // save via temp+rename-over-original — the write-open sentinel path
+        // never fires for the target itself, so cross-user rename collisions
+        // would otherwise slip through. Dropping the sentinel here means
+        // another user's rename() will see us as the foreign holder and
+        // divert their save to a conflict-suffixed name. Sentinels self-
+        // expire after LOCK_TTL_SECS (15 min), so a crashed editor never
+        // leaves a file locked forever.
         if !meta.is_dir {
-            let (_, base) = Self::split_key(&real_key);
-            if let Some(target) = file_lock::classify_lockfile(base) {
+            let (parent, base) = Self::split_key(&real_key);
+            if let Some(target_base) = file_lock::classify_lockfile(base) {
+                let target_key = if parent.is_empty() {
+                    target_base.clone()
+                } else {
+                    format!("{parent}/{target_base}")
+                };
                 self.emit_lock(FileLockEvent {
                     drive_id: self.drive_id,
-                    target,
+                    target: target_key.clone(),
                     trigger: real_key.clone(),
                     state: "lockfile_created".into(),
                     owner: None,
                     machine: None,
                 });
+                if !is_internal_key(&target_key) {
+                    let client = self.file_lock_client.clone();
+                    let bucket = self.file_lock_bucket.clone();
+                    let mid = self.machine_id.clone();
+                    let owner = self.owner.clone();
+                    let abs = self.file_lock_abs_key(&target_key);
+                    let _ = self.rt.block_on(async move {
+                        file_lock::acquire(&client, &bucket, &abs, &mid, &owner).await
+                    });
+                }
             }
         }
 
@@ -2837,9 +2956,32 @@ impl FileSystemContext for S3Fs {
                 })?;
         } else {
             // File rename: copy then delete.
+            //
+            // Conflict-copy fallback: if the destination is currently locked
+            // by another user (foreign sentinel), redirect our copy to a
+            // suffixed name (`foo (conflict-<us>-<ts>).xlsx`) instead of
+            // overwriting theirs. Excel/Word/PowerPoint save via
+            // temp+rename-over-original, so this is where a cross-user save
+            // collision is actually resolved — the original stays intact,
+            // our user's edits land safely, and the UI gets a
+            // `file_conflict_diverted` event so we can toast the outcome.
+            let mut effective_dst = new_key.clone();
+            let mut diverted_from: Option<(String, file_lock::Sentinel)> = None;
+            if let Some(foreign) = self.foreign_lock_for(&new_key) {
+                let alt = make_conflict_key(&new_key, &self.owner);
+                tracing::warn!(
+                    target: "nanocrew::vfs",
+                    "rename dst {new_key:?} locked by {} on {} — diverting to {alt:?}",
+                    foreign.owner,
+                    foreign.machine,
+                );
+                diverted_from = Some((new_key.clone(), foreign));
+                effective_dst = alt;
+            }
+
             let provider = self.provider.clone();
             let old_k = old_key.clone();
-            let new_k = new_key.clone();
+            let new_k = effective_dst.clone();
             self.rt
                 .block_on(async move {
                     provider
@@ -2852,9 +2994,28 @@ impl FileSystemContext for S3Fs {
                         .map_err(|e| format!("delete_object: {e}"))
                 })
                 .map_err(|e| {
-                    eprintln!("[winfsp] rename failed src={old_key} dst={new_key}: {e}");
+                    eprintln!("[winfsp] rename failed src={old_key} dst={effective_dst}: {e}");
                     nt(STATUS_INVALID_PARAMETER)
                 })?;
+
+            // Emit the divert event after the copy landed so consumers can
+            // trust that the diverted key is a real object they can open.
+            if let Some((intended, foreign)) = diverted_from {
+                self.emit_lock(FileLockEvent {
+                    drive_id: self.drive_id,
+                    target: intended,
+                    trigger: effective_dst.clone(),
+                    state: "file_conflict_diverted".into(),
+                    owner: Some(foreign.owner),
+                    machine: Some(foreign.machine),
+                });
+            }
+
+            // Invalidate the effective destination too so a subsequent open
+            // of the diverted name sees fresh S3 state, not stale cache.
+            self.invalidate_parent(&effective_dst);
+            self.invalidate_meta(&effective_dst);
+            self.invalidate_cache(&effective_dst);
         }
         self.invalidate_parent(&old_key);
         self.invalidate_parent(&new_key);

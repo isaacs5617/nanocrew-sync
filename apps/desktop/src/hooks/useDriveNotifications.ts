@@ -53,6 +53,19 @@ interface ActivityEntry {
   message?: string | null;
 }
 
+/** Emitted as `file_lock_event` by the VFS. See types.rs::FileLockEvent. */
+interface FileLockEventPayload {
+  drive_id: number;
+  /** The path Windows asked about (target of the operation). */
+  target: string;
+  /** The path that actually got created / diverted / detected. */
+  trigger: string;
+  /** e.g. "sentinel_conflict", "lockfile_created", "file_conflict_diverted" */
+  state: string;
+  owner?: string | null;
+  machine?: string | null;
+}
+
 interface DriveMeta { id: number; name: string; letter: string }
 
 /** Cached drive-id → friendly label map. Refreshed on drive_status_changed
@@ -157,6 +170,34 @@ export function useDriveNotifications(token: string | null) {
     });
     return () => { un.then(fn => fn()); prevStatus.current.clear(); };
   }, [token, labelFor]);
+
+  // file_lock_event — cross-user file collisions. The most important one is
+  // `file_conflict_diverted`: someone else was editing the file we saved to,
+  // and the VFS routed our copy to a suffixed name so neither user loses
+  // work. Always toast this one (not gated on notify_uploads/errors) — the
+  // user MUST know the file they think they saved is actually at a new path.
+  React.useEffect(() => {
+    if (!token) return;
+    const un = listen<FileLockEventPayload>('file_lock_event', async e => {
+      const { state, target, trigger, owner } = e.payload;
+      if (state === 'file_conflict_diverted') {
+        const targetBase = target.split('/').pop() || target;
+        const divertedBase = trigger.split('/').pop() || trigger;
+        const who = owner ? ` ${owner}` : ' another user';
+        toast(
+          'Save collision — your file was renamed',
+          `${targetBase} was being edited by${who}. Your changes are saved as: ${divertedBase}`,
+        );
+      } else if (state === 'sentinel_conflict') {
+        const who = owner ? ` ${owner}` : ' another user';
+        const targetBase = target.split('/').pop() || target;
+        if (await getBoolPref(token, 'notify_errors', true)) {
+          toast('File locked', `${targetBase} is being edited by${who}. Open in read-only mode.`);
+        }
+      }
+    });
+    return () => { un.then(fn => fn()); };
+  }, [token]);
 
   // transfer_progress — upload complete (opt-in, off by default — noisy)
   React.useEffect(() => {

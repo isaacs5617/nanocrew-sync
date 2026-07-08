@@ -194,6 +194,17 @@ export function useDriveNotifications(token: string | null) {
         if (await getBoolPref(token, 'notify_errors', true)) {
           toast('File locked', `${targetBase} is being edited by${who}. Open in read-only mode.`);
         }
+      } else if (state === 'delete_failed') {
+        // Windows/WinFsp has no way to report cleanup failures back to
+        // Explorer, so Explorer thinks the delete worked and hides the file
+        // even though S3 still has it. Toast unconditionally so the user
+        // knows to check permissions / retry.
+        const targetBase = target.split('/').pop() || target;
+        const reason = owner || 'unknown reason';
+        toast(
+          'Delete failed',
+          `${targetBase} could not be removed. ${reason}. The file is still on the server.`,
+        );
       }
     });
     return () => { un.then(fn => fn()); };

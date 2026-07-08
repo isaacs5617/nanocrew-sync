@@ -2506,20 +2506,81 @@ impl FileSystemContext for S3Fs {
         match context.as_ref() {
             OpenFile::Dir { key, .. } => {
                 if flags & CLEANUP_DELETE != 0 {
-                    // Delete the `.keep` marker if present.
-                    let marker = if key.is_empty() {
-                        ".keep".to_string()
-                    } else {
-                        format!("{}/.keep", key)
-                    };
+                    // Recursive delete: list every object under this prefix
+                    // (including the `.keep` marker and any children that
+                    // Explorer/rmdir didn't pre-delete) and delete them all.
+                    // v0.2.13 and earlier only deleted `.keep`, leaving
+                    // orphaned S3 objects after tools like `rmdir /s`,
+                    // Robocopy /MIR, or PowerShell Remove-Item -Recurse.
                     let provider = self.provider.clone();
-                    let marker_key = marker.clone();
-                    let _ = self
-                        .rt
-                        .block_on(async move { provider.delete(&marker_key).await });
-                    self.invalidate_parent(key);
-                    self.invalidate_meta(key);
-                    self.invalidate_cache(&marker);
+                    let list_prefix = if key.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", key)
+                    };
+                    let key_owned = key.to_string();
+                    let del_result: Result<(usize, Vec<(String, String)>), String> =
+                        self.rt.block_on(async move {
+                            let items = provider
+                                .list_prefix(&list_prefix)
+                                .await
+                                .map_err(|e| format!("list_prefix: {e}"))?;
+                            let mut failures: Vec<(String, String)> = Vec::new();
+                            let mut ok_count = 0usize;
+                            for obj in &items {
+                                match provider.delete(obj).await {
+                                    Ok(_) => ok_count += 1,
+                                    Err(e) => failures.push((obj.clone(), e.to_string())),
+                                }
+                            }
+                            Ok((ok_count, failures))
+                        });
+                    match del_result {
+                        Ok((ok, failures)) => {
+                            if failures.is_empty() {
+                                tracing::info!(
+                                    target: "nanocrew::vfs",
+                                    "dir cleanup delete key={key_owned:?} removed {ok} object(s)"
+                                );
+                                self.invalidate_parent(key);
+                                self.invalidate_meta(key);
+                            } else {
+                                let sample = failures.first().map(|(k, e)| format!("{k}: {e}"))
+                                    .unwrap_or_default();
+                                tracing::error!(
+                                    target: "nanocrew::vfs",
+                                    "dir cleanup delete key={key_owned:?} PARTIAL: {ok} ok, {} failed (first: {sample})",
+                                    failures.len(),
+                                );
+                                self.emit_lock(FileLockEvent {
+                                    drive_id: self.drive_id,
+                                    target: key.clone(),
+                                    trigger: key.clone(),
+                                    state: "delete_failed".into(),
+                                    owner: Some(sample),
+                                    machine: None,
+                                });
+                                // Deliberately do NOT invalidate parent — let
+                                // the stale listing keep showing the folder
+                                // so the user sees it hasn't really been
+                                // deleted.
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "nanocrew::vfs",
+                                "dir cleanup list_prefix key={key_owned:?} failed: {e}"
+                            );
+                            self.emit_lock(FileLockEvent {
+                                drive_id: self.drive_id,
+                                target: key.clone(),
+                                trigger: key.clone(),
+                                state: "delete_failed".into(),
+                                owner: Some(e),
+                                machine: None,
+                            });
+                        }
+                    }
                 }
             }
             OpenFile::File {
@@ -2556,12 +2617,37 @@ impl FileSystemContext for S3Fs {
                 if flags & CLEANUP_DELETE != 0 || pending_delete.load(Ordering::Relaxed) {
                     let provider = self.provider.clone();
                     let k = key.to_string();
-                    let _ = self
+                    let del_result = self
                         .rt
                         .block_on(async move { provider.delete(&k).await });
-                    self.invalidate_parent(key);
-                    self.invalidate_meta(key);
-                    self.invalidate_cache(key);
+                    match del_result {
+                        Ok(_) => {
+                            self.invalidate_parent(key);
+                            self.invalidate_meta(key);
+                            self.invalidate_cache(key);
+                        }
+                        Err(e) => {
+                            // Cleanup has no way to signal failure back to
+                            // WinFsp/Windows (Windows limitation), so the
+                            // user's Explorer thinks the delete succeeded.
+                            // Instead: log LOUDLY, don't invalidate the
+                            // parent listing (so the file stays visible
+                            // matching S3 reality), and toast via
+                            // file_lock_event so the user sees why.
+                            tracing::error!(
+                                target: "nanocrew::vfs",
+                                "delete key={key:?} failed: {e}"
+                            );
+                            self.emit_lock(FileLockEvent {
+                                drive_id: self.drive_id,
+                                target: key.clone(),
+                                trigger: key.clone(),
+                                state: "delete_failed".into(),
+                                owner: Some(e.to_string()),
+                                machine: None,
+                            });
+                        }
+                    }
                 }
             }
         }

@@ -2587,6 +2587,33 @@ impl FileSystemContext for S3Fs {
                 nt(STATUS_INVALID_PARAMETER)
             })?;
         let n = bytes.len().min(buffer.len());
+
+        // Defensive short-read detection. If get_range returned fewer bytes
+        // than requested AND we're not at EOF, something upstream is lying
+        // to us — a corrupted cache block, a truncated S3 response, or a
+        // races-on-tmp bug like the pre-v0.2.12 put_block one. Serving the
+        // short bytes to Excel/Word/PDF viewers surfaces as silent content
+        // corruption (xlsx CRC mismatch → "we found a problem with some
+        // content"). Log loudly, invalidate any cached blocks touching this
+        // range so the next read refetches from S3, and return an error to
+        // the app so the user sees a clean failure instead of quiet damage.
+        if (n as u64) < avail && offset + n as u64 <= size {
+            tracing::error!(
+                target: "nanocrew::vfs",
+                "read {key:?} short: got {n} of {avail} bytes at offset {offset} (file size {size}) — invalidating cached blocks and returning IO error",
+            );
+            if let Some(cache) = &self.cache {
+                cache.invalidate_key(&key);
+            }
+            let mut lc = self.list_cache.lock().unwrap_or_else(|p| p.into_inner());
+            lc.remove(&key);
+            drop(lc);
+            // STATUS_UNEXPECTED_IO_ERROR (0xC00000E9) — surfaces to
+            // Explorer/Excel as a clean IO failure so the user can retry the
+            // open rather than silently opening a corrupted view of the file.
+            return Err(FspError::NTSTATUS(0xC00000E9u32 as i32));
+        }
+
         buffer[..n].copy_from_slice(&bytes[..n]);
         self.emit_download_progress(download, &key, size, n as u64);
 

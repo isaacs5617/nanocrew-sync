@@ -361,9 +361,19 @@ impl DiskCache {
             (bytes.to_vec(), len)
         };
 
-        // Write to a tmp file and rename so a partial write can't be
-        // resurfaced as a bogus cache hit.
-        let tmp = path.with_extension("tmp");
+        // Write to a UNIQUE tmp file and rename so a partial write can't be
+        // resurfaced as a bogus cache hit, AND concurrent put_block calls for
+        // the same (key, block_start, len) can't race on a shared tmp path.
+        //
+        // v0.2.11 and earlier used `path.with_extension("tmp")` — deterministic
+        // per block. When Excel opened a >50 MB xlsx, the sync read() and the
+        // background prefetch_ahead task would both try to cache the same
+        // block, both open the same tmp file, interleave their bytes, and one
+        // rename would win with a corrupted payload. xlsx = ZIP + CRC, so any
+        // byte-off in a cached block surfaces to Excel as "We found a problem
+        // with some content." Same failure mode for docx/pptx/pdf.
+        let tmp_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let tmp = path.with_extension(format!("{tmp_suffix}.tmp"));
         let do_write = || -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&disk_bytes)?;

@@ -3948,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "nanocrew-sync"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "aes-gcm 0.10.3",
  "android_logger",

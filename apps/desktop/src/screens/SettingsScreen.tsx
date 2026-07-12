@@ -6,7 +6,7 @@ import { appDataDir, join } from '@tauri-apps/api/path';
 import * as Sentry from '@sentry/react';
 import {
   getTokens, NC_FONT_MONO,
-  NCCard, NCEyebrow, NCLabel, NCToggle, NCBtn,
+  NCCard, NCEyebrow, NCLabel, NCToggle, NCBtn, NCInput,
   TopBar,
   type Theme,
 } from '@nanocrew/ui';
@@ -566,7 +566,91 @@ const AdvancedSection: React.FC<{ theme: Theme; token: string }> = ({ theme, tok
         }}
       />
     </NCCard>
+    <DangerZone theme={theme} token={token} />
   </>;
+};
+
+/** Factory-reset card. Guarded by a typed-confirmation dialog so a stray
+ *  click can't destroy someone's account + drive credentials. */
+const DangerZone: React.FC<{ theme: Theme; token: string }> = ({ theme, token }) => {
+  const tok = getTokens(theme);
+  const [confirming, setConfirming] = React.useState(false);
+  const [typed, setTyped] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const CONFIRM_PHRASE = 'RESET';
+  const canProceed = typed.trim().toUpperCase() === CONFIRM_PHRASE && !busy;
+
+  const doReset = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await invoke('factory_reset', { token });
+      // Backend emits `factory_reset_complete` — the App shell listens for
+      // that and routes to the Setup screen. Nothing more to do here.
+    } catch (e: any) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <NCCard theme={theme} pad={20} style={{ borderColor: `${tok.danger}55` }}>
+      <NCEyebrow theme={theme} style={{ marginBottom: 14, color: tok.danger }}>Danger zone</NCEyebrow>
+      <div style={{ fontSize: 13, color: tok.textHi, marginBottom: 6, fontWeight: 500 }}>Reset all app data</div>
+      <div style={{ fontSize: 12, color: tok.textMd, lineHeight: 1.55, marginBottom: 14 }}>
+        Wipes every account, drive, cached file, and preference on this PC. Your bucket contents stay untouched — this only clears local state.
+        <br /><br />
+        Use when the app is stuck, showing stale data after a corruption event, or you want to start fresh. You'll need to re-add each drive with your Wasabi access key + secret.
+      </div>
+
+      {!confirming && (
+        <NCBtn theme={theme} small onClick={() => setConfirming(true)} style={{
+          borderColor: `${tok.danger}88`, color: tok.danger,
+        }}>
+          Reset all data…
+        </NCBtn>
+      )}
+
+      {confirming && (
+        <div style={{
+          marginTop: 4, padding: 14,
+          background: `${tok.danger}0F`,
+          border: `1px solid ${tok.danger}55`,
+          borderRadius: 3,
+        }}>
+          <div style={{ fontSize: 12, color: tok.textHi, marginBottom: 10 }}>
+            Type <b style={{ fontFamily: NC_FONT_MONO, color: tok.danger }}>{CONFIRM_PHRASE}</b> to confirm. This cannot be undone.
+          </div>
+          <NCInput
+            theme={theme}
+            value={typed}
+            onChange={setTyped}
+            placeholder={CONFIRM_PHRASE}
+          />
+          {err && (
+            <div style={{ marginTop: 10, fontSize: 12, color: tok.danger }}>
+              Reset failed: {err}
+            </div>
+          )}
+          <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+            <NCBtn
+              theme={theme} small
+              disabled={!canProceed}
+              onClick={doReset}
+              style={{ borderColor: tok.danger, color: canProceed ? tok.danger : tok.textLo }}
+            >
+              {busy ? 'Resetting…' : 'Yes, reset everything'}
+            </NCBtn>
+            <NCBtn theme={theme} small ghost onClick={() => { setConfirming(false); setTyped(''); setErr(null); }}>
+              Cancel
+            </NCBtn>
+          </div>
+        </div>
+      )}
+    </NCCard>
+  );
 };
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme }) => {

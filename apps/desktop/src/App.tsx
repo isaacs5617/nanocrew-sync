@@ -230,6 +230,19 @@ export function App() {
     setAppState('signin');
   };
 
+  // v0.2.15 factory-reset flow. Backend wipes account+drives+cache and emits
+  // `factory_reset_complete` — we route back to the initial setup screen so
+  // the user creates a fresh account with the (now empty) DB.
+  React.useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen('factory_reset_complete', () => {
+      setToken('');
+      setUsername('');
+      setAppState('setup');
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
   const handleLock = () => {
     if (appState !== 'authed') return;
     setAppState('locked');

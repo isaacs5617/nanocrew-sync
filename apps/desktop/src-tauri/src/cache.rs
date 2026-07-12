@@ -55,10 +55,13 @@ const NONCE_LEN: usize = 12;
 /// `aes-gcm` crate's `encrypt` API.
 const TAG_LEN: usize = 16;
 
-/// Block size we align cached ranges to. 1 MiB is a good trade-off: small
-/// enough that partial-file reads don't drag in excessive extra bytes, large
-/// enough that the SQLite index stays tractable (~1k rows per GiB of data).
-pub const CACHE_BLOCK: u64 = 1 * 1024 * 1024;
+/// Block size we align cached ranges to. v0.2.15: raised 1 MiB -> 4 MiB.
+/// For sequential-heavy workloads (video, large xlsx, PDFs) this cuts the
+/// per-block HTTP + SigV4 + TCP-slow-start overhead by 4x while shrinking
+/// SQLite `cache_entries` row count 4x (fewer index pages, less LRU
+/// churn). Scattered small reads pay a bit more bandwidth-per-request but
+/// the per-block round-trip savings dominate on high-latency links.
+pub const CACHE_BLOCK: u64 = 4 * 1024 * 1024;
 
 /// How often the background sweeper runs.
 const EVICT_INTERVAL: Duration = Duration::from_secs(60);

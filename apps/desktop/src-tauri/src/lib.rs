@@ -297,6 +297,7 @@ pub fn run() {
             commands::drives::add_onedrive_drive,
             commands::system::get_autostart,
             commands::system::set_autostart,
+            commands::system::factory_reset,
             commands::activity::list_activity,
             commands::activity::clear_activity,
             commands::activity::export_activity_csv,

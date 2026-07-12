@@ -106,7 +106,13 @@ const MAX_DIR_ENTRIES: usize = 100_000;
 /// Filename shown at the end of a truncated listing so the truncation is
 /// visible rather than silent.
 const TRUNCATION_SENTINEL: &str = "⚠ FOLDER TOO LARGE — listing truncated, use Search.txt";
-const PART_TARGET: usize = 16 * 1024 * 1024;
+// v0.2.15: bumped 16 MiB -> 64 MiB. Uploads on high-latency links (MWEB ->
+// Frankfurt seen at ~35 Mbps single-TCP) spend proportionally more time on
+// SigV4 / HTTP-header round-trips per part; 4x larger parts = 4x fewer
+// PUTs for the same object. RAM cost: PART_TARGET * UPLOAD_CONCURRENCY =
+// 512 MiB per active upload — acceptable, and bounded because we stream
+// parts as they finish rather than buffering the whole file.
+const PART_TARGET: usize = 64 * 1024 * 1024;
 /// Background-refresh task interval (Wave 1: cache freshness).
 const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);  // 5 min
 /// Only re-check folders the user has visited within this window.
@@ -118,9 +124,12 @@ const VISITED_DIRS_CAPACITY: usize = 64;
 /// pools.
 const UPLOAD_CONCURRENCY: usize = 8;
 /// How many cache blocks we fetch in parallel when materializing a file on
-/// open. Same rationale as `UPLOAD_CONCURRENCY` — saturates uplinks without
-/// exhausting connection pools.
-const MATERIALIZE_CONCURRENCY: usize = 8;
+/// open. v0.2.15: bumped 8 -> 16. On high-latency links opening a 50 MB
+/// Office doc goes from ~50 sequential round-trips down to ~4 batches of
+/// 16 parallel range GETs — noticeably snappier first-open. Bandwidth-cap
+/// prevention lives in `download_limiter` so we can't accidentally hog
+/// the pipe with 16 sockets at once.
+const MATERIALIZE_CONCURRENCY: usize = 16;
 /// Only emit transfer_progress for files at or above this size. Smaller files
 /// don't need the UI noise.
 const MIN_TRANSFER_BYTES: u64 = 256 * 1024;

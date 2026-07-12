@@ -4,7 +4,7 @@
 //! to the environment (read or write a single registry value). Anything more
 //! complex goes in its own module.
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{auth::require_auth, error::AppError, state::AppState};
 
@@ -212,5 +212,102 @@ fn write_run_value(_command: &str) -> Result<(), AppError> {
 
 #[cfg(not(windows))]
 fn delete_run_value() -> Result<(), AppError> {
+    Ok(())
+}
+
+// ── Factory reset ────────────────────────────────────────────────────────────
+
+/// Emergency-recovery command that wipes ALL locally-stored state — accounts,
+/// drives, credentials, cache blocks, listing caches, activity log, prefs. The
+/// only things it does NOT touch are the sentinel objects in the user's
+/// buckets (those are S3-side) and the app binary itself.
+///
+/// UX: exposed in Settings → Danger Zone as a "Reset all data" button, guarded
+/// by a confirmation dialog. On success the app forces a sign-out and the
+/// frontend routes back to the setup screen; the user is expected to recreate
+/// their account and re-add drives with their Wasabi secrets from a password
+/// manager.
+///
+/// Best-effort: any single unmount / delete that fails is logged and skipped so
+/// we always end in the intended "clean" state. Requires an authenticated
+/// session so a stale token can't nuke someone's data.
+#[tauri::command]
+pub async fn factory_reset(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    token: String,
+) -> Result<(), String> {
+    require_auth(&state, &token).map_err(|e| e.to_string())?;
+
+    // 1. Unmount every currently-mounted drive so WinFsp releases file
+    //    handles and drive letters before we drop the DB rows. We reach
+    //    directly into `state.mounts` rather than looping through
+    //    `unmount_drive` because that command also records activity /
+    //    requires the letter lookup — post-wipe we don't care about
+    //    either.
+    let mounted_ids: Vec<i64> = {
+        let mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+        mounts.keys().copied().collect()
+    };
+    for id in &mounted_ids {
+        let handle = {
+            let mut mounts = state.mounts.lock().unwrap_or_else(|p| p.into_inner());
+            mounts.remove(id)
+        };
+        if let Some(h) = handle {
+            h.stop();
+            let _ = app.emit(
+                "drive_status_changed",
+                crate::types::DriveStatusPayload {
+                    drive_id: *id,
+                    status: "offline".into(),
+                    message: None,
+                },
+            );
+        }
+    }
+
+    // 2. Truncate all data tables. VACUUM shrinks the file so leftover pages
+    //    with credential fragments can't be recovered off disk.
+    {
+        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let sql = "
+            DELETE FROM accounts;
+            DELETE FROM drives;
+            DELETE FROM cache_entries;
+            DELETE FROM pinned_keys;
+            DELETE FROM activity;
+            DELETE FROM prefs;
+        ";
+        if let Err(e) = db.execute_batch(sql) {
+            tracing::error!(target: "nanocrew::factory_reset", "table wipe: {e}");
+        }
+        if let Err(e) = db.execute_batch("VACUUM;") {
+            tracing::warn!(target: "nanocrew::factory_reset", "vacuum: {e}");
+        }
+    }
+
+    // 3. Wipe on-disk cache blocks + directory listings for every drive.
+    let cache_root = crate::commands::prefs::get_cache_root(&state.db);
+    if let Some(root) = cache_root {
+        if root.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&root) {
+                tracing::warn!(
+                    target: "nanocrew::factory_reset",
+                    "wipe cache root {}: {e}",
+                    root.display()
+                );
+            }
+        }
+    }
+
+    // 4. Emit a signal the frontend can listen for to route to Setup.
+    let _ = app.emit("factory_reset_complete", ());
+
+    tracing::info!(
+        target: "nanocrew::factory_reset",
+        "wiped {} mounted drive(s) + all local state",
+        mounted_ids.len()
+    );
     Ok(())
 }

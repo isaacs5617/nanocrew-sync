@@ -87,8 +87,32 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::InvalidInput(e.to_string()))?;
     }
+
+    // v0.2.15: integrity-check + auto-heal on startup. Corrupted `cache_entries`
+    // indexes cause get_block() to misroute lookups, which surfaces to users
+    // as silent xlsx/PDF/Word corruption (bytes look right length but come
+    // from the wrong on-disk block). Same class of bug destroyed the DB in
+    // production on 2026-07-09: B-tree rowid ordering broke, secret_key
+    // columns landed the DEFAULT of an unrelated column, drives failed to
+    // mount on restart. Detect it once, back the bad file up, and salvage
+    // what we can before opening — the alternative is silently reading a
+    // damaged file and writing new damage on top.
+    if path.exists() {
+        if let Err(e) = try_salvage_if_corrupt(path) {
+            tracing::warn!(
+                target: "nanocrew::db",
+                "integrity-check pass failed (non-fatal, continuing): {e}"
+            );
+        }
+    }
+
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    // Aggressive WAL checkpointing so the -wal file can't quietly grow into
+    // multi-MB territory (we saw a 4 MB WAL accumulate in prod). At 1000
+    // pages (~4 MB) SQLite auto-truncates on next commit — cap that at 200
+    // pages (~800 KB) so recovery from a crash replays fewer changes.
+    let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 200;");
     // Migration: add secret_key column to existing databases that pre-date it.
     let _ = conn.execute(
         "ALTER TABLE drives ADD COLUMN secret_key TEXT NOT NULL DEFAULT ''",
@@ -129,4 +153,137 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
         [],
     );
     Ok(conn)
+}
+
+/// Run `PRAGMA integrity_check`. If the result is anything other than "ok",
+/// rename the current DB out of the way (so the next open() creates a fresh
+/// one) and best-effort dump the salvageable rows next to it as a JSON blob
+/// the user can point at if they want to hand-recover credentials.
+fn try_salvage_if_corrupt(path: &Path) -> Result<(), AppError> {
+    // Open read-only for the check so we can't accidentally damage a healthy
+    // DB while probing it.
+    let ro_uri = format!(
+        "file:{}?mode=ro",
+        path.to_string_lossy().replace('\\', "/")
+    );
+    let conn = match Connection::open_with_flags(
+        &ro_uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // Can't even open — let normal open() surface the error.
+    };
+
+    let result: String = conn
+        .query_row("PRAGMA integrity_check(1);", [], |r| r.get(0))
+        .unwrap_or_else(|_| "unknown".into());
+    drop(conn);
+
+    if result == "ok" {
+        return Ok(());
+    }
+
+    tracing::error!(
+        target: "nanocrew::db",
+        "integrity_check FAILED: {result:?} — quarantining {} and salvaging drives",
+        path.display()
+    );
+
+    // Try to read the salvageable rows before we move the file — accounts +
+    // drives are what the user cares about; cache_entries is regeneratable.
+    let salvage = attempt_salvage(&ro_uri);
+
+    // Move the corrupted files out of the way. Use a timestamp so multiple
+    // corruptions don't clobber earlier evidence.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bad = path.with_file_name(format!("nanocrew.db.corrupted-{ts}"));
+    let _ = std::fs::rename(path, &bad);
+    for sfx in ["-wal", "-shm"] {
+        let src = path.with_extension(format!("db{sfx}"));
+        let dst = bad.with_extension(format!("db{sfx}"));
+        let _ = std::fs::rename(&src, &dst);
+    }
+
+    // Write the salvage report (accounts count + drive configs) next to it
+    // so the user can hand-restore if we can't automate it.
+    if let Some(json) = salvage {
+        let report = path.with_file_name(format!("nanocrew.db.salvage-{ts}.json"));
+        let _ = std::fs::write(&report, json.as_bytes());
+        tracing::info!(
+            target: "nanocrew::db",
+            "wrote salvage report to {}",
+            report.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Best-effort dump of the accounts + drives tables into a JSON string.
+/// Returns None if we can't read anything usable.
+fn attempt_salvage(ro_uri: &str) -> Option<String> {
+    let conn = Connection::open_with_flags(
+        ro_uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+
+    let mut out = String::from("{\n");
+    out.push_str(&format!("  \"salvaged_at\": {},\n", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+
+    // Accounts — just the usernames, no password hashes (user needs to
+    // reset anyway).
+    let usernames: Vec<String> = conn
+        .prepare("SELECT username FROM accounts")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .and_then(|it| it.collect())
+        })
+        .unwrap_or_default();
+    out.push_str("  \"accounts\": [");
+    out.push_str(
+        &usernames
+            .iter()
+            .map(|u| format!("\"{}\"", u.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.push_str("],\n");
+
+    // Drives — full config so a hand-recover just needs the plaintext
+    // Wasabi secret from the user's password manager.
+    let drives: Vec<String> = conn
+        .prepare(
+            "SELECT id, name, provider, endpoint, bucket, COALESCE(bucket_prefix,'') AS prefix, \
+             region, letter, access_key_id FROM drives",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| {
+                Ok(format!(
+                    "    {{\"id\": {}, \"name\": \"{}\", \"provider\": \"{}\", \
+                     \"endpoint\": \"{}\", \"bucket\": \"{}\", \"bucket_prefix\": \"{}\", \
+                     \"region\": \"{}\", \"letter\": \"{}\", \"access_key_id\": \"{}\"}}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?.replace('"', "\\\""),
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })
+            .and_then(|it| it.collect())
+        })
+        .unwrap_or_default();
+    out.push_str("  \"drives\": [\n");
+    out.push_str(&drives.join(",\n"));
+    out.push_str("\n  ]\n}\n");
+
+    Some(out)
 }

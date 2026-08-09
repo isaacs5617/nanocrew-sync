@@ -177,9 +177,15 @@ async fn subscribe_loop(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    // Backoff schedule per task spec: 1s, 2s, 5s, 15s, 60s cap.
-    const BACKOFF_STEPS: &[u64] = &[1, 2, 5, 15, 60];
+    // Backoff schedule. v0.3.1: escalates further for users whose network
+    // simply can't reach the coordinator (default URL is tailnet-only for
+    // now — a user outside Tailscale used to spam retries at the 60s cap
+    // ~1500 times/day). After 10 consecutive failed connects we jump to
+    // 5 min; after 30, to 1 hour. Each successful frame (`ack_received`)
+    // resets to step 0.
+    const BACKOFF_STEPS: &[u64] = &[1, 2, 5, 15, 60, 60, 60, 60, 60, 60, 300, 300, 300, 3600];
     let mut step = 0usize;
+    let mut consecutive_failures = 0u32;
 
     tracing::info!(target: "nanocrew::coordinator", "starting subscribe loop url={ws_url}");
 
@@ -224,15 +230,34 @@ async fn subscribe_loop(
             continue;
         }
 
-        // We're connected. Reset backoff and flip status.
-        step = 0;
-        (emit_status)(true);
-        tracing::info!(target: "nanocrew::coordinator", "ws subscribed bucket={bucket}");
+        // v0.3.1: DON'T reset backoff here. A close-4001 (JWT rejected)
+        // arrives immediately after send(); the old code reset step=0
+        // right here and looped forever hammering the server with the
+        // same bad JWT once per second. We now only reset backoff after
+        // the server actually accepts us — either a subscribed ack or
+        // the first real invalidate frame.
+        tracing::debug!(target: "nanocrew::coordinator", "ws subscribe sent, waiting for ack bucket={bucket}");
+        let mut ack_received = false;
 
         // Read loop. tungstenite auto-pongs incoming pings.
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(Message::Text(txt)) => {
+                    // v0.3.1: any recognisable JSON frame from the server
+                    // proves it accepted our subscribe. Reset backoff and
+                    // flip status green THEN. Prevents fast-loop hammer
+                    // when the server closes with 4001 immediately after
+                    // our subscribe went out.
+                    if !ack_received {
+                        ack_received = true;
+                        step = 0;
+                        consecutive_failures = 0;
+                        (emit_status)(true);
+                        tracing::info!(
+                            target: "nanocrew::coordinator",
+                            "ws accepted bucket={bucket}"
+                        );
+                    }
                     match serde_json::from_str::<InvalidateFrame>(&txt) {
                         Ok(frame) if frame.ty == "invalidate" => {
                             tracing::debug!(
@@ -244,14 +269,33 @@ async fn subscribe_loop(
                                 prefix: frame.prefix,
                                 actor: frame.actor_machine,
                             };
-                            if event_tx.send(ev).await.is_err() {
-                                tracing::info!(
-                                    target: "nanocrew::coordinator",
-                                    "event receiver dropped — exiting subscribe loop"
-                                );
-                                let _ = ws.close(None).await;
-                                (emit_status)(false);
-                                return;
+                            // v0.3.1: try_send instead of send().await. If the
+                            // receiver has fallen behind, dropping oldest
+                            // (well, dropping this one — tokio mpsc doesn't
+                            // support drop-oldest directly) is better than
+                            // awaiting: an awaiting send stops us polling
+                            // ws.next(), tungstenite can't process incoming
+                            // pings, server times us out, we reconnect.
+                            // Silent overflow is fine because the next
+                            // read from Explorer will re-hit TTL polling
+                            // as backstop.
+                            match event_tx.try_send(ev) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        target: "nanocrew::coordinator",
+                                        "invalidate mpsc full — dropped one event, TTL polling will still cover"
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::info!(
+                                        target: "nanocrew::coordinator",
+                                        "event receiver dropped — exiting subscribe loop"
+                                    );
+                                    let _ = ws.close(None).await;
+                                    (emit_status)(false);
+                                    return;
+                                }
                             }
                         }
                         Ok(_) => { /* subscribed ack / unknown types — ignore */ }
@@ -266,10 +310,25 @@ async fn subscribe_loop(
                 Ok(Message::Binary(_)) => { /* server never sends binary; ignore */ }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => { /* handled by tungstenite */ }
                 Ok(Message::Close(frame)) => {
+                    // v0.3.1: recognise permanent-auth close (4001) and
+                    // stop the reconnect loop entirely. Otherwise a
+                    // revoked/expired JWT means we spam the server 1500
+                    // times/day with the same bad token and log-flood on
+                    // both sides. Anything else = transient disconnect,
+                    // fall through to reconnect.
+                    let permanent = matches!(&frame, Some(f) if u16::from(f.code) == 4001u16);
                     tracing::info!(
                         target: "nanocrew::coordinator",
-                        "ws close from server: {frame:?}"
+                        "ws close from server: {frame:?} (permanent={permanent})"
                     );
+                    if permanent {
+                        tracing::error!(
+                            target: "nanocrew::coordinator",
+                            "coordinator auth rejected — stopping. Set a valid license_jwt pref to retry."
+                        );
+                        (emit_status)(false);
+                        return;
+                    }
                     break;
                 }
                 Ok(Message::Frame(_)) => { /* low-level, ignore */ }
@@ -282,10 +341,13 @@ async fn subscribe_loop(
 
         // Disconnected. Announce and back off before reconnecting.
         (emit_status)(false);
+        if !ack_received {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+        }
         let delay = BACKOFF_STEPS[step.min(BACKOFF_STEPS.len() - 1)];
         tracing::info!(
             target: "nanocrew::coordinator",
-            "ws disconnected — reconnect in {delay}s"
+            "ws disconnected — reconnect in {delay}s (consecutive_failures={consecutive_failures})"
         );
         tokio::time::sleep(Duration::from_secs(delay)).await;
         step = (step + 1).min(BACKOFF_STEPS.len() - 1);

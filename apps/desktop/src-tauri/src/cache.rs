@@ -400,7 +400,22 @@ impl DiskCache {
             return;
         }
 
+        // v0.3.1: re-check is_enabled() under the DB lock. clear_all sets
+        // enabled=false BEFORE its own DELETE runs; if we passed the top-of-
+        // function is_enabled() before clear_all's swap but haven't yet
+        // inserted, we'd race and leave an orphan (row+file surviving a
+        // supposedly-cleared drive, wasting quota forever). Take the lock
+        // first, then look again — memory ordering on the swap (AcqRel)
+        // pairs with our load here to guarantee we see the clear.
         let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.is_enabled() {
+            // Cache was disabled while we were writing the block file.
+            // Drop it on the floor to keep clear_all's post-condition
+            // (no rows for this drive) intact.
+            drop(conn);
+            let _ = fs::remove_file(&path);
+            return;
+        }
         let _ = conn.execute(
             "INSERT OR REPLACE INTO cache_entries
                 (drive_id, key, offset, len, size_bytes, etag, last_access)

@@ -1,5 +1,5 @@
 import React from 'react';
-import { getTokens, NC_FONT_DISPLAY, NC_FONT_MONO, NC_FONT_UI, type Theme } from '../tokens.js';
+import { getTokens, NC_FONT_MONO, type Theme } from '../tokens.js';
 import { NCEyebrow } from '../primitives/NCEyebrow.js';
 import { NCNavRow } from '../primitives/NCNavRow.js';
 import { NCStatusDot } from '../primitives/NCStatusDot.js';

@@ -56,6 +56,14 @@ pub struct MountConfig {
     /// MountConfig build sites. Per-drive data lands at
     /// `<cache_root>/drive-<id>/`.
     pub cache_root: std::path::PathBuf,
+
+    /// Sync-coordinator base URL (Wave 4). `None` or empty = opt out and
+    /// fall back to TTL polling; the VFS wires no coordinator at all.
+    pub coordinator_url: Option<String>,
+    /// License JWT to pass opaquely to the coordinator for auth. `None`
+    /// when the user isn't activated yet — the coordinator is skipped in
+    /// that case (its `verifyLicense` would reject the connection anyway).
+    pub license_jwt: Option<String>,
 }
 
 /// Shared handles into the live VFS so commands running on the main app
@@ -324,6 +332,56 @@ pub fn spawn_mount(
                 .build();
             let client = aws_sdk_s3::Client::from_conf(s3_conf);
 
+            // 2a. Sync-coordinator client (Wave 4). Opt-in via the
+            //     `coordinator_url` pref. When unset, empty, or the user has
+            //     no license JWT yet, we build nothing — the VFS silently
+            //     falls back to TTL polling.
+            let (coord_client, coord_rx) = match (
+                config
+                    .coordinator_url
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty()),
+                config.license_jwt.as_deref(),
+            ) {
+                (Some(url), Some(jwt)) if !jwt.is_empty() => {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        crate::coordinator::CoordinatorEvent,
+                    >(64);
+                    let emit_app_coord = app_handle.clone();
+                    let coord_drive_id = config.drive_id;
+                    let emit_status: std::sync::Arc<
+                        dyn Fn(bool) + Send + Sync,
+                    > = std::sync::Arc::new(move |connected: bool| {
+                        let _ = emit_app_coord.emit(
+                            "coordinator_status",
+                            serde_json::json!({
+                                "drive_id": coord_drive_id,
+                                "connected": connected,
+                            }),
+                        );
+                    });
+                    let machine_id = crate::file_lock::machine_id();
+                    let client = crate::coordinator::CoordinatorClient::spawn(
+                        url.to_string(),
+                        config.bucket.clone(),
+                        machine_id,
+                        jwt.to_string(),
+                        config.owner.clone(),
+                        tx,
+                        emit_status,
+                        &rt,
+                    );
+                    tracing::info!(
+                        target: "nanocrew::coordinator",
+                        drive_id = config.drive_id,
+                        "coordinator client configured url={url}"
+                    );
+                    (Some(client), Some(rx))
+                }
+                _ => (None, None),
+            };
+
             // 2. Build the filesystem context. The runtime we just used moves
             //    into S3Fs and stays alive for every subsequent IO call.
             let provider: std::sync::Arc<dyn CloudProvider> = std::sync::Arc::new(S3Provider::new(
@@ -377,6 +435,7 @@ pub fn spawn_mount(
                         },
                     );
                 }),
+                coord_client,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -395,6 +454,11 @@ pub fn spawn_mount(
                 disk_list_cache: ctx.disk_list_cache_arc(),
             };
             ctx.start_background_refresh();
+            // Wire the coordinator's WS-fed invalidations into the same
+            // cache-drop path as the background refresh, if configured.
+            if let Some(rx) = coord_rx {
+                ctx.start_coordinator_receiver(rx);
+            }
 
             // 3. Volume parameters. These are NTFS-ish defaults tuned for an
             //    object-storage-backed volume: case-preserved but not

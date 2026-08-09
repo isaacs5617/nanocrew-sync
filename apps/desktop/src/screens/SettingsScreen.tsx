@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { appDataDir, join } from '@tauri-apps/api/path';
 import * as Sentry from '@sentry/react';
@@ -140,6 +141,41 @@ const PrefInput: React.FC<{
           fontFamily: mono ? NC_FONT_MONO : undefined,
         }}
       />
+    </div>
+  );
+};
+
+/// Live status dot for the sync coordinator WebSocket. Listens for
+/// `coordinator_status` Tauri events emitted from the Rust side. Three states:
+///   - unset  (no url configured yet → grey "not configured")
+///   - true   (WS connected → green "connected")
+///   - false  (WS not connected → red "disconnected")
+const CoordinatorStatusRow: React.FC<{ theme: Theme }> = ({ theme }) => {
+  const tok = getTokens(theme);
+  const [connected, setConnected] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    const un = listen<{ drive_id: number; connected: boolean }>(
+      'coordinator_status',
+      (e) => setConnected(!!e.payload?.connected),
+    );
+    return () => { un.then((f) => f()).catch(() => {}); };
+  }, []);
+  const dot = connected === null
+    ? { color: tok.textMd, label: 'not configured' }
+    : connected
+      ? { color: tok.lime,   label: 'connected' }
+      : { color: '#e05a5a',  label: 'disconnected' };
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: tok.textMd }}>
+      <span
+        aria-hidden
+        style={{
+          display: 'inline-block',
+          width: 8, height: 8, borderRadius: '50%',
+          background: dot.color,
+        }}
+      />
+      <span>{dot.label}</span>
     </div>
   );
 };
@@ -836,6 +872,23 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ theme, setTheme 
               placeholder={t('settings.network.ca.placeholder')}
               mono
             />
+          </NCCard>
+          <NCCard theme={theme} pad={20}>
+            <NCEyebrow theme={theme} style={{ marginBottom: 14 }}>Sync coordinator (experimental)</NCEyebrow>
+            <div style={{ fontSize: 12, color: tok.textMd, lineHeight: 1.55, marginBottom: 16 }}>
+              URL of the NanoCrew coordinator that pushes file-change notifications to your peers.
+              Leave blank to fall back to periodic polling (default).
+            </div>
+            <PrefInput
+              theme={theme} token={token}
+              prefKey="coordinator_url"
+              label="Coordinator URL"
+              sub="e.g. wss://coordinator.nanocrew.ai or http://127.0.0.1:3022"
+              placeholder=""
+              mono
+            />
+            <Spacer />
+            <CoordinatorStatusRow theme={theme} />
           </NCCard>
         </>;
 

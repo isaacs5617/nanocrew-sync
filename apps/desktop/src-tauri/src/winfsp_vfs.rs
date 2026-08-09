@@ -401,6 +401,12 @@ pub struct S3Fs {
     /// background task detects an out-of-band change. Boxed so S3Fs doesn't
     /// need the AppHandle in scope for every call.
     emit_dir_refreshed: Arc<dyn Fn(String) + Send + Sync>,
+
+    /// Optional sync-coordinator client (Wave 4 push-based cache freshness).
+    /// `None` = user has not configured a coordinator URL, in which case
+    /// every notify() site is a no-op and we fall back to the existing TTL
+    /// + background-refresh polling. Never on the critical path of IO.
+    coordinator: Option<Arc<crate::coordinator::CoordinatorClient>>,
 }
 
 impl S3Fs {
@@ -422,6 +428,7 @@ impl S3Fs {
         connectivity: Arc<AtomicBool>,
         disk_list_cache_dir: Option<std::path::PathBuf>,
         emit_dir_refreshed: Arc<dyn Fn(String) + Send + Sync>,
+        coordinator: Option<Arc<crate::coordinator::CoordinatorClient>>,
     ) -> Result<Self, String> {
         let security = build_everyone_sd().map_err(|e| format!("build SD: {e}"))?;
         let machine_id = file_lock::machine_id();
@@ -456,6 +463,7 @@ impl S3Fs {
             disk_list_cache,
             visited_dirs,
             emit_dir_refreshed,
+            coordinator,
         })
     }
 
@@ -529,6 +537,73 @@ impl S3Fs {
                 )
                 .await;
             }
+        });
+    }
+
+    /// Spawn a task that drains `rx` (fed by
+    /// `crate::coordinator::CoordinatorClient`) and, for every peer-supplied
+    /// `Invalidate` event, drops the affected in-memory + on-disk listing
+    /// caches, sweeps any negative meta-cache entries beneath the prefix,
+    /// and fires `dir_listing_refreshed` so the in-app File Browser refreshes.
+    ///
+    /// Windows Explorer picks up the change on its next directory read via
+    /// WinFsp's own invalidation path — issuing an explicit
+    /// `SHChangeNotify(SHCNE_UPDATEDIR)` here would require plumbing the
+    /// mount letter down into S3Fs plus enabling the `Win32_UI_Shell`
+    /// feature on the `windows` crate. Left as a follow-up.
+    pub fn start_coordinator_receiver(
+        &self,
+        mut rx: tokio::sync::mpsc::Receiver<crate::coordinator::CoordinatorEvent>,
+    ) {
+        let list_cache = Arc::clone(&self.list_cache);
+        let meta_cache = Arc::clone(&self.meta_cache);
+        let disk_list_cache = self.disk_list_cache.clone();
+        let emit = Arc::clone(&self.emit_dir_refreshed);
+
+        self.rt.spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    crate::coordinator::CoordinatorEvent::Invalidate { prefix, actor } => {
+                        tracing::debug!(
+                            target: "nanocrew::coordinator",
+                            "applying peer invalidate prefix={prefix:?} actor={actor}"
+                        );
+
+                        // 1) In-memory list cache.
+                        list_cache
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&prefix);
+
+                        // 2) Meta cache — drop the prefix itself + everything
+                        //    beneath it (matches invalidate_parent semantics).
+                        let mut mc = meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+                        if prefix.is_empty() {
+                            mc.clear();
+                        } else {
+                            let lc_prefix = format!("{}/", prefix.to_ascii_lowercase());
+                            let lc_self = prefix.to_ascii_lowercase();
+                            mc.retain(|k, _| {
+                                !(k.starts_with(&lc_prefix) || k == &lc_self)
+                            });
+                        }
+                        drop(mc);
+
+                        // 3) Persistent disk listing.
+                        if let Some(disk) = &disk_list_cache {
+                            disk.invalidate(&prefix);
+                        }
+
+                        // 4) Poke the in-app File Browser so any open view of
+                        //    this folder re-fetches immediately.
+                        (emit)(prefix.clone());
+                    }
+                }
+            }
+            tracing::info!(
+                target: "nanocrew::coordinator",
+                "coordinator receiver channel closed"
+            );
         });
     }
 
@@ -629,6 +704,16 @@ impl S3Fs {
     }
 
     // ── Cache helpers ────────────────────────────────────────────────────────
+
+    /// Notify peers via the sync coordinator that `key`'s parent prefix has
+    /// changed. Fire-and-forget: any coordinator error is swallowed inside
+    /// `CoordinatorClient::notify`. No-op when no coordinator is configured.
+    fn notify_parent(&self, key: &str) {
+        if let Some(c) = &self.coordinator {
+            let (parent, _) = Self::split_key(key);
+            c.notify(parent);
+        }
+    }
 
     fn invalidate_parent(&self, key: &str) {
         let (parent, _) = Self::split_key(key);
@@ -2475,6 +2560,9 @@ impl FileSystemContext for S3Fs {
                 .map_err(|_| nt(STATUS_ACCESS_DENIED))?;
 
             self.invalidate_parent(&key);
+            // Wave 4: push the same invalidation to peers so their listing
+            // caches drop this prefix before their next TTL sweep.
+            self.notify_parent(&key);
             // Clear any negative meta-cache entry left by Explorer's pre-create
             // existence check, so the immediate post-create lookup succeeds.
             self.invalidate_meta(&key);
@@ -2625,6 +2713,8 @@ impl FileSystemContext for S3Fs {
                                 );
                                 self.invalidate_parent(key);
                                 self.invalidate_meta(key);
+                                // Wave 4: peers should drop the parent listing.
+                                self.notify_parent(key);
                             } else {
                                 let sample = failures.first().map(|(k, e)| format!("{k}: {e}"))
                                     .unwrap_or_default();
@@ -2687,6 +2777,8 @@ impl FileSystemContext for S3Fs {
                                 self.invalidate_meta(key);
                                 self.invalidate_parent(key);
                                 self.invalidate_cache(key);
+                                // Wave 4: peers should invalidate this dir too.
+                                self.notify_parent(key);
                             }
                             Err(e) => {
                                 eprintln!("[winfsp] upload failed key={key}: {e}");
@@ -2706,6 +2798,8 @@ impl FileSystemContext for S3Fs {
                             self.invalidate_parent(key);
                             self.invalidate_meta(key);
                             self.invalidate_cache(key);
+                            // Wave 4: peers should drop the parent listing.
+                            self.notify_parent(key);
                         }
                         Err(e) => {
                             // Cleanup has no way to signal failure back to
@@ -3221,6 +3315,11 @@ impl FileSystemContext for S3Fs {
         self.invalidate_meta(&new_key);
         self.invalidate_cache(&old_key);
         self.invalidate_cache(&new_key);
+        // Wave 4: peers should refresh both source and destination parents.
+        // (If the rename was diverted, `new_key` and `effective_dst` share
+        // the same parent, so a single notify per parent is enough.)
+        self.notify_parent(&old_key);
+        self.notify_parent(&new_key);
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "nanocrew-sync"
-version = "0.2.16"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -72,6 +72,11 @@ urlencoding  = "2"
 futures-util = "0.3"
 bytes        = "1"
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+# WebSocket client for the sync coordinator (Wave 4 push-based invalidation).
+# `connect` pulls in `connect_async`; `rustls-tls-webpki-roots` uses the
+# bundled Mozilla root store so we don't depend on the system trust store.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 # SHA-256 for deriving sentinel-lock object names
 sha2 = "0.10"

@@ -377,6 +377,11 @@ pub async fn mount_drive(
         cache_max_bytes,
         db_path,
         cache_root,
+        // Wave 4: sync coordinator (on by default in v0.3.0). Falls back
+        // to the hosted URL when the pref is unset. See mounts::MountConfig.
+        coordinator_url: crate::commands::prefs::get(&state.db, "coordinator_url")
+            .or_else(|| Some(crate::DEFAULT_COORDINATOR_URL.to_string())),
+        license_jwt: crate::commands::prefs::get(&state.db, "license_jwt"),
     };
     let app2 = app.clone();
     let handle = tokio::task::spawn_blocking(move || mounts::spawn_mount(mount_config, app2))

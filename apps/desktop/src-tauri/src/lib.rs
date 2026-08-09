@@ -27,6 +27,8 @@ mod throttle;
 mod types;
 #[cfg(target_os = "windows")]
 mod winfsp_vfs;
+#[cfg(target_os = "windows")]
+mod coordinator;
 
 // ── macOS-only modules (Track v0.3.0 macOS beta) ────────────────────────────
 #[cfg(target_os = "macos")]
@@ -47,6 +49,14 @@ mod jni_helpers;
 use state::AppState;
 #[cfg(not(target_os = "android"))]
 use types::DriveStatusPayload;
+
+/// v0.3.0 default coordinator URL. Points at the hosted service on the
+/// Hetzner box (tailnet-only for now, will move to a public domain when
+/// Alex migrates it to production infra). Users can override via the
+/// `coordinator_url` pref, or set it to an empty string to opt out and
+/// fall back to TTL polling.
+#[cfg(not(target_os = "android"))]
+pub const DEFAULT_COORDINATOR_URL: &str = "wss://nanocrew-1.tail57f01.ts.net:10002";
 
 // ── Android entry point ─────────────────────────────────────────────────────
 // On Android there's no tray, no drive letter, no auto-mount loop. The OS
@@ -541,6 +551,19 @@ async fn auto_mount_drives(app: tauri::AppHandle) {
             cache_max_bytes,
             db_path: db_path.clone(),
             cache_root: cache_root.clone(),
+            // Wave 4: opt-in sync coordinator. Both prefs come straight from
+            // the same key/value store the Settings UI writes to. Missing
+            // license just skips coordinator setup — TTL polling is the
+            // authoritative fallback.
+            // v0.3.0: default the coordinator URL to the hosted service so
+            // fresh installs get push-based cross-user invalidation without
+            // any Settings-screen action. Users can opt out by setting the
+            // pref to an explicit empty string (the client treats
+            // Some("") as "not configured"), or point at their own
+            // coordinator (self-hosted or when Alex migrates the service).
+            coordinator_url: commands::prefs::get(&state.db, "coordinator_url")
+                .or_else(|| Some(DEFAULT_COORDINATOR_URL.to_string())),
+            license_jwt: commands::prefs::get(&state.db, "license_jwt"),
         };
 
         let _ = app.emit(

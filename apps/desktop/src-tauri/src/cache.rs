@@ -153,52 +153,49 @@ impl DiskCache {
     }
 
     /// Delete every cached block for this drive from disk and clear the index.
+    ///
+    /// v0.2.16: flip `enabled=false` before the DB read+delete so any
+    /// concurrent `put_block` short-circuits at its own `is_enabled()`
+    /// check (line ~319) and never writes a phantom row/file after we've
+    /// snapshotted state. The previous version raced: put_block that
+    /// passed `is_enabled()` just before clear_all took the lock would
+    /// insert a new row + write a new file AFTER we deleted the row set
+    /// but BEFORE we tried to remove its file — leaving an orphaned
+    /// row-less file on disk that used cache quota forever.
     pub fn clear_all(&self) {
-        let blocks: Vec<(i64, i64)> = {
-            let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
-            let mut stmt = match conn.prepare(
-                "SELECT offset, len FROM cache_entries WHERE drive_id = ?1",
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let rows: Result<Vec<_>, _> = stmt
-                .query_map(rusqlite::params![self.drive_id], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })
-                .and_then(|it| it.collect());
-            let list = rows.unwrap_or_default();
-            // We need all keys too — refetch with keys for path_for calls below.
-            list
-        };
-        // Re-query with keys for file deletion.
+        // Disable first — quiesces new writes. Restored to prior state at end.
+        let was_enabled = self.enabled.swap(false, Ordering::AcqRel);
+
+        // Single query gathers everything we need in one DB round-trip.
         let keyed: Vec<(String, i64, i64)> = {
             let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
             let mut stmt = match conn.prepare(
                 "SELECT key, offset, len FROM cache_entries WHERE drive_id = ?1",
             ) {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(_) => {
+                    self.enabled.store(was_enabled, Ordering::Release);
+                    return;
+                }
             };
             let rows: Result<Vec<_>, _> = stmt
                 .query_map(rusqlite::params![self.drive_id], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
                 })
                 .and_then(|it| it.collect());
-            rows.unwrap_or_default()
-        };
-        {
-            let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let list = rows.unwrap_or_default();
             let _ = conn.execute(
                 "DELETE FROM cache_entries WHERE drive_id = ?1",
                 rusqlite::params![self.drive_id],
             );
-        }
-        let _ = blocks; // already fetched above for count only
+            list
+        };
         for (key, off, len) in keyed {
             let p = self.path_for(&key, off as u64, len as u64);
             let _ = fs::remove_file(&p);
         }
+
+        self.enabled.store(was_enabled, Ordering::Release);
     }
 
     /// Cache path: `<root>/<hex[0..2]>/<hex[2..]>/<offset>-<len>.bin`. The

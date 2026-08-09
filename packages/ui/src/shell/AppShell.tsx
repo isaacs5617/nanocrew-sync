@@ -30,37 +30,11 @@ export const AppShell: React.FC<AppShellProps> = ({
         borderRight: `1px solid ${t.border}`,
         display: 'flex', flexDirection: 'column',
       }}>
-        <div style={{ padding: '14px 16px 8px' }}>
-          <NCEyebrow theme={theme} style={{ marginBottom: 12 }}>Workspace</NCEyebrow>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 10,
-            padding: '8px 10px', borderRadius: 3,
-            background: t.surface2, border: `1px solid ${t.border}`,
-          }}>
-            <div style={{
-              width: 28, height: 28, borderRadius: 3,
-              background: t.lime, color: '#0A0A0A',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontFamily: NC_FONT_DISPLAY, fontWeight: 800, fontSize: 14,
-            }}>
-              NC
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{
-                fontFamily: NC_FONT_UI, fontSize: 12, fontWeight: 500, color: t.textHi,
-                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              }}>
-                NanoCrew · Cape Town
-              </div>
-              <div style={{
-                fontFamily: NC_FONT_MONO, fontSize: 9, color: t.textMd, letterSpacing: 1,
-              }}>
-                FREE · UNLIMITED
-              </div>
-            </div>
-            <I.chevD size={12} color={t.textMd} />
-          </div>
-        </div>
+        {/* v0.2.16: removed the "Workspace" chip. It was a decorative mock
+            with no click handler, no dropdown, no state — the product has
+            no workspace concept (drives are per-machine). Deleted rather
+            than wired because there's nothing meaningful to wire it to.
+            The Account section further down already covers identity. */}
 
         <div style={{ padding: '8px 0', flex: 1 }}>
           <NCEyebrow theme={theme} style={{ padding: '12px 16px 8px' }}>Navigate</NCEyebrow>

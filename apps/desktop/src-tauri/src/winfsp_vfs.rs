@@ -106,6 +106,13 @@ const MAX_DIR_ENTRIES: usize = 100_000;
 /// Filename shown at the end of a truncated listing so the truncation is
 /// visible rather than silent.
 const TRUNCATION_SENTINEL: &str = "⚠ FOLDER TOO LARGE — listing truncated, use Search.txt";
+/// v0.2.16: short TTL for empty listings. Previously we skipped caching
+/// empties entirely (v0.2.11 fix, to avoid poisoned-empty problems), but
+/// that meant a directory containing only `.keep` markers re-listed on
+/// EVERY read — pathological for keep-only folders in trees Explorer
+/// scrolls through. 5 s is short enough that a genuine cross-user
+/// upload becomes visible fast, long enough to avoid the re-list storm.
+const EMPTY_LIST_TTL: Duration = Duration::from_secs(5);
 // v0.2.15: bumped 16 MiB -> 64 MiB. Uploads on high-latency links (MWEB ->
 // Frankfurt seen at ~35 Mbps single-TCP) spend proportionally more time on
 // SigV4 / HTTP-header round-trips per part; 4x larger parts = 4x fewer
@@ -589,6 +596,29 @@ impl S3Fs {
         }
     }
 
+    /// v0.2.16 fail-closed variant. Returns Ok(Some) if a foreign sentinel
+    /// exists, Ok(None) if genuinely Free, and Err on network/API failure.
+    /// Callers that MUST NOT clobber another user's file (rename divert,
+    /// direct-write open) should use this and reject on Err, not fail-open.
+    fn foreign_lock_for_strict(
+        &self,
+        rel_key: &str,
+    ) -> Result<Option<file_lock::Sentinel>, String> {
+        if is_internal_key(rel_key) {
+            return Ok(None);
+        }
+        let client = self.file_lock_client.clone();
+        let bucket = self.file_lock_bucket.clone();
+        let mid = self.machine_id.clone();
+        let abs = self.file_lock_abs_key(rel_key);
+        self.rt
+            .block_on(async move { file_lock::check(&client, &bucket, &abs, &mid).await })
+            .map(|state| match state {
+                file_lock::LockState::Foreign(s) => Some(s),
+                _ => None,
+            })
+    }
+
     /// Split a key into `(parent_prefix, basename)`. Parent prefix has no
     /// trailing slash; root returns `("", name)`.
     fn split_key(key: &str) -> (&str, &str) {
@@ -612,6 +642,32 @@ impl S3Fs {
         if let Some(disk) = &self.disk_list_cache {
             disk.invalidate(parent);
         }
+        // v0.2.16: sweep negative meta_cache entries under this prefix.
+        // Otherwise a "not found" cached at the child key when a foreign
+        // machine subsequently creates that key would keep every open()
+        // returning STATUS_OBJECT_NAME_NOT_FOUND until META_TTL expires
+        // — even though the listing itself has already refreshed. Symptom:
+        // "file appears in the directory but every open fails until a
+        // minute passes."
+        self.sweep_negative_meta_under(parent);
+    }
+
+    /// v0.2.16: drop every `None` (negative / not-found) entry in the
+    /// meta_cache whose key falls beneath `prefix`. Cheap: linear in
+    /// meta_cache size, which is capped by natural usage. Called from
+    /// invalidate_parent + wherever we detect a foreign listing change.
+    fn sweep_negative_meta_under(&self, prefix: &str) {
+        let needle = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.to_ascii_lowercase())
+        };
+        let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+        mc.retain(|k, (_, v)| {
+            // Keep positive entries always; only prune negative entries
+            // that live under the changed prefix.
+            v.is_some() || !k.starts_with(&needle)
+        });
     }
 
     /// Seed the in-memory meta_cache for every entry in a freshly-acquired
@@ -727,18 +783,27 @@ impl S3Fs {
 
         let listing = result?;
         let now = Instant::now();
-        // Only cache non-empty results in memory. An empty result is either
-        // a genuinely empty folder (cheap to re-list on next request) or a
-        // silent failure / transient network hiccup (v0.2.11: was previously
-        // being cached for LIST_TTL, leaving Explorer showing "empty" until
-        // the TTL expired even after S3 recovered). Warn-log so we can
-        // diagnose next time.
+        // v0.2.16: empty results now go into the in-memory cache with a
+        // short TTL (EMPTY_LIST_TTL, currently 5s) rather than being
+        // dropped entirely. Fixes the re-list storm on `.keep`-only
+        // directories while keeping the v0.2.11 "don't wedge Explorer on
+        // a silent failure" property — 5s is short enough that a genuine
+        // cross-user upload becomes visible almost immediately. Disk
+        // cache still skips empties to avoid multi-hour poisoning across
+        // restarts.
         if listing.dirs.is_empty() && listing.files.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 target: "nanocrew::vfs",
-                "list_dir prefix={:?} returned EMPTY — skipping cache write, will retry on next request",
-                prefix,
+                "list_dir prefix={:?} EMPTY — cached with short TTL ({:?})",
+                prefix, EMPTY_LIST_TTL,
             );
+            let effective_now = now
+                .checked_sub(LIST_TTL - EMPTY_LIST_TTL)
+                .unwrap_or(now);
+            self.list_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(prefix.to_string(), (effective_now, listing.clone()));
         } else {
             self.list_cache
                 .lock()
@@ -886,16 +951,23 @@ impl S3Fs {
         let listing = CachedList { dirs: all_dirs, files: all_files };
 
         let now = Instant::now();
-        // Only cache non-empty results in memory. Empty results are either
-        // a genuinely empty folder (cheap to re-list) or a silent failure —
-        // caching for LIST_TTL would leave Explorer showing "empty folder"
-        // for a full minute even after the underlying issue clears.
+        // v0.2.16: empty results cached with EMPTY_LIST_TTL (5s) rather
+        // than dropped. Non-empty results keep the full LIST_TTL (60s)
+        // and get persisted to disk. Capped (truncated) listings skip
+        // the disk save so a re-list gets a chance to fit.
         if listing.dirs.is_empty() && listing.files.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 target: "nanocrew::vfs",
-                "listing_for key={:?} returned EMPTY — skipping cache write, will retry on next request",
-                key,
+                "listing_for key={:?} EMPTY — cached with short TTL ({:?})",
+                key, EMPTY_LIST_TTL,
             );
+            let effective_now = now
+                .checked_sub(LIST_TTL - EMPTY_LIST_TTL)
+                .unwrap_or(now);
+            self.list_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key.to_string(), (effective_now, listing.clone()));
         } else {
             self.list_cache
                 .lock()
@@ -2966,6 +3038,17 @@ impl FileSystemContext for S3Fs {
             let mut m = meta.lock().unwrap_or_else(|p| p.into_inner());
             m.size = 0;
             fill_file_info(file_info, &m);
+
+            // v0.2.16: drop all cached state for the key that's about to be
+            // overwritten. Previously overwrite() skipped invalidation
+            // entirely, so any concurrent read() (thumbnailer, AV scan,
+            // background prefetch, another handle in a different app) would
+            // happily serve stale pre-overwrite blocks from disk cache
+            // AFTER the overwrite's fresh bytes started arriving — user
+            // opens the "new" file, sees old contents.
+            self.invalidate_cache(key);
+            self.invalidate_meta(key);
+            self.invalidate_parent(key);
         }
         Ok(())
     }
@@ -3060,18 +3143,38 @@ impl FileSystemContext for S3Fs {
             // collision is actually resolved — the original stays intact,
             // our user's edits land safely, and the UI gets a
             // `file_conflict_diverted` event so we can toast the outcome.
+            // v0.2.16: fail-CLOSED here. If the sentinel-check S3 call
+            // itself fails (network hiccup, throttling), previous versions
+            // fell through as if the file were free and clobbered whoever
+            // was actually editing. Rename-divert is our last line of
+            // defence against silent data loss on cross-user collisions,
+            // so on any check error we refuse the rename with
+            // STATUS_SHARING_VIOLATION — the user sees a retryable error
+            // instead of Alex's file getting overwritten.
             let mut effective_dst = new_key.clone();
             let mut diverted_from: Option<(String, file_lock::Sentinel)> = None;
-            if let Some(foreign) = self.foreign_lock_for(&new_key) {
-                let alt = make_conflict_key(&new_key, &self.owner);
-                tracing::warn!(
-                    target: "nanocrew::vfs",
-                    "rename dst {new_key:?} locked by {} on {} — diverting to {alt:?}",
-                    foreign.owner,
-                    foreign.machine,
-                );
-                diverted_from = Some((new_key.clone(), foreign));
-                effective_dst = alt;
+            match self.foreign_lock_for_strict(&new_key) {
+                Ok(Some(foreign)) => {
+                    let alt = make_conflict_key(&new_key, &self.owner);
+                    tracing::warn!(
+                        target: "nanocrew::vfs",
+                        "rename dst {new_key:?} locked by {} on {} — diverting to {alt:?}",
+                        foreign.owner,
+                        foreign.machine,
+                    );
+                    diverted_from = Some((new_key.clone(), foreign));
+                    effective_dst = alt;
+                }
+                Ok(None) => {
+                    // Genuinely free — proceed with normal rename.
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "nanocrew::vfs",
+                        "rename dst {new_key:?} lock-check failed ({e}) — failing CLOSED to avoid silent overwrite"
+                    );
+                    return Err(nt(STATUS_SHARING_VIOLATION));
+                }
             }
 
             let provider = self.provider.clone();

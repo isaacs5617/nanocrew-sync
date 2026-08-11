@@ -88,6 +88,14 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
             .map_err(|e| AppError::InvalidInput(e.to_string()))?;
     }
 
+    // v0.3.2 recovery: users updated between v0.2.15 and v0.3.1 may have
+    // had their DB falsely quarantined by the (now-removed) auto-quarantine
+    // code — see `try_salvage_if_corrupt` doc comment. If we now see a
+    // tiny fresh DB alongside a `nanocrew.db.corrupted-<ts>` that actually
+    // passes integrity_check, swap them back so those users get their
+    // drives + accounts restored on next launch. Non-fatal on any error.
+    try_restore_from_bad_quarantine(path);
+
     // v0.2.15: integrity-check + auto-heal on startup. Corrupted `cache_entries`
     // indexes cause get_block() to misroute lookups, which surfaces to users
     // as silent xlsx/PDF/Word corruption (bytes look right length but come
@@ -155,13 +163,22 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
     Ok(conn)
 }
 
-/// Run `PRAGMA integrity_check`. If the result is anything other than "ok",
-/// rename the current DB out of the way (so the next open() creates a fresh
-/// one) and best-effort dump the salvageable rows next to it as a JSON blob
-/// the user can point at if they want to hand-recover credentials.
+/// v0.3.2: probe DB integrity but NEVER rename the file automatically.
+///
+/// The previous auto-quarantine (v0.2.15 – v0.3.1) destroyed user data in
+/// production. Two bugs combined into a disaster:
+///   1) The read-only integrity probe couldn't see the un-checkpointed WAL,
+///      so it false-positived on healthy DBs.
+///   2) The rename step used `Path::with_extension` on a filename whose
+///      "extension" from Rust's POV was `corrupted-<ts>` — so the WAL/SHM
+///      companions were written to `nanocrew.db.db-wal/-shm` instead of
+///      `nanocrew.db.corrupted-<ts>-wal/-shm`. Fresh DB + orphaned WAL =
+///      confused startup, empty prefs, missing drives, "app opens with
+///      everything gone" reports.
+///
+/// The safe behaviour is to LOG the result and let the human decide via
+/// the Factory Reset button already exposed in Settings → Danger Zone.
 fn try_salvage_if_corrupt(path: &Path) -> Result<(), AppError> {
-    // Open read-only for the check so we can't accidentally damage a healthy
-    // DB while probing it.
     let ro_uri = format!(
         "file:{}?mode=ro",
         path.to_string_lossy().replace('\\', "/")
@@ -171,7 +188,7 @@ fn try_salvage_if_corrupt(path: &Path) -> Result<(), AppError> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     ) {
         Ok(c) => c,
-        Err(_) => return Ok(()), // Can't even open — let normal open() surface the error.
+        Err(_) => return Ok(()),
     };
 
     let result: String = conn
@@ -179,111 +196,107 @@ fn try_salvage_if_corrupt(path: &Path) -> Result<(), AppError> {
         .unwrap_or_else(|_| "unknown".into());
     drop(conn);
 
-    if result == "ok" {
-        return Ok(());
-    }
-
-    tracing::error!(
-        target: "nanocrew::db",
-        "integrity_check FAILED: {result:?} — quarantining {} and salvaging drives",
-        path.display()
-    );
-
-    // Try to read the salvageable rows before we move the file — accounts +
-    // drives are what the user cares about; cache_entries is regeneratable.
-    let salvage = attempt_salvage(&ro_uri);
-
-    // Move the corrupted files out of the way. Use a timestamp so multiple
-    // corruptions don't clobber earlier evidence.
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bad = path.with_file_name(format!("nanocrew.db.corrupted-{ts}"));
-    let _ = std::fs::rename(path, &bad);
-    for sfx in ["-wal", "-shm"] {
-        let src = path.with_extension(format!("db{sfx}"));
-        let dst = bad.with_extension(format!("db{sfx}"));
-        let _ = std::fs::rename(&src, &dst);
-    }
-
-    // Write the salvage report (accounts count + drive configs) next to it
-    // so the user can hand-restore if we can't automate it.
-    if let Some(json) = salvage {
-        let report = path.with_file_name(format!("nanocrew.db.salvage-{ts}.json"));
-        let _ = std::fs::write(&report, json.as_bytes());
-        tracing::info!(
+    if result != "ok" {
+        tracing::warn!(
             target: "nanocrew::db",
-            "wrote salvage report to {}",
-            report.display()
+            "startup integrity_check reported {:?} for {} — leaving file in place. \
+             If the app misbehaves, use Settings → Danger Zone → Reset all data.",
+            result,
+            path.display()
         );
     }
-
     Ok(())
 }
 
-/// Best-effort dump of the accounts + drives tables into a JSON string.
-/// Returns None if we can't read anything usable.
-fn attempt_salvage(ro_uri: &str) -> Option<String> {
-    let conn = Connection::open_with_flags(
-        ro_uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .ok()?;
+// v0.3.2: `attempt_salvage()` was removed alongside the auto-quarantine
+// path. Its silent `unwrap_or_default()` on the query result made a
+// misleading empty-drives salvage report which confused hand-recovery.
+// The Factory Reset button owned by the user is the correct human path
+// for a truly corrupted DB.
 
-    let mut out = String::from("{\n");
-    out.push_str(&format!("  \"salvaged_at\": {},\n", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+/// v0.3.2 self-heal for users hit by v0.2.15 – v0.3.1's buggy auto-quarantine.
+///
+/// Symptom: after updating, users open the app to find no account, no
+/// drives, no prefs — everything looks like a fresh install even though
+/// they had real config. Their real DB was renamed to
+/// `nanocrew.db.corrupted-<ts>` by the old code (usually with a false-
+/// positive integrity flag), leaving a tiny empty DB in its place.
+///
+/// This function: if `path` doesn't exist OR is under ~16 KiB (fresh
+/// empty DB is ~4 KiB, this bounds "real user DBs"), look for any sibling
+/// `nanocrew.db.corrupted-*` file, integrity-check the newest one, and
+/// if it passes, swap it into place. Idempotent (does nothing when the
+/// live DB already has real content). Non-fatal on any error — we'd
+/// rather users get a fresh empty DB than a hang on this recovery path.
+fn try_restore_from_bad_quarantine(path: &Path) {
+    // Heuristic: user has meaningful data if their DB is bigger than a
+    // freshly-created empty one. 16 KiB is a healthy buffer over the
+    // ~4 KiB baseline.
+    const EMPTY_DB_SUSPECT_MAX: u64 = 16 * 1024;
+    let live_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if live_size > EMPTY_DB_SUSPECT_MAX {
+        return;
+    }
 
-    // Accounts — just the usernames, no password hashes (user needs to
-    // reset anyway).
-    let usernames: Vec<String> = conn
-        .prepare("SELECT username FROM accounts")
-        .and_then(|mut s| {
-            s.query_map([], |r| r.get::<_, String>(0))
-                .and_then(|it| it.collect())
-        })
-        .unwrap_or_default();
-    out.push_str("  \"accounts\": [");
-    out.push_str(
-        &usernames
-            .iter()
-            .map(|u| format!("\"{}\"", u.replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    out.push_str("],\n");
-
-    // Drives — full config so a hand-recover just needs the plaintext
-    // Wasabi secret from the user's password manager.
-    let drives: Vec<String> = conn
-        .prepare(
-            "SELECT id, name, provider, endpoint, bucket, COALESCE(bucket_prefix,'') AS prefix, \
-             region, letter, access_key_id FROM drives",
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut candidates: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s.starts_with("nanocrew.db.corrupted-") {
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            candidates.push((e.path(), size));
+        }
+    }
+    // Prefer the biggest — most likely the real user data. Ties broken
+    // by mtime don't matter here because size is a stronger signal.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    for (cand, size) in candidates {
+        if size <= EMPTY_DB_SUSPECT_MAX {
+            continue;
+        }
+        // Integrity-check the candidate as a healthy DB before trusting it.
+        let ok = Connection::open_with_flags(
+            &cand,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
-        .and_then(|mut s| {
-            s.query_map([], |r| {
-                Ok(format!(
-                    "    {{\"id\": {}, \"name\": \"{}\", \"provider\": \"{}\", \
-                     \"endpoint\": \"{}\", \"bucket\": \"{}\", \"bucket_prefix\": \"{}\", \
-                     \"region\": \"{}\", \"letter\": \"{}\", \"access_key_id\": \"{}\"}}",
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?.replace('"', "\\\""),
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, String>(8)?,
-                ))
-            })
-            .and_then(|it| it.collect())
+        .ok()
+        .and_then(|c| {
+            c.query_row("PRAGMA integrity_check(1);", [], |r| r.get::<_, String>(0))
+                .ok()
         })
-        .unwrap_or_default();
-    out.push_str("  \"drives\": [\n");
-    out.push_str(&drives.join(",\n"));
-    out.push_str("\n  ]\n}\n");
-
-    Some(out)
+        .map(|s| s == "ok")
+        .unwrap_or(false);
+        if !ok {
+            continue;
+        }
+        // Remove the empty live DB (if present) and any stray -wal/-shm
+        // that the rename bug also created (`nanocrew.db.db-wal` etc.).
+        // Then copy the candidate into place. Copy (not rename) so the
+        // quarantine backup stays on disk as evidence.
+        for stray in [
+            path.with_extension("db-wal"),
+            path.with_extension("db-shm"),
+            parent.join("nanocrew.db.db-wal"),
+            parent.join("nanocrew.db.db-shm"),
+        ] {
+            let _ = std::fs::remove_file(&stray);
+        }
+        let _ = std::fs::remove_file(path);
+        if std::fs::copy(&cand, path).is_ok() {
+            tracing::warn!(
+                target: "nanocrew::db",
+                "v0.3.2 self-heal: restored {} from {} (v0.2.15-v0.3.1 quarantine was buggy)",
+                path.display(), cand.display()
+            );
+            return;
+        }
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nanocrew-sync"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -77,6 +77,13 @@ reqwest      = { version = "0.12", default-features = false, features = ["rustls
 # `connect` pulls in `connect_async`; `rustls-tls-webpki-roots` uses the
 # bundled Mozilla root store so we don't depend on the system trust store.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+# Direct dep so we can call `rustls::crypto::ring::default_provider().install_default()`
+# at process start. See lib.rs::run comment — without this the first TLS
+# handshake panics with "Could not automatically determine the process-level
+# CryptoProvider" because reqwest / tokio-tungstenite / aws-smithy-http-client
+# each pull rustls features that leave the provider ambiguous.
+rustls = { version = "0.23", features = ["ring"] }
 
 # SHA-256 for deriving sentinel-lock object names
 sha2 = "0.10"

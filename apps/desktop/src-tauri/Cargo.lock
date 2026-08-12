@@ -3948,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "nanocrew-sync"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "android_logger",
@@ -3975,6 +3975,7 @@ dependencies = [
  "rusqlite",
  "russh",
  "russh-sftp",
+ "rustls 0.23.38",
  "security-framework 2.11.1",
  "sentry",
  "sentry-tracing",
@@ -5850,6 +5851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

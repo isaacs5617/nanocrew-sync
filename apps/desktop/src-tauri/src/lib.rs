@@ -96,6 +96,20 @@ pub fn run() {
 #[cfg(not(target_os = "android"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // v0.3.3 crash fix. rustls 0.23 requires an explicit process-level
+    // CryptoProvider when multiple providers are compiled in via
+    // conflicting feature flags across deps (reqwest's rustls-tls,
+    // tokio-tungstenite's rustls-tls-webpki-roots, and aws-smithy-
+    // http-client's rustls-ring all trip this). Without this call, the
+    // first TLS handshake — usually the coordinator WebSocket at
+    // auto-mount time — panics on `tokio-rt-worker` with
+    // "Could not automatically determine the process-level CryptoProvider",
+    // and panic=abort turns that into STATUS_STACK_BUFFER_OVERRUN, which
+    // users see as "app opens and closes with no error." Install ring
+    // (matches aws-smithy-http-client's `rustls-ring` feature). Second-
+    // caller is a silent no-op if this is somehow called twice.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let _sentry = sentry::init((
         std::env::var("SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {

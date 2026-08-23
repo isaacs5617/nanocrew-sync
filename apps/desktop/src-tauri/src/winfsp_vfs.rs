@@ -488,17 +488,18 @@ impl S3Fs {
 
         // Meta cache: drop every entry whose key starts with "<prefix>/"
         // (and the prefix itself). Empty prefix = root => clear everything.
-        let lc_prefix = if prefix.is_empty() {
+        // v0.3.4: keys are now stored real-case (case-sensitive volume)
+        // so the needle is real-case too — no lowercasing.
+        let needle_prefix = if prefix.is_empty() {
             String::new()
         } else {
-            format!("{}/", prefix.to_ascii_lowercase())
+            format!("{}/", prefix)
         };
         let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
         if prefix.is_empty() {
             mc.clear();
         } else {
-            let lc_self = prefix.to_ascii_lowercase();
-            mc.retain(|k, _| !(k.starts_with(&lc_prefix) || k == &lc_self));
+            mc.retain(|k, _| !(k.starts_with(&needle_prefix) || k == prefix));
         }
         drop(mc);
 
@@ -577,14 +578,14 @@ impl S3Fs {
 
                         // 2) Meta cache — drop the prefix itself + everything
                         //    beneath it (matches invalidate_parent semantics).
+                        //    v0.3.4: real-case keys, no lowercase transform.
                         let mut mc = meta_cache.lock().unwrap_or_else(|p| p.into_inner());
                         if prefix.is_empty() {
                             mc.clear();
                         } else {
-                            let lc_prefix = format!("{}/", prefix.to_ascii_lowercase());
-                            let lc_self = prefix.to_ascii_lowercase();
+                            let needle = format!("{}/", prefix);
                             mc.retain(|k, _| {
-                                !(k.starts_with(&lc_prefix) || k == &lc_self)
+                                !(k.starts_with(&needle) || k == &prefix)
                             });
                         }
                         drop(mc);
@@ -742,10 +743,12 @@ impl S3Fs {
     /// meta_cache size, which is capped by natural usage. Called from
     /// invalidate_parent + wherever we detect a foreign listing change.
     fn sweep_negative_meta_under(&self, prefix: &str) {
+        // v0.3.4: meta_cache is now case-sensitive (mounted volume is
+        // case-sensitive). Needle preserves real case.
         let needle = if prefix.is_empty() {
             String::new()
         } else {
-            format!("{}/", prefix.to_ascii_lowercase())
+            format!("{}/", prefix)
         };
         let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
         mc.retain(|k, (_, v)| {
@@ -758,6 +761,11 @@ impl S3Fs {
     /// Seed the in-memory meta_cache for every entry in a freshly-acquired
     /// listing. Shared between the S3-fetch path and the disk-hit path so
     /// both populate stat() lookups identically.
+    ///
+    /// v0.3.4: entries stored with real case (case-sensitive volume). Two
+    /// siblings differing only in letter case (e.g. `Ubuntu LM` /
+    /// `UBUNTU LM`) now coexist here instead of collapsing to one lower-
+    /// cased key.
     fn seed_meta_from_listing(&self, prefix: &str, listing: &CachedList, now: Instant) {
         let mut mc = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
         let parent = if prefix.is_empty() {
@@ -768,7 +776,7 @@ impl S3Fs {
         for d in &listing.dirs {
             let full = format!("{parent}{d}");
             mc.insert(
-                full.to_ascii_lowercase(),
+                full.clone(),
                 (
                     now,
                     Some((full, Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() })),
@@ -777,7 +785,7 @@ impl S3Fs {
         }
         for (name, meta) in &listing.files {
             let full = format!("{parent}{name}");
-            mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
+            mc.insert(full.clone(), (now, Some((full, meta.clone()))));
         }
     }
 
@@ -785,7 +793,7 @@ impl S3Fs {
         self.meta_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&key.to_ascii_lowercase());
+            .remove(key);
     }
 
     /// Drop all on-disk cached blocks for `key`. Called after uploads,
@@ -986,10 +994,11 @@ impl S3Fs {
                     };
                     let mut mc =
                         self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
+                    // v0.3.4: real-case keys (case-sensitive volume).
                     for d in &page.dirs {
                         let full = format!("{parent}{d}");
                         mc.insert(
-                            full.to_ascii_lowercase(),
+                            full.clone(),
                             (
                                 now,
                                 Some((
@@ -1005,7 +1014,7 @@ impl S3Fs {
                     }
                     for (name, meta) in &new_files {
                         let full = format!("{parent}{name}");
-                        mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
+                        mc.insert(full.clone(), (now, Some((full, meta.clone()))));
                     }
                 }
 
@@ -1126,14 +1135,17 @@ impl S3Fs {
                 },
             )));
         }
-        // Meta cache — keyed by the LOWERCASE input key (case-insensitive).
-        // The value carries the real-case S3 key, so we always return the
-        // canonical case no matter how the caller cased the request. This is
-        // essential: the returned key is used for materialize/get_range, and
-        // S3 is case-sensitive — returning the request's case 404s.
+        // v0.3.4: meta_cache is now case-sensitive to match the mounted
+        // volume's CaseSensitiveSearch=true flag. Two S3 keys differing only
+        // in letter case (e.g. `Ubuntu LM` and `UBUNTU LM`) now coexist as
+        // distinct entries instead of collapsing. Lookups still fall back to
+        // a case-insensitive listing walk below if the exact key misses —
+        // that safety net helps users who type wrong-case paths in Explorer's
+        // address bar, and it deterministically returns whichever real-case
+        // key sorts first (dict order) when multiple case-variants exist.
         {
             let cache = self.meta_cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((at, v)) = cache.get(&key.to_ascii_lowercase()) {
+            if let Some((at, v)) = cache.get(key) {
                 if at.elapsed() < META_TTL {
                     return Ok(v.clone());
                 }
@@ -1146,16 +1158,17 @@ impl S3Fs {
         for (i, seg) in segments.iter().enumerate() {
             let is_last = i == segments.len() - 1;
             let listing = self.list_dir(&parent_real)?;
-            let seg_lower = seg.to_ascii_lowercase();
 
-            // Directory first — dirs and files can't collide in the same
-            // prefix in practice, but prefer dirs to keep directory traversal
-            // working even if the final segment is a file named the same.
+            // Prefer exact-case match (case-sensitive volume expects it).
+            // Fall back to case-insensitive for legacy typing UX. Prefer
+            // dirs over files when both exist under the same name — matches
+            // Windows path-resolution intuition for mid-path segments.
             let dir_hit = listing
                 .dirs
                 .iter()
-                .find(|d| d.eq_ignore_ascii_case(&seg_lower) || d.to_ascii_lowercase() == seg_lower)
-                .cloned();
+                .find(|d| d.as_str() == *seg)
+                .cloned()
+                .or_else(|| listing.dirs.iter().find(|d| d.eq_ignore_ascii_case(seg)).cloned());
             if let Some(real) = dir_hit {
                 parent_real = if parent_real.is_empty() {
                     real
@@ -1173,15 +1186,16 @@ impl S3Fs {
             let file_hit = listing
                 .files
                 .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(seg))
-                .cloned();
+                .find(|(n, _)| n.as_str() == *seg)
+                .cloned()
+                .or_else(|| listing.files.iter().find(|(n, _)| n.eq_ignore_ascii_case(seg)).cloned());
             if let Some((real, m)) = file_hit {
                 if !is_last {
                     // File appears mid-path — the path is invalid.
                     self.meta_cache
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .insert(key.to_ascii_lowercase(), (Instant::now(), None));
+                        .insert(key.to_string(), (Instant::now(), None));
                     return Ok(None);
                 }
                 parent_real = if parent_real.is_empty() {
@@ -1197,16 +1211,20 @@ impl S3Fs {
             self.meta_cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(key.to_ascii_lowercase(), (Instant::now(), None));
+                .insert(key.to_string(), (Instant::now(), None));
             return Ok(None);
         }
 
         let found = last_meta.map(|m| (parent_real, m));
-        // Cache the (real-case key, meta) under the lowercase input key.
+        // v0.3.4: cache under the real-case input key. If the caller asked
+        // for wrong case and we resolved via the case-insensitive fallback
+        // above, we still cache under THEIR key so the next identical-case
+        // lookup is a fast hit. Real-case keys still coexist because
+        // seed_meta_from_listing stores them under real case too.
         self.meta_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(key.to_ascii_lowercase(), (Instant::now(), found.clone()));
+            .insert(key.to_string(), (Instant::now(), found.clone()));
         Ok(found)
     }
 
@@ -1976,10 +1994,11 @@ fn seed_meta_from_listing_into(
     } else {
         format!("{prefix}/")
     };
+    // v0.3.4: real-case keys (case-sensitive volume).
     for d in &listing.dirs {
         let full = format!("{parent}{d}");
         mc.insert(
-            full.to_ascii_lowercase(),
+            full.clone(),
             (
                 now,
                 Some((full, Meta { is_dir: true, size: 0, mtime_filetime: now_filetime() })),
@@ -1988,7 +2007,7 @@ fn seed_meta_from_listing_into(
     }
     for (name, meta) in &listing.files {
         let full = format!("{parent}{name}");
-        mc.insert(full.to_ascii_lowercase(), (now, Some((full, meta.clone()))));
+        mc.insert(full.clone(), (now, Some((full, meta.clone()))));
     }
 }
 
@@ -2312,7 +2331,10 @@ impl FileSystemContext for S3Fs {
             && is_write_access(granted_access)
             && !is_internal_key(&real_key)
         {
-            let lk = real_key.to_ascii_lowercase();
+            // v0.3.4: real-case key. Volume is now case-sensitive, so
+            // `Foo.txt` and `FOO.txt` are distinct files that can be
+            // opened for write independently.
+            let lk = real_key.clone();
             {
                 let mut locks = self.local_writers.lock().unwrap_or_else(|p| p.into_inner());
                 if locks.contains(&lk) {
@@ -2470,10 +2492,11 @@ impl FileSystemContext for S3Fs {
 
             // Phase 4.1/4.3: release writer lock + sentinel if we took one.
             if holds_writer_lock.swap(false, Ordering::Relaxed) {
+                // v0.3.4: real-case key (see open() writer-lock acquire).
                 self.local_writers
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .remove(&key.to_ascii_lowercase());
+                    .remove(key);
                 let client = self.file_lock_client.clone();
                 let bucket = self.file_lock_bucket.clone();
                 let k = self.file_lock_abs_key(key);
@@ -2592,7 +2615,8 @@ impl FileSystemContext for S3Fs {
         // local-writer claim and drop a sentinel. Internal bookkeeping keys
         // bypass — we must be able to write sentinels themselves.
         let took_local = if !is_internal_key(&key) {
-            let lk = key.to_ascii_lowercase();
+            // v0.3.4: real-case key (case-sensitive volume).
+            let lk = key.clone();
             let mut locks = self.local_writers.lock().unwrap_or_else(|p| p.into_inner());
             if locks.contains(&lk) {
                 return Err(nt(STATUS_SHARING_VIOLATION));
@@ -2611,7 +2635,7 @@ impl FileSystemContext for S3Fs {
                 self.local_writers
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .remove(&key.to_ascii_lowercase());
+                    .remove(&key);
                 self.emit_lock(FileLockEvent {
                     drive_id: self.drive_id,
                     target: key.clone(),

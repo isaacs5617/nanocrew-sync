@@ -482,7 +482,16 @@ pub fn spawn_mount(
                 .volume_serial_number(config.drive_id as u32)
                 .file_info_timeout(1000)
                 .case_preserved_names(true)
-                .case_sensitive_search(false)
+                // v0.3.4: report the volume as case-sensitive to match S3.
+                // S3 is case-sensitive natively; keeping this false hid every
+                // entry whose only difference from a sibling was letter case
+                // (e.g. `Ubuntu LM` and `UBUNTU LM` collapsed to one). Modern
+                // Windows tolerates per-volume case sensitivity (used by WSL
+                // since 2018); Explorer, Office, and most tools handle it
+                // transparently. Any tool that hard-codes case-insensitive
+                // assumptions and misbehaves under this flag is a bug on
+                // their side — the alternative was silently losing files.
+                .case_sensitive_search(true)
                 .unicode_on_disk(true)
                 // Keep ACLs off — we don't persist per-file ACLs. WinFsp will
                 // accept our Everyone-FA descriptor as advisory without

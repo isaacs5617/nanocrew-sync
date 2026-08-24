@@ -3269,14 +3269,22 @@ impl FileSystemContext for S3Fs {
             // collision is actually resolved — the original stays intact,
             // our user's edits land safely, and the UI gets a
             // `file_conflict_diverted` event so we can toast the outcome.
-            // v0.2.16: fail-CLOSED here. If the sentinel-check S3 call
-            // itself fails (network hiccup, throttling), previous versions
-            // fell through as if the file were free and clobbered whoever
-            // was actually editing. Rename-divert is our last line of
-            // defence against silent data loss on cross-user collisions,
-            // so on any check error we refuse the rename with
-            // STATUS_SHARING_VIOLATION — the user sees a retryable error
-            // instead of Alex's file getting overwritten.
+            // v0.3.6: reverted the v0.2.16 fail-CLOSED behaviour. That
+            // change intended to block silent overwrite of another user's
+            // file when the sentinel-check S3 call itself errored — but
+            // in practice Excel's tmp+rename save path hits this every
+            // time and any transient S3 hiccup surfaces as "Your changes
+            // could not be saved to 'foo.xlsx' because of a sharing
+            // violation." Users can't save. The cost of the theoretical
+            // cross-user protection (rare: needs simultaneous edit + S3
+            // outage) is not worth the constant real-world save failures.
+            //
+            // Trade-off restored to pre-v0.2.16: CONFIRMED foreign lock
+            // still diverts to a conflict-suffixed name. Check errors log
+            // a warning and PROCEED with the normal rename. If we clobber
+            // another user's changes because our check couldn't run, it
+            // shows up in the log — the coordinator's push invalidation
+            // (v0.3.0) is the real answer to concurrent-edit safety.
             let mut effective_dst = new_key.clone();
             let mut diverted_from: Option<(String, file_lock::Sentinel)> = None;
             match self.foreign_lock_for_strict(&new_key) {
@@ -3295,11 +3303,10 @@ impl FileSystemContext for S3Fs {
                     // Genuinely free — proceed with normal rename.
                 }
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         target: "nanocrew::vfs",
-                        "rename dst {new_key:?} lock-check failed ({e}) — failing CLOSED to avoid silent overwrite"
+                        "rename dst {new_key:?} lock-check failed ({e}) — proceeding with normal rename (fail-open)"
                     );
-                    return Err(nt(STATUS_SHARING_VIOLATION));
                 }
             }
 

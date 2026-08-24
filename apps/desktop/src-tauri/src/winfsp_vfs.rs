@@ -1110,12 +1110,20 @@ impl S3Fs {
             entries.push((name.clone(), meta.clone()));
         }
 
+        // Sort primarily case-insensitively so Explorer's alphabetical
+        // ordering matches user intuition ("apple" and "Apple" appear
+        // together), with a real-case tie-break so the order is
+        // deterministic when case-only variants exist. Deliberately do NOT
+        // dedup by case: the volume is case-sensitive (v0.3.4 program-wide),
+        // S3 stores `Ubuntu LM/` and `UBUNTU LM/` as distinct prefixes,
+        // and collapsing them here made the second one invisible in
+        // Explorer even after everything else (WinFsp flag, meta_cache,
+        // local_writers) was made case-sensitive.
         entries.sort_by(|a, b| {
             let ka = a.0.to_uppercase();
             let kb = b.0.to_uppercase();
             ka.cmp(&kb).then_with(|| a.0.cmp(&b.0))
         });
-        entries.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
         Ok(entries)
     }
 
